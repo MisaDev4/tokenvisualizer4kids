@@ -17,8 +17,6 @@ public sealed class AppSettings
 
     public string SelectedLiveWindow { get; set; } = "w5";
 
-    public string SelectedLiveMode { get; set; } = "river";
-
     public string SelectedLiveMetric { get; set; } = "cost";
 
     public static AppSettings Load()

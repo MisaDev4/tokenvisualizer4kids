@@ -88,7 +88,10 @@
                          Content="Dashboard" Tag="dashboard" IsChecked="True" Checked="TabButton_Checked" />
             <RadioButton x:Name="TabLive" Style="{StaticResource SegmentButton}" GroupName="tab"
                          Content="Live" Tag="live" Checked="TabButton_Checked"
-                         ToolTip="Ultra real time: every response appears as a bubble the moment it is logged." />
+                         ToolTip="Ultra real time: every response drops into the cup the moment it is logged." />
+            <RadioButton x:Name="TabMulti" Style="{StaticResource SegmentButton}" GroupName="tab"
+                         Content="Multi" Tag="multi" Checked="TabButton_Checked"
+                         ToolTip="Dashboard chart and totals with the live view alongside." />
             <RadioButton x:Name="TabLimits" Style="{StaticResource SegmentButton}" GroupName="tab"
                          Content="Limits" Tag="limits" Checked="TabButton_Checked"
                          ToolTip="Your Claude plan rate limits, with reset countdowns." />
@@ -331,7 +334,7 @@
         </Grid>
       </Border>
 
-      <Border Grid.Column="2" Style="{StaticResource Card}" Padding="20,16">
+      <Border x:Name="ModelsCard" Grid.Column="2" Style="{StaticResource Card}" Padding="20,16">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -425,7 +428,7 @@
             </StackPanel>
           </UniformGrid>
           <Border Grid.Column="3" Style="{StaticResource SegmentGroup}" VerticalAlignment="Center"
-                  ToolTip="How far back the river reaches.">
+                  ToolTip="Round length: how long the cup fills before it settles into a layer.">
             <StackPanel Orientation="Horizontal">
               <RadioButton x:Name="LiveW1" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
                            Content="60 s" Tag="w1" Checked="LiveWindowButton_Checked" />
@@ -444,7 +447,9 @@
         </Grid>
       </Border>
 
-      <Border Grid.Row="1" Style="{StaticResource Card}" Padding="20,16">
+      <!-- The whole live feed card moves into the Multi tab's right column and
+           back: one live view, one set of state, shown wherever it is needed. -->
+      <Border x:Name="LiveFeedCard" Grid.Row="1" Style="{StaticResource Card}" Padding="20,16">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -461,11 +466,11 @@
                          Foreground="{StaticResource InkBrush}" VerticalAlignment="Center" />
               <TextBlock x:Name="LiveRoundText" FontSize="12" FontWeight="SemiBold"
                          Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
-                         Margin="14,1,0,0" Visibility="Collapsed" />
+                         Margin="14,1,0,0" />
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
               <ItemsControl x:Name="RoundHistoryBars" Height="26" Margin="0,2,12,0"
-                            VerticalAlignment="Center" Visibility="Collapsed">
+                            VerticalAlignment="Center">
                 <ItemsControl.ItemsPanel>
                   <ItemsPanelTemplate>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Bottom" />
@@ -479,18 +484,8 @@
                   </DataTemplate>
                 </ItemsControl.ItemTemplate>
               </ItemsControl>
-              <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0">
-                <StackPanel Orientation="Horizontal">
-                  <RadioButton x:Name="LiveModeRiver" Style="{StaticResource SegmentButton}" GroupName="liveMode"
-                               Content="River" Tag="river" IsChecked="True" Checked="LiveModeButton_Checked"
-                               ToolTip="Time flows right to left; one row per session." />
-                  <RadioButton x:Name="LiveModeCup" Style="{StaticResource SegmentButton}" GroupName="liveMode"
-                               Content="Cup" Tag="cup" Checked="LiveModeButton_Checked"
-                               ToolTip="Responses stack up like blocks in a cup and drain as they age out." />
-                </StackPanel>
-              </Border>
               <Border Style="{StaticResource SegmentGroup}"
-                      ToolTip="What sizes the shapes (and the value printed on cup blocks).">
+                      ToolTip="What sizes the blocks (and the value printed on them).">
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="LiveMetricCost" Style="{StaticResource SegmentButton}" GroupName="liveMetric"
                                Content="Cost" Tag="cost" IsChecked="True" Checked="LiveMetricButton_Checked" />
@@ -518,15 +513,13 @@
             </ItemsControl.ItemTemplate>
           </ItemsControl>
           <Grid Grid.Row="2" Margin="0,6,0,0" SizeChanged="LiveCanvas_SizeChanged">
-            <Canvas x:Name="LiveAxisCanvas" ClipToBounds="True" Background="Transparent" />
-            <Canvas x:Name="RiverCanvas" ClipToBounds="True" Background="Transparent" />
             <ScrollViewer x:Name="LiveScroll" VerticalScrollBarVisibility="Auto"
                           HorizontalScrollBarVisibility="Disabled" Focusable="False"
                           Background="Transparent" BorderThickness="0" Padding="0">
               <Canvas x:Name="LiveCanvas" ClipToBounds="True" Background="Transparent" />
             </ScrollViewer>
             <TextBlock x:Name="LiveEmptyText"
-                       Text="Waiting for activity — bubbles appear here within about a second of a response being logged."
+                       Text="Waiting for activity — blocks drop in within about a second of a response being logged."
                        Foreground="{StaticResource MutedBrush}" FontSize="13"
                        HorizontalAlignment="Center" VerticalAlignment="Center"
                        IsHitTestVisible="False" />
