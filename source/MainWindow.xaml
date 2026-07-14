@@ -164,7 +164,15 @@
             Visibility="Collapsed" Cursor="Hand" MouseLeftButtonUp="LimitsBar_Clicked"
             ToolTip="Click for the full limits page.">
       <!-- Meters wrap on narrow windows instead of clipping off the edge. -->
-      <ItemsControl x:Name="LimitsPanel" VerticalAlignment="Center">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="LimitsBarAccount" FontSize="11" FontWeight="SemiBold"
+                   Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
+                   Margin="0,0,26,0" />
+        <ItemsControl x:Name="LimitsPanel" Grid.Column="1" VerticalAlignment="Center">
         <ItemsControl.ItemsPanel>
           <ItemsPanelTemplate>
             <WrapPanel Orientation="Horizontal" />
@@ -187,7 +195,8 @@
             </StackPanel>
           </DataTemplate>
         </ItemsControl.ItemTemplate>
-      </ItemsControl>
+        </ItemsControl>
+      </Grid>
     </Border>
 
     <!-- ═══ Hero cost + KPI tiles ═══ -->
@@ -584,31 +593,51 @@
           <ItemsControl x:Name="LimitsDetailList">
             <ItemsControl.ItemTemplate>
               <DataTemplate>
-                <Border Style="{StaticResource Card}" Padding="24,20" Margin="0,0,0,14">
-                  <Grid>
-                    <Grid.RowDefinitions>
-                      <RowDefinition Height="Auto" />
-                      <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <Grid Grid.Row="0">
+                <!-- One card per Claude account, its limits stacked inside. -->
+                <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+                  <StackPanel>
+                    <Grid>
                       <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                       </Grid.ColumnDefinitions>
-                      <StackPanel VerticalAlignment="Center">
-                        <TextBlock Text="{Binding Title}" FontSize="15" FontWeight="SemiBold"
+                      <StackPanel>
+                        <TextBlock Text="{Binding Email}" FontSize="15" FontWeight="SemiBold"
                                    Foreground="{StaticResource InkBrush}" />
-                        <TextBlock Text="{Binding ResetText}" FontSize="12"
-                                   Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0" />
+                        <TextBlock Text="{Binding StatusText}" FontSize="12"
+                                   Foreground="{Binding StatusBrush}" Margin="0,3,0,0" />
                       </StackPanel>
-                      <TextBlock Grid.Column="1" Text="{Binding PercentText}" FontSize="34"
-                                 FontWeight="SemiBold" Foreground="{Binding PercentBrush}"
-                                 VerticalAlignment="Center" Margin="16,0,0,0" />
+                      <TextBlock Grid.Column="1" Text="{Binding PlanText}" FontSize="12"
+                                 FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
+                                 VerticalAlignment="Top" Margin="16,2,0,0" />
                     </Grid>
-                    <ProgressBar Grid.Row="1" Style="{StaticResource ShareBar}" Height="10"
-                                 Value="{Binding Share, Mode=OneWay}" Foreground="{Binding BarBrush}"
-                                 Margin="0,14,0,0" />
-                  </Grid>
+                    <ItemsControl ItemsSource="{Binding Limits}" Margin="0,4,0,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <StackPanel Margin="0,14,0,0">
+                            <Grid>
+                              <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                              </Grid.ColumnDefinitions>
+                              <StackPanel VerticalAlignment="Center">
+                                <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
+                                           Foreground="{StaticResource InkBrush}" />
+                                <TextBlock Text="{Binding ResetText}" FontSize="11"
+                                           Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+                              </StackPanel>
+                              <TextBlock Grid.Column="1" Text="{Binding PercentText}" FontSize="20"
+                                         FontWeight="SemiBold" Foreground="{Binding PercentBrush}"
+                                         VerticalAlignment="Center" Margin="16,0,0,0" />
+                            </Grid>
+                            <ProgressBar Style="{StaticResource ShareBar}" Height="8"
+                                         Value="{Binding Share, Mode=OneWay}" Foreground="{Binding BarBrush}"
+                                         Margin="0,8,0,0" />
+                          </StackPanel>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </StackPanel>
                 </Border>
               </DataTemplate>
             </ItemsControl.ItemTemplate>

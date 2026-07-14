@@ -31,6 +31,7 @@ public partial class MainWindow : Window
     private string _barsKey = "auto";
     private DashboardData? _latestData;
     private bool _haveLimits;
+    private bool _limitsRefreshing;
 
     // ── Live view state ────────────────────────────────────────────────────
     private string _tabKey = "dashboard";
@@ -215,91 +216,114 @@ public partial class MainWindow : Window
 
     private async Task RefreshLimitsAsync()
     {
-        var snapshot = await _limitsService.FetchAsync();
-        if (_disposed)
+        if (_limitsRefreshing)
         {
             return;
         }
 
-        if (snapshot is null)
+        _limitsRefreshing = true;
+        try
         {
-            // Keep whatever was last shown; only the never-signed-in case
-            // gets the explainer on the limits page.
-            LimitsPageEmpty.Visibility = _haveLimits ? Visibility.Collapsed : Visibility.Visible;
-            return;
+            var accounts = await _limitsService.FetchAllAsync();
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (accounts.Count == 0)
+            {
+                // Keep whatever was last shown; only the never-signed-in case
+                // gets the explainer on the limits page.
+                LimitsPageEmpty.Visibility = _haveLimits ? Visibility.Collapsed : Visibility.Visible;
+                return;
+            }
+
+            _haveLimits = true;
+            LimitsPageEmpty.Visibility = Visibility.Collapsed;
+
+            // The compact top bar mirrors whichever account Claude Code is
+            // signed into right now; the limits page lists every account.
+            var current = accounts.FirstOrDefault(account => account.IsActive) ?? accounts[0];
+            LimitsBarAccount.Text = ShortAccountName(current.Email);
+            LimitsPanel.ItemsSource = current.Limits.Select(limit =>
+            {
+                var elevated = limit.Severity is "critical" or "warning" || limit.Percent >= 70;
+                var barBrush = LimitBarBrush(limit);
+                var resets = limit.ResetsAt is { } at
+                    ? $"resets {FormatResetTime(at.ToLocalTime())}"
+                    : "";
+                return new LimitVm(
+                    limit.Label,
+                    Math.Clamp(limit.Percent / 100.0, 0, 1),
+                    barBrush,
+                    $"{limit.Percent:0}%",
+                    elevated ? barBrush : (Brush)FindResource("InkBrush"),
+                    resets,
+                    $"{current.Email} · {LimitTitle(limit.Label)} — {limit.Percent:0}% used" +
+                    (resets.Length > 0 ? $" · {resets}" : ""));
+            }).ToList();
+            LimitsBar.Visibility = Visibility.Visible;
+
+            LimitsDetailList.ItemsSource = accounts.Select(account => new AccountVm(
+                account.Email,
+                PlanLabel(account.Plan),
+                account.IsActive
+                    ? "signed in to Claude Code now"
+                    : account.Stale
+                        ? account.FetchedAt is { } fetched
+                            ? $"stale — last reached {fetched.LocalDateTime:h:mm tt}, updates on its next sign-in"
+                            : "stale — waiting for its next sign-in"
+                        : "tracked in the background",
+                account.IsActive ? (Brush)FindResource("AccentBrush") : (Brush)FindResource("MutedBrush"),
+                account.Limits.Select(limit => new LimitDetailVm(
+                    LimitTitle(limit.Label),
+                    limit.ResetsAt is { } at ? FormatResetDetail(at) : "reset time unknown",
+                    $"{limit.Percent:0}%",
+                    LimitBarBrush(limit),
+                    Math.Clamp(limit.Percent / 100.0, 0, 1),
+                    LimitBarBrush(limit))).ToList())).ToList();
+
+            LimitsPageSubtitle.Text =
+                $"{accounts.Count} {(accounts.Count == 1 ? "account" : "accounts")} · " +
+                $"the same numbers Claude Code shows under /usage · updated {DateTime.Now:h:mm tt}";
         }
-
-        _haveLimits = true;
-        LimitsPageEmpty.Visibility = Visibility.Collapsed;
-        var limits = snapshot.Limits;
-
-        LimitsPanel.ItemsSource = limits.Select(limit =>
+        finally
         {
-            var elevated = limit.Severity is "critical" or "warning" ||
-                           limit.Percent >= 70;
-            var barBrush = limit.Severity switch
-            {
-                "critical" => LimitCriticalBrush,
-                "warning" => LimitWarningBrush,
-                _ => limit.Percent >= 90 ? LimitCriticalBrush
-                    : limit.Percent >= 70 ? LimitWarningBrush
-                    : (Brush)FindResource("AccentBrush")
-            };
-            var name = limit.Label switch
-            {
-                "5h" => "5-hour session limit",
-                "Week" => "Weekly limit · all models",
-                _ => $"Weekly limit · {limit.Label}"
-            };
-            var resets = limit.ResetsAt is { } at
-                ? $"resets {FormatResetTime(at.ToLocalTime())}"
-                : "";
-            return new LimitVm(
-                limit.Label,
-                Math.Clamp(limit.Percent / 100.0, 0, 1),
-                barBrush,
-                $"{limit.Percent:0}%",
-                elevated ? barBrush : (Brush)FindResource("InkBrush"),
-                resets,
-                $"{name} — {limit.Percent:0}% used" + (resets.Length > 0 ? $" · {resets}" : ""));
-        }).ToList();
-        LimitsBar.Visibility = Visibility.Visible;
+            _limitsRefreshing = false;
+        }
+    }
 
-        LimitsDetailList.ItemsSource = limits.Select(limit =>
-        {
-            var barBrush = limit.Severity switch
-            {
-                "critical" => LimitCriticalBrush,
-                "warning" => LimitWarningBrush,
-                _ => limit.Percent >= 90 ? LimitCriticalBrush
-                    : limit.Percent >= 70 ? LimitWarningBrush
-                    : (Brush)FindResource("AccentBrush")
-            };
-            return new LimitDetailVm(
-                limit.Label switch
-                {
-                    "5h" => "5-hour session",
-                    "Week" => "Weekly · all models",
-                    _ => $"Weekly · {limit.Label}"
-                },
-                limit.ResetsAt is { } at ? FormatResetDetail(at) : "reset time unknown",
-                $"{limit.Percent:0}%",
-                barBrush,
-                Math.Clamp(limit.Percent / 100.0, 0, 1),
-                barBrush);
-        }).ToList();
+    private Brush LimitBarBrush(ClaudeLimit limit) => limit.Severity switch
+    {
+        "critical" => LimitCriticalBrush,
+        "warning" => LimitWarningBrush,
+        _ => limit.Percent >= 90 ? LimitCriticalBrush
+            : limit.Percent >= 70 ? LimitWarningBrush
+            : (Brush)FindResource("AccentBrush")
+    };
 
-        var plan = snapshot.Plan switch
-        {
-            "max" => "Max plan",
-            "pro" => "Pro plan",
-            "team" => "Team plan",
-            "enterprise" => "Enterprise plan",
-            null or "" => "Claude subscription",
-            _ => $"{char.ToUpperInvariant(snapshot.Plan[0])}{snapshot.Plan[1..]} plan"
-        };
-        LimitsPageSubtitle.Text =
-            $"{plan} · the same numbers Claude Code shows under /usage · updated {DateTime.Now:h:mm tt}";
+    private static string LimitTitle(string label) => label switch
+    {
+        "5h" => "5-hour session",
+        "Week" => "Weekly · all models",
+        _ => $"Weekly · {label}"
+    };
+
+    private static string PlanLabel(string? plan) => plan switch
+    {
+        "max" => "Max",
+        "pro" => "Pro",
+        "team" => "Team",
+        "enterprise" => "Enterprise",
+        null or "" => "",
+        _ => $"{char.ToUpperInvariant(plan[0])}{plan[1..]}"
+    };
+
+    /// <summary>The part before the @, so the top bar stays compact.</summary>
+    private static string ShortAccountName(string email)
+    {
+        var at = email.IndexOf('@');
+        return at > 0 ? email[..at] : email;
     }
 
     /// <summary>"resets in 2 h 41 m · 11:39 PM" — countdown plus wall-clock time.</summary>
@@ -347,6 +371,13 @@ public partial class MainWindow : Window
         Brush PercentBrush,
         double Share,
         Brush BarBrush);
+
+    private sealed record AccountVm(
+        string Email,
+        string PlanText,
+        string StatusText,
+        Brush StatusBrush,
+        List<LimitDetailVm> Limits);
 
     protected override void OnSourceInitialized(EventArgs e)
     {
