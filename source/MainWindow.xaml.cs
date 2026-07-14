@@ -262,7 +262,7 @@ public partial class MainWindow : Window
                     $"{current.Email} · {LimitTitle(limit.Label)} — {limit.Percent:0}% used" +
                     (resets.Length > 0 ? $" · {resets}" : ""));
             }).ToList();
-            LimitsBar.Visibility = Visibility.Visible;
+            LimitsStrip.Visibility = Visibility.Visible;
 
             LimitsDetailList.ItemsSource = accounts.Select(account => new AccountVm(
                 account.Email,
