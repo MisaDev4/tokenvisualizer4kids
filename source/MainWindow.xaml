@@ -670,12 +670,9 @@
                         <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold"
                                    Foreground="{StaticResource InkBrush}" TextTrimming="CharacterEllipsis" />
                       </StackPanel>
-                      <Border Grid.Column="1" CornerRadius="4" BorderThickness="1" Padding="5,1"
-                              Margin="8,0,0,0" VerticalAlignment="Center"
-                              BorderBrush="{Binding BadgeEdgeBrush}">
-                        <TextBlock Text="{Binding BadgeText}" FontSize="9" FontWeight="Bold"
-                                   Foreground="{Binding BadgeBrush}" />
-                      </Border>
+                      <Path Grid.Column="1" Data="{Binding IconGeometry}" Fill="{Binding IconBrush}"
+                            Width="14" Height="14" Stretch="Uniform" Opacity="0.9"
+                            Margin="8,0,0,0" VerticalAlignment="Center" />
                     </Grid>
                     <TextBlock Text="{Binding StatusText}" FontSize="12" FontWeight="SemiBold"
                                Foreground="{Binding StatusBrush}" Margin="17,7,0,0" />

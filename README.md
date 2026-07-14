@@ -12,7 +12,7 @@ The classic view: estimated cost with a comparison against the prior period, tok
 
 ## Terminals
 
-A page with one tile per **open** terminal — Claude Code and Codex, each tagged with a colored badge so you can tell them apart at a glance. Claude Code terminals come from Claude Code's own live session registry, verified against the running processes (so closed terminals don't linger); Codex terminals are classified from their session rollouts and matched against running codex processes the same way. Tiles carry the same session names Claude Code uses: **green** means the terminal is sitting at the prompt, **blue** means it is mid-turn working — background agents count, so a turn that ended while its agents keep running stays blue — and **amber** means it wants attention: a permission prompt, a plan approval, or a turn gone quiet. Older Claude Code versions without the registry fall back to transcript-tail matching. No hooks or integration needed; states flip within a few seconds.
+A page with one tile per **open** terminal — Claude Code and Codex, each wearing its maker's logomark so you can tell them apart at a glance. Claude Code terminals come from Claude Code's own live session registry, verified against the running processes (so closed terminals don't linger); Codex terminals are classified from their session rollouts and matched against running codex processes the same way. Tiles carry the same session names Claude Code uses: **green** means the terminal is sitting at the prompt, **blue** means it is mid-turn working — background agents count, so a turn that ended while its agents keep running stays blue — and **amber** means it wants attention: a permission prompt, a plan approval, or a turn gone quiet. Older Claude Code versions without the registry fall back to transcript-tail matching. No hooks or integration needed; states flip within a few seconds.
 
 ## Live
 
@@ -24,7 +24,7 @@ Ultra real time: every response drops into the cup as a block within about a sec
 
 ![Limits](docs/limits.png)
 
-Your Claude plan rate limits — the same numbers Claude Code shows under `/usage`: the 5-hour session window, the weekly all-models window, and per-model weekly windows, each with a severity-colored usage bar, a reset countdown, and a thin companion bar showing how far through the window you are. If several Claude accounts sign into Claude Code on this machine, each one gets its own card and keeps updating in the background between sign-ins. A compact copy of the signed-in account's meters lives in the status strip on every tab; click it to jump here.
+Your Claude plan rate limits — the same numbers Claude Code shows under `/usage`: the 5-hour session window, the weekly all-models window, and per-model weekly windows, each with a severity-colored usage bar, a reset countdown, and a thin companion bar showing how far through the window you are. Each account card also names its exact plan tier (Max 5x · $100/mo vs Max 20x · $200/mo), which `/usage` doesn't show. If several Claude accounts sign into Claude Code on this machine, each one gets its own card and keeps updating in the background between sign-ins. A compact copy of the signed-in account's meters lives in the status strip on every tab; click it to jump here.
 
 ## Data sources
 

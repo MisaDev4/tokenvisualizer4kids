@@ -14,6 +14,7 @@ public sealed record ClaudeAccountLimits(
     string Id,
     string Email,
     string? Plan,
+    string? RateLimitTier,
     bool IsActive,
     bool Stale,
     DateTimeOffset? FetchedAt,
@@ -119,7 +120,7 @@ public sealed class ClaudeLimitsService : IDisposable
                     return null;
                 }
 
-                (id, var email, var plan) = identity.Value;
+                (id, var email, var plan, var tier) = identity.Value;
                 _tokenOwner[token] = id;
                 if (!_accounts.TryGetValue(id, out var known))
                 {
@@ -130,6 +131,7 @@ public sealed class ClaudeLimitsService : IDisposable
                 // The profile is authoritative: the credentials file's
                 // subscriptionType has been seen reporting pro for Max accounts.
                 known.Plan = plan ?? known.Plan;
+                known.RateLimitTier = tier ?? known.RateLimitTier;
             }
 
             var account = _accounts[id];
@@ -145,6 +147,7 @@ public sealed class ClaudeLimitsService : IDisposable
                 ? expires.GetInt64()
                 : account.ExpiresAtMs;
             account.Plan ??= StringOf(oauth, "subscriptionType");
+            account.RateLimitTier ??= StringOf(oauth, "rateLimitTier");
             account.LastSeenActiveMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _refreshFailedAtMs.Remove(id);
             return id;
@@ -162,6 +165,20 @@ public sealed class ClaudeLimitsService : IDisposable
         long nowMs,
         CancellationToken cancellationToken)
     {
+        // Accounts adopted before tiers were tracked backfill theirs once.
+        if (account.RateLimitTier is null && !string.IsNullOrEmpty(account.AccessToken) &&
+            nowMs < account.ExpiresAtMs - 120_000)
+        {
+            var identity = await FetchIdentityAsync(account.AccessToken, cancellationToken).ConfigureAwait(false);
+            if (identity is { } known)
+            {
+                account.Plan = known.Plan ?? account.Plan;
+                // Empty (not null) when the profile carries no tier, so this
+                // lookup runs once per account, not once per poll.
+                account.RateLimitTier = known.Tier ?? "";
+            }
+        }
+
         if (nowMs >= account.ExpiresAtMs - 120_000)
         {
             if (isActive)
@@ -242,7 +259,7 @@ public sealed class ClaudeLimitsService : IDisposable
         }
     }
 
-    private async Task<(string Id, string Email, string? Plan)?> FetchIdentityAsync(
+    private async Task<(string Id, string Email, string? Plan, string? Tier)?> FetchIdentityAsync(
         string token,
         CancellationToken cancellationToken)
     {
@@ -267,7 +284,14 @@ public sealed class ClaudeLimitsService : IDisposable
             var plan = BoolOf(accountElement, "has_claude_max") ? "max"
                 : BoolOf(accountElement, "has_claude_pro") ? "pro"
                 : null;
-            return string.IsNullOrEmpty(id) ? null : (id, email ?? "unknown account", plan);
+
+            // The $100 and $200 Max plans both read "max"; the organization's
+            // rate_limit_tier (default_claude_max_5x / _20x) tells them apart.
+            var tier = document.RootElement.TryGetProperty("organization", out var organization) &&
+                       organization.ValueKind == JsonValueKind.Object
+                ? StringOf(organization, "rate_limit_tier")
+                : null;
+            return string.IsNullOrEmpty(id) ? null : (id, email ?? "unknown account", plan, tier);
         }
         catch (Exception exception) when (exception is HttpRequestException or JsonException or TaskCanceledException)
         {
@@ -355,6 +379,7 @@ public sealed class ClaudeLimitsService : IDisposable
         account.Id,
         account.Email,
         account.Plan,
+        account.RateLimitTier,
         isActive,
         account.LastFetchedMs < nowMs - StaleAfterMs,
         account.LastFetchedMs > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(account.LastFetchedMs) : null,
@@ -438,6 +463,7 @@ internal sealed class StoredAccount
     public string Id { get; set; } = "";
     public string Email { get; set; } = "";
     public string? Plan { get; set; }
+    public string? RateLimitTier { get; set; }
     public string AccessToken { get; set; } = "";
     public string? RefreshToken { get; set; }
     public long ExpiresAtMs { get; set; }
