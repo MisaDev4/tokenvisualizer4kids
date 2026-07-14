@@ -261,13 +261,34 @@ public partial class MainWindow : Window
                             : "stale — waiting for its next sign-in"
                         : "tracked in the background",
                 account.IsActive ? (Brush)FindResource("AccentBrush") : (Brush)FindResource("MutedBrush"),
-                account.Limits.Select(limit => new LimitDetailVm(
-                    LimitTitle(limit.Label),
-                    limit.ResetsAt is { } at ? FormatResetDetail(at) : "reset time unknown",
-                    $"{limit.Percent:0}%",
-                    LimitBarBrush(limit),
-                    Math.Clamp(limit.Percent / 100.0, 0, 1),
-                    LimitBarBrush(limit))).ToList())).ToList();
+                account.Limits.Select(limit =>
+                {
+                    // The thin bar under the usage bar: how far through the
+                    // limit window we are, i.e. how close the reset is.
+                    double resetShare = 0;
+                    var resetTooltip = "";
+                    if (limit.ResetsAt is { } resetsAt)
+                    {
+                        var period = limit.Label == "5h" ? TimeSpan.FromHours(5) : TimeSpan.FromDays(7);
+                        resetShare = Math.Clamp(
+                            1 - (resetsAt - DateTimeOffset.Now).TotalMilliseconds / period.TotalMilliseconds,
+                            0,
+                            1);
+                        resetTooltip = $"{resetShare * 100:0}% of the way through this " +
+                                       $"{(limit.Label == "5h" ? "5-hour window" : "week")}";
+                    }
+
+                    return new LimitDetailVm(
+                        LimitTitle(limit.Label),
+                        limit.ResetsAt is { } at ? FormatResetDetail(at) : "reset time unknown",
+                        $"{limit.Percent:0}%",
+                        LimitBarBrush(limit),
+                        Math.Clamp(limit.Percent / 100.0, 0, 1),
+                        LimitBarBrush(limit),
+                        resetShare,
+                        limit.ResetsAt is null ? Visibility.Collapsed : Visibility.Visible,
+                        resetTooltip);
+                }).ToList())).ToList();
 
             LimitsPageSubtitle.Text =
                 $"{accounts.Count} {(accounts.Count == 1 ? "account" : "accounts")} · " +
@@ -356,7 +377,10 @@ public partial class MainWindow : Window
         string PercentText,
         Brush PercentBrush,
         double Share,
-        Brush BarBrush);
+        Brush BarBrush,
+        double ResetShare,
+        Visibility ResetVisibility,
+        string ResetTooltip);
 
     private sealed record AccountVm(
         string Email,

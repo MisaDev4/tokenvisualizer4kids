@@ -592,6 +592,12 @@
                             <ProgressBar Style="{StaticResource ShareBar}" Height="8"
                                          Value="{Binding Share, Mode=OneWay}" Foreground="{Binding BarBrush}"
                                          Margin="0,8,0,0" />
+                            <!-- Thin companion bar: progress through the window, i.e. how close the reset is. -->
+                            <ProgressBar Style="{StaticResource ShareBar}" Height="2"
+                                         Value="{Binding ResetShare, Mode=OneWay}"
+                                         Foreground="{StaticResource MutedBrush}" Margin="0,3,0,0"
+                                         Visibility="{Binding ResetVisibility}"
+                                         ToolTip="{Binding ResetTooltip}" />
                           </StackPanel>
                         </DataTemplate>
                       </ItemsControl.ItemTemplate>
