@@ -430,6 +430,12 @@
                            Content="5 m" Tag="w5" IsChecked="True" Checked="LiveWindowButton_Checked" />
               <RadioButton x:Name="LiveW15" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
                            Content="15 m" Tag="w15" Checked="LiveWindowButton_Checked" />
+              <RadioButton x:Name="LiveW30" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="30 m" Tag="w30" Checked="LiveWindowButton_Checked" />
+              <RadioButton x:Name="LiveW45" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="45 m" Tag="w45" Checked="LiveWindowButton_Checked" />
+              <RadioButton x:Name="LiveW60" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="1 h" Tag="w60" Checked="LiveWindowButton_Checked" />
             </StackPanel>
           </Border>
         </Grid>

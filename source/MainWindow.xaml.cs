@@ -452,6 +452,9 @@ public partial class MainWindow : Window
         {
             "w1" => 60_000L,
             "w15" => 900_000L,
+            "w30" => 1_800_000L,
+            "w45" => 2_700_000L,
+            "w60" => 3_600_000L,
             _ => 300_000L
         };
         if (!_loaded)
@@ -472,6 +475,9 @@ public partial class MainWindow : Window
         {
             "w1" => "last 60 s",
             "w15" => "last 15 min",
+            "w30" => "last 30 min",
+            "w45" => "last 45 min",
+            "w60" => "last hour",
             _ => "last 5 min"
         };
         LiveSpendLabel.Text = $"Spend · {name}";
@@ -565,7 +571,8 @@ public partial class MainWindow : Window
         _livePulling = true;
         try
         {
-            var rows = await _database.GetEventsUpdatedSinceAsync(_liveLastSeenMs);
+            // Hour-long windows can hold far more events than the short ones.
+            var rows = await _database.GetEventsUpdatedSinceAsync(_liveLastSeenMs, 1200);
             foreach (var row in rows)
             {
                 _liveLastSeenMs = Math.Max(_liveLastSeenMs, row.UpdatedMs);
@@ -808,14 +815,35 @@ public partial class MainWindow : Window
     {
         const double wallInset = 16;
         const double floorInset = 12;
-        const double gap = 4;
+        const double topPad = 10;
+        var ordered = _liveBubbles.Values.OrderBy(item => item.FirstSeenMs).ToList();
+        if (ordered.Count == 0)
+        {
+            return;
+        }
+
+        // Scale-to-fit: when the stack would overflow the rim, shrink every
+        // block by one shared factor so relative areas stay honest.
+        var available = Math.Max(40, height - floorInset - topPad);
+        var scale = 1.0;
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var needed = PackHeight(ordered, width, wallInset, scale);
+            if (needed <= available || scale <= 0.08)
+            {
+                break;
+            }
+
+            scale *= Math.Max(0.4, Math.Sqrt(available / needed) * 0.96);
+        }
+
+        var gap = GapFor(scale);
         var x = wallInset;
         var rowBase = 0d;
         var rowHeight = 0d;
-
-        foreach (var bubble in _liveBubbles.Values.OrderBy(item => item.FirstSeenMs))
+        foreach (var bubble in ordered)
         {
-            var side = CupSide(bubble);
+            var side = Math.Max(6, CupSide(bubble) * scale);
             bubble.Side = side;
             if (x + side > width - wallInset && x > wallInset)
             {
@@ -844,6 +872,32 @@ public partial class MainWindow : Window
             }
         }
     }
+
+    /// <summary>Height the shelf-packed stack needs at the given block scale.</summary>
+    private double PackHeight(List<LiveBubble> ordered, double width, double wallInset, double scale)
+    {
+        var gap = GapFor(scale);
+        var x = wallInset;
+        var rowBase = 0d;
+        var rowHeight = 0d;
+        foreach (var bubble in ordered)
+        {
+            var side = Math.Max(6, CupSide(bubble) * scale);
+            if (x + side > width - wallInset && x > wallInset)
+            {
+                rowBase += rowHeight + gap;
+                x = wallInset;
+                rowHeight = 0;
+            }
+
+            x += side + gap;
+            rowHeight = Math.Max(rowHeight, side);
+        }
+
+        return rowBase + rowHeight;
+    }
+
+    private static double GapFor(double scale) => scale < 0.6 ? 2 : 4;
 
     private string LiveLabelText(LiveBubble bubble) => _liveMetricKey == "tokens"
         ? FormatCompact(bubble.Event.Tokens.Total)
@@ -910,6 +964,9 @@ public partial class MainWindow : Window
         {
             60_000L => 15_000L,
             900_000L => 180_000L,
+            1_800_000L => 300_000L,
+            2_700_000L => 300_000L,
+            3_600_000L => 600_000L,
             _ => 60_000L
         };
         var gridBrush = (Brush)FindResource("GridlineBrush");
@@ -982,12 +1039,15 @@ public partial class MainWindow : Window
     {
         "w1" => LiveW1,
         "w15" => LiveW15,
+        "w30" => LiveW30,
+        "w45" => LiveW45,
+        "w60" => LiveW60,
         _ => LiveW5
     };
 
     private static string NormalizeLiveWindowKey(string key) => key switch
     {
-        "w1" or "w15" => key,
+        "w1" or "w15" or "w30" or "w45" or "w60" => key,
         _ => "w5"
     };
 
