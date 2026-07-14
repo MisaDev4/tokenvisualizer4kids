@@ -10,6 +10,10 @@ Double-click **`TokenTracker.exe`**. There is nothing to install. Closing the wi
 
 The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), a stacked per-model timeline, and a by-model breakdown. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — 1-minute bars over the last hour, 15-minute bars over 8 hours, whatever combination fits; **Auto** chooses sensibly and sizes too fine for the range disable themselves. The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text.
 
+## Terminals
+
+The bar under the header (visible on every tab) tracks each Claude Code terminal on the machine by tailing its session transcript: **green** means the turn finished and the terminal is sitting at the prompt, **blue** means it is mid-turn working, and **amber** means it has been quiet mid-turn for a while — usually a permission prompt waiting for an answer. No hooks or integration needed; state flips within a few seconds.
+
 ## Live
 
 ![Live](docs/live.png)

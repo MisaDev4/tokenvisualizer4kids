@@ -23,7 +23,9 @@ public partial class MainWindow : Window
     private readonly UsageDatabase _database;
     private readonly UsageCollector _collector;
     private readonly ClaudeLimitsService _limitsService = new();
+    private readonly TerminalStatusService _terminalsService = new();
     private readonly SemaphoreSlim _dashboardLock = new(1, 1);
+    private bool _terminalsScanning;
     private bool _loaded;
     private bool _disposed;
     private string _rangeKey = "last7";
@@ -198,7 +200,79 @@ public partial class MainWindow : Window
         };
         limitsRefresh.Tick += async (_, _) => await RefreshLimitsAsync();
         limitsRefresh.Start();
+
+        // Terminal states flip in seconds (a turn ends, a prompt is answered),
+        // so this polls faster than the other feeds; the scan only tails a
+        // handful of recently touched transcript files.
+        var terminalsRefresh = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(3)
+        };
+        terminalsRefresh.Tick += async (_, _) => await RefreshTerminalsAsync();
+        terminalsRefresh.Start();
     }
+
+    private async Task RefreshTerminalsAsync()
+    {
+        if (_terminalsScanning)
+        {
+            return;
+        }
+
+        _terminalsScanning = true;
+        try
+        {
+            var terminals = await _terminalsService.ScanAsync(TimeSpan.FromHours(6));
+            if (_disposed)
+            {
+                return;
+            }
+
+            var duplicateNames = terminals
+                .GroupBy(status => status.ProjectName, StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1)
+                .Select(group => group.Key)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            TerminalsPanel.ItemsSource = terminals.Take(14).Select(status =>
+            {
+                var age = DateTimeOffset.UtcNow - status.LastActivity;
+                var (dot, text, meaning) = status.State switch
+                {
+                    TerminalState.Ready => (
+                        (Brush)FindResource("Series2Brush"),
+                        age.TotalSeconds < 60 ? "ready" : $"ready · {AgeText(age)}",
+                        "Turn finished — waiting for your prompt."),
+                    TerminalState.Waiting => (
+                        LimitWarningBrush,
+                        $"waiting · {AgeText(age)}",
+                        "Mid-turn but quiet — possibly a permission prompt or a long tool."),
+                    _ => (
+                        (Brush)FindResource("AccentBrush"),
+                        "working…",
+                        "Mid-turn: the model is generating or running tools.")
+                };
+                var name = duplicateNames.Contains(status.ProjectName)
+                    ? $"{status.ProjectName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
+                    : status.ProjectName;
+                return new TerminalVm(
+                    name,
+                    text,
+                    dot,
+                    $"{status.ProjectPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt}");
+            }).ToList();
+            TerminalsBar.Visibility = terminals.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        finally
+        {
+            _terminalsScanning = false;
+        }
+    }
+
+    private static string AgeText(TimeSpan age) => age.TotalHours >= 1
+        ? $"{(int)age.TotalHours}h {age.Minutes}m"
+        : $"{Math.Max(1, (int)age.TotalMinutes)}m";
+
+    private sealed record TerminalVm(string Name, string StatusText, Brush DotBrush, string Tooltip);
 
     private async Task RefreshLimitsAsync()
     {
@@ -435,6 +509,7 @@ public partial class MainWindow : Window
             _liveStarted = true;
             _liveTimer.Start();
             _ = RefreshLimitsAsync();
+            _ = RefreshTerminalsAsync();
         }
         catch (Exception exception)
         {
