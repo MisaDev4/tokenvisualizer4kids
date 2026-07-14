@@ -12,7 +12,7 @@ The classic view: estimated cost with a comparison against the prior period, tok
 
 ## Terminals
 
-A page with one tile per **open** Claude Code terminal, read from Claude Code's own live session registry and verified against the running processes (so closed terminals don't linger). Tiles carry the same session names Claude Code uses: **green** means the terminal is sitting at the prompt, **blue** means it is mid-turn working — background agents count, so a turn that ended while its agents keep running stays blue — and **amber** means it wants attention: a permission prompt, a plan approval, or a turn gone quiet. Older Claude Code versions without the registry fall back to transcript-tail matching. No hooks or integration needed; states flip within a few seconds.
+A page with one tile per **open** terminal — Claude Code and Codex, each tagged with a colored badge so you can tell them apart at a glance. Claude Code terminals come from Claude Code's own live session registry, verified against the running processes (so closed terminals don't linger); Codex terminals are classified from their session rollouts and matched against running codex processes the same way. Tiles carry the same session names Claude Code uses: **green** means the terminal is sitting at the prompt, **blue** means it is mid-turn working — background agents count, so a turn that ended while its agents keep running stays blue — and **amber** means it wants attention: a permission prompt, a plan approval, or a turn gone quiet. Older Claude Code versions without the registry fall back to transcript-tail matching. No hooks or integration needed; states flip within a few seconds.
 
 ## Live
 

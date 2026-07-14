@@ -268,14 +268,20 @@ public partial class MainWindow : Window
                 var name = duplicateNames.Contains(status.ProjectName)
                     ? $"{status.ProjectName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
                     : status.ProjectName;
+                var (badgeText, badgeBrush, appName) = status.App == TerminalApp.Codex
+                    ? ("CODEX", CodexBadgeBrush, "Codex")
+                    : ("CLAUDE", ClaudeBadgeBrush, "Claude Code");
                 return new TerminalTileVm(
                     name,
                     text,
                     state,
                     state,
                     EdgeBrushFor(state),
+                    badgeText,
+                    badgeBrush,
+                    EdgeBrushFor(badgeBrush),
                     status.ProjectPath,
-                    $"{status.ProjectPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}");
+                    $"{appName} · {status.ProjectPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}");
             }).ToList();
 
             var ready = terminals.Count(status => status.State == TerminalState.Ready);
@@ -283,7 +289,7 @@ public partial class MainWindow : Window
             var waiting = terminals.Count(status => status.State == TerminalState.Waiting);
             TerminalsSubtitle.Text =
                 $"{ready} ready · {working} working · {waiting} waiting · " +
-                $"open terminals, matched to running Claude Code processes";
+                $"open terminals, matched to running Claude Code and Codex processes";
             TerminalsEmpty.Visibility = terminals.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         finally
@@ -316,6 +322,9 @@ public partial class MainWindow : Window
         Brush StatusBrush,
         Brush DotBrush,
         Brush EdgeBrush,
+        string BadgeText,
+        Brush BadgeBrush,
+        Brush BadgeEdgeBrush,
         string PathText,
         string Tooltip);
 
@@ -480,6 +489,10 @@ public partial class MainWindow : Window
 
     private static readonly Brush LimitWarningBrush = new SolidColorBrush(Color.FromRgb(0xE0, 0xA4, 0x58));
     private static readonly Brush LimitCriticalBrush = new SolidColorBrush(Color.FromRgb(0xE5, 0x53, 0x4B));
+
+    /// <summary>Terminal tile badges: Claude clay and OpenAI green.</summary>
+    private static readonly Brush ClaudeBadgeBrush = new SolidColorBrush(Color.FromRgb(0xD9, 0x77, 0x57));
+    private static readonly Brush CodexBadgeBrush = new SolidColorBrush(Color.FromRgb(0x3D, 0xC0, 0x8E));
 
     private sealed record LimitVm(
         string Label,

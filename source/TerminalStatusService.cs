@@ -23,7 +23,14 @@ public sealed record TerminalStatus(
     string ProjectName,
     string ProjectPath,
     TerminalState State,
-    DateTimeOffset LastActivity);
+    DateTimeOffset LastActivity,
+    TerminalApp App);
+
+public enum TerminalApp
+{
+    ClaudeCode,
+    Codex
+}
 
 /// <summary>
 /// Reports which Claude Code terminals are busy and which are sitting at the
@@ -54,6 +61,11 @@ public sealed class TerminalStatusService
         ".claude",
         "sessions");
 
+    public string CodexSessionsRoot { get; init; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".codex",
+        "sessions");
+
     public Task<IReadOnlyList<TerminalStatus>> ScanAsync(TimeSpan lookback, CancellationToken cancellationToken = default) =>
         Task.Run(() => Scan(lookback), cancellationToken);
 
@@ -64,6 +76,8 @@ public sealed class TerminalStatusService
         {
             results = ScanTranscripts(lookback);
         }
+
+        results.AddRange(ScanCodexSessions(lookback));
 
         return results
             .OrderBy(status => status.State switch
@@ -182,7 +196,8 @@ public sealed class TerminalStatusService
             string.IsNullOrEmpty(name) ? "unknown" : name,
             cwd,
             state,
-            lastActivity);
+            lastActivity,
+            TerminalApp.ClaudeCode);
     }
 
     private static bool IsLiveClaudeProcess(int pid, DateTimeOffset? startedAt)
@@ -292,44 +307,57 @@ public sealed class TerminalStatusService
             }
         }
 
-        // A closed terminal leaves a transcript that looks exactly like an idle
-        // one, so match against running claude processes: per working directory,
-        // keep at most as many sessions (newest first) as there are processes.
-        var openCounts = OpenTerminalCwds();
-        if (openCounts is not null)
-        {
-            var kept = new List<TerminalStatus>();
-            var used = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var status in results.OrderByDescending(item => item.LastActivity))
-            {
-                var key = NormalizePath(status.ProjectPath);
-                if (used.GetValueOrDefault(key) < openCounts.GetValueOrDefault(key))
-                {
-                    used[key] = used.GetValueOrDefault(key) + 1;
-                    kept.Add(status);
-                }
-            }
+        // A closed terminal leaves a transcript that looks exactly like an
+        // idle one, so match against running claude processes (a self-update
+        // renames running ones to claude.exe.old.<timestamp>).
+        return ApplyProcessCap(results, OpenTerminalCwds(name =>
+            name.Equals("claude", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("claude.exe.old", StringComparison.OrdinalIgnoreCase)));
+    }
 
-            results = kept;
+    /// <summary>Per working directory, keep at most as many sessions (newest
+    /// first) as there are open terminal processes there. A null count map
+    /// means enumeration failed; skip filtering rather than blank the page.</summary>
+    private static List<TerminalStatus> ApplyProcessCap(List<TerminalStatus> results, Dictionary<string, int>? openCounts)
+    {
+        if (openCounts is null)
+        {
+            return results;
         }
 
-        return results;
+        var kept = new List<TerminalStatus>();
+        var used = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var status in results.OrderByDescending(item => item.LastActivity))
+        {
+            var key = NormalizePath(status.ProjectPath);
+            if (used.GetValueOrDefault(key) < openCounts.GetValueOrDefault(key))
+            {
+                used[key] = used.GetValueOrDefault(key) + 1;
+                kept.Add(status);
+            }
+        }
+
+        return kept;
     }
 
     private static string NormalizePath(string path) => path.TrimEnd('\\', '/');
 
-    /// <summary>Working directories of running claude processes, with counts.
-    /// Null when enumeration itself fails, so the caller can skip filtering
-    /// rather than blank the page.</summary>
-    private static Dictionary<string, int>? OpenTerminalCwds()
+    /// <summary>Working directories of running terminal processes, with counts.
+    /// Null when enumeration itself fails.</summary>
+    private static Dictionary<string, int>? OpenTerminalCwds(Func<string, bool> processNameMatches)
     {
         try
         {
             var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var process in Process.GetProcessesByName("claude"))
+            foreach (var process in Process.GetProcesses())
             {
                 using (process)
                 {
+                    if (!processNameMatches(process.ProcessName))
+                    {
+                        continue;
+                    }
+
                     var cwd = TryGetProcessCwd(process);
                     if (!string.IsNullOrEmpty(cwd))
                     {
@@ -342,6 +370,186 @@ public sealed class TerminalStatusService
             return counts;
         }
         catch
+        {
+            return null;
+        }
+    }
+
+    // ----- Codex ------------------------------------------------------------
+
+    /// <summary>Codex has no session registry, so its rollouts get the same
+    /// treatment as the Claude fallback: classify the tail of every recent
+    /// session, then cap per working directory by running codex processes
+    /// (the TUI is a single codex.exe per terminal; helper processes have
+    /// longer names and are excluded by the exact match).</summary>
+    private List<TerminalStatus> ScanCodexSessions(TimeSpan lookback)
+    {
+        var results = new List<TerminalStatus>();
+        if (!Directory.Exists(CodexSessionsRoot))
+        {
+            return results;
+        }
+
+        // Rollouts are partitioned into sessions\yyyy\MM\dd folders.
+        var cutoff = DateTime.UtcNow - lookback;
+        for (var day = DateTime.Now.Date; day >= cutoff.ToLocalTime().Date; day = day.AddDays(-1))
+        {
+            var folder = Path.Combine(CodexSessionsRoot, $"{day:yyyy}", $"{day:MM}", $"{day:dd}");
+            if (!Directory.Exists(folder))
+            {
+                continue;
+            }
+
+            foreach (var path in Directory.EnumerateFiles(folder, "*.jsonl"))
+            {
+                try
+                {
+                    var info = new FileInfo(path);
+                    if (info.LastWriteTimeUtc < cutoff)
+                    {
+                        continue;
+                    }
+
+                    var status = ClassifyCodex(info);
+                    if (status is not null)
+                    {
+                        results.Add(status);
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+
+        return ApplyProcessCap(results, OpenTerminalCwds(name =>
+            name.Equals("codex", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static TerminalStatus? ClassifyCodex(FileInfo file)
+    {
+        string? projectPath = null;
+        var state = null as TerminalState?;
+
+        foreach (var line in TailLinesNewestFirst(file.FullName))
+        {
+            JsonDocument document;
+            try
+            {
+                document = JsonDocument.Parse(line);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+
+            using (document)
+            {
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object ||
+                    !root.TryGetProperty("payload", out var payload))
+                {
+                    continue;
+                }
+
+                if (projectPath is null && payload.ValueKind == JsonValueKind.Object &&
+                    payload.TryGetProperty("cwd", out var cwd) && cwd.ValueKind == JsonValueKind.String)
+                {
+                    projectPath = cwd.GetString();
+                }
+
+                if (state is not null)
+                {
+                    if (projectPath is not null)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                switch (StringOf(root, "type"))
+                {
+                    case "event_msg":
+                        switch (StringOf(payload, "type"))
+                        {
+                            case "task_complete":
+                            case "turn_aborted":
+                                state = TerminalState.Ready;
+                                break;
+
+                            case "task_started":
+                            case "user_message":
+                                state = TerminalState.Working;
+                                break;
+                        }
+
+                        break;
+
+                    case "response_item":
+                        // Model output or a tool call: the turn is in flight.
+                        state = TerminalState.Working;
+                        break;
+                }
+
+                if (state is not null && projectPath is not null)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (state is null)
+        {
+            return null;
+        }
+
+        // The session_meta first line holds the cwd when no turn_context fell
+        // inside the tail window.
+        projectPath ??= CodexHeadCwd(file.FullName);
+
+        var lastActivity = new DateTimeOffset(file.LastWriteTimeUtc, TimeSpan.Zero);
+        if (state == TerminalState.Working && DateTimeOffset.UtcNow - lastActivity > WaitingAfter)
+        {
+            state = TerminalState.Waiting;
+        }
+
+        // rollout-yyyy-MM-ddTHH-mm-ss-<session uuid>.jsonl
+        var baseName = Path.GetFileNameWithoutExtension(file.Name);
+        var sessionId = baseName.Length > 28 ? baseName[28..] : baseName;
+
+        var name = string.IsNullOrEmpty(projectPath) ? "unknown" : Path.GetFileName(projectPath.TrimEnd('\\', '/'));
+        return new TerminalStatus(
+            sessionId,
+            string.IsNullOrEmpty(name) ? "unknown" : name,
+            projectPath ?? "",
+            state.Value,
+            lastActivity,
+            TerminalApp.Codex);
+    }
+
+    /// <summary>Extracts payload.cwd from the session_meta line without
+    /// parsing it: that line embeds the entire base prompt and can run past
+    /// any sensible read budget, but the cwd sits near its start.</summary>
+    private static string? CodexHeadCwd(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var buffer = new byte[16 * 1024];
+            var read = stream.Read(buffer, 0, buffer.Length);
+            var text = Encoding.UTF8.GetString(buffer, 0, read);
+
+            var match = System.Text.RegularExpressions.Regex.Match(text, "\"cwd\":\"((?:[^\"\\\\]|\\\\.)*)\"");
+            return match.Success
+                ? match.Groups[1].Value.Replace("\\\\", "\\").Replace("\\/", "/")
+                : null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return null;
         }
@@ -544,7 +752,8 @@ public sealed class TerminalStatusService
             string.IsNullOrEmpty(name) ? "unknown" : name,
             projectPath ?? "",
             state.Value,
-            lastActivity);
+            lastActivity,
+            TerminalApp.ClaudeCode);
     }
 
     private static string UserEntryText(JsonElement root)

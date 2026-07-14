@@ -640,11 +640,11 @@
         <StackPanel>
           <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
             <StackPanel>
-              <TextBlock Text="Claude Code terminals" FontSize="18" FontWeight="SemiBold"
+              <TextBlock Text="Open terminals" FontSize="18" FontWeight="SemiBold"
                          Foreground="{StaticResource InkBrush}" />
               <TextBlock x:Name="TerminalsSubtitle" FontSize="12"
                          Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
-                         Text="Open terminals, matched to running Claude Code processes." />
+                         Text="Open terminals, matched to running Claude Code and Codex processes." />
             </StackPanel>
           </Border>
           <ItemsControl x:Name="TerminalsPanel">
@@ -659,12 +659,24 @@
                         BorderBrush="{Binding EdgeBrush}" BorderThickness="1"
                         ToolTip="{Binding Tooltip}">
                   <StackPanel>
-                    <StackPanel Orientation="Horizontal">
-                      <Ellipse Width="9" Height="9" Fill="{Binding DotBrush}" VerticalAlignment="Center"
-                               Margin="0,1,8,0" />
-                      <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold"
-                                 Foreground="{StaticResource InkBrush}" TextTrimming="CharacterEllipsis" />
-                    </StackPanel>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Orientation="Horizontal">
+                        <Ellipse Width="9" Height="9" Fill="{Binding DotBrush}" VerticalAlignment="Center"
+                                 Margin="0,1,8,0" />
+                        <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold"
+                                   Foreground="{StaticResource InkBrush}" TextTrimming="CharacterEllipsis" />
+                      </StackPanel>
+                      <Border Grid.Column="1" CornerRadius="4" BorderThickness="1" Padding="5,1"
+                              Margin="8,0,0,0" VerticalAlignment="Center"
+                              BorderBrush="{Binding BadgeEdgeBrush}">
+                        <TextBlock Text="{Binding BadgeText}" FontSize="9" FontWeight="Bold"
+                                   Foreground="{Binding BadgeBrush}" />
+                      </Border>
+                    </Grid>
                     <TextBlock Text="{Binding StatusText}" FontSize="12" FontWeight="SemiBold"
                                Foreground="{Binding StatusBrush}" Margin="17,7,0,0" />
                     <TextBlock Text="{Binding PathText}" FontSize="11"
@@ -677,7 +689,7 @@
           </ItemsControl>
           <TextBlock x:Name="TerminalsEmpty" FontSize="13" Foreground="{StaticResource MutedBrush}"
                      TextWrapping="Wrap" TextAlignment="Center" Margin="0,26,0,0" Visibility="Collapsed"
-                     Text="No Claude Code terminals are open right now." />
+                     Text="No Claude Code or Codex terminals are open right now." />
         </StackPanel>
       </ScrollViewer>
     </Grid>
