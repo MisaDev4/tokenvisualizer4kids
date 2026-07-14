@@ -8,7 +8,7 @@ namespace TokenTracker;
 
 public enum TerminalState
 {
-    /// <summary>Mid-turn: the model is generating or running tools.</summary>
+    /// <summary>Mid-turn: the model is generating, running tools, or has background agents out.</summary>
     Working,
 
     /// <summary>Mid-turn but quiet for a while: likely a permission prompt or a long tool.</summary>
@@ -26,13 +26,15 @@ public sealed record TerminalStatus(
     DateTimeOffset LastActivity);
 
 /// <summary>
-/// Watches the tails of Claude Code session transcripts to tell which
-/// terminals are busy and which have finished their turn and are waiting for
-/// a prompt. A finished turn is unmistakable in the transcript: an assistant
-/// entry with stop_reason end_turn followed by a system/turn_duration record.
-/// Anything else conversational means the turn is still in flight — and if a
-/// turn has been silent for a while, that usually means a permission prompt
-/// or a long-running tool wants attention.
+/// Reports which Claude Code terminals are busy and which are sitting at the
+/// prompt. The primary source is Claude Code's own session registry
+/// (~/.claude/sessions/&lt;pid&gt;.json), which each running terminal keeps
+/// updated with its current session id and a live busy/idle status — this is
+/// authoritative even when the transcript is silent, e.g. while background
+/// agents run after the main turn ended. Registry entries are only trusted
+/// when their pid is a live claude process started at the recorded time.
+/// Older Claude Code versions without the registry fall back to classifying
+/// transcript tails.
 /// </summary>
 public sealed class TerminalStatusService
 {
@@ -47,10 +49,219 @@ public sealed class TerminalStatusService
         ".claude",
         "projects");
 
+    public string SessionsRoot { get; init; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude",
+        "sessions");
+
     public Task<IReadOnlyList<TerminalStatus>> ScanAsync(TimeSpan lookback, CancellationToken cancellationToken = default) =>
         Task.Run(() => Scan(lookback), cancellationToken);
 
     private IReadOnlyList<TerminalStatus> Scan(TimeSpan lookback)
+    {
+        var results = ScanSessionRegistry();
+        if (results.Count == 0)
+        {
+            results = ScanTranscripts(lookback);
+        }
+
+        return results
+            .OrderBy(status => status.State switch
+            {
+                TerminalState.Ready => 0,
+                TerminalState.Waiting => 1,
+                _ => 2
+            })
+            .ThenByDescending(status => status.LastActivity)
+            .ToList();
+    }
+
+    // ----- Session registry ------------------------------------------------
+
+    private List<TerminalStatus> ScanSessionRegistry()
+    {
+        var results = new List<TerminalStatus>();
+        if (!Directory.Exists(SessionsRoot))
+        {
+            return results;
+        }
+
+        foreach (var path in Directory.EnumerateFiles(SessionsRoot, "*.json"))
+        {
+            try
+            {
+                var status = ReadRegistryEntry(path);
+                if (status is not null)
+                {
+                    results.Add(status);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+            {
+                // A registry file mid-write or malformed; next scan is 3 s away.
+            }
+        }
+
+        return results;
+    }
+
+    private TerminalStatus? ReadRegistryEntry(string path)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(path));
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        // Only interactive terminals; daemons and one-shot runs are not tiles.
+        var kind = StringOf(root, "kind");
+        if (kind is not null && kind != "interactive")
+        {
+            return null;
+        }
+
+        var sessionId = StringOf(root, "sessionId");
+        var cwd = StringOf(root, "cwd");
+        if (string.IsNullOrEmpty(sessionId) || string.IsNullOrEmpty(cwd) ||
+            !root.TryGetProperty("pid", out var pidValue) || !pidValue.TryGetInt32(out var pid))
+        {
+            return null;
+        }
+
+        // Exited terminals can leave their registry file behind, and pids get
+        // reused; only a live claude process born when the entry says counts.
+        var startedAt = root.TryGetProperty("startedAt", out var startedValue) && startedValue.TryGetInt64(out var started)
+            ? DateTimeOffset.FromUnixTimeMilliseconds(started)
+            : (DateTimeOffset?)null;
+        if (!IsLiveClaudeProcess(pid, startedAt))
+        {
+            return null;
+        }
+
+        var statusUpdatedAt = root.TryGetProperty("statusUpdatedAt", out var updatedValue) && updatedValue.TryGetInt64(out var updated)
+            ? DateTimeOffset.FromUnixTimeMilliseconds(updated)
+            : DateTimeOffset.MinValue;
+        var liveStatus = StringOf(root, "status");
+
+        var projectDir = Path.Combine(ProjectsRoot, FlattenProjectPath(cwd));
+        var lastActivity = LatestActivity(projectDir, sessionId, statusUpdatedAt);
+
+        TerminalState state;
+        if (liveStatus == "idle")
+        {
+            state = TerminalState.Ready;
+            // For an idle terminal "since" means "sitting at the prompt since".
+            lastActivity = statusUpdatedAt > DateTimeOffset.MinValue ? statusUpdatedAt : lastActivity;
+        }
+        else if (liveStatus == "waiting")
+        {
+            // Claude Code says the turn is blocked on the user: a permission
+            // prompt, a plan approval, background work it is paused on.
+            state = TerminalState.Waiting;
+        }
+        else
+        {
+            // busy (or an unknown future status): subagent transcripts count
+            // as activity, so a terminal whose main turn is silent while
+            // agents run stays working, while one that has gone completely
+            // quiet mid-turn drifts to waiting.
+            state = DateTimeOffset.UtcNow - lastActivity > WaitingAfter
+                ? TerminalState.Waiting
+                : TerminalState.Working;
+        }
+
+        var name = StringOf(root, "name");
+        if (string.IsNullOrEmpty(name))
+        {
+            name = Path.GetFileName(cwd.TrimEnd('\\', '/'));
+        }
+
+        return new TerminalStatus(
+            sessionId,
+            string.IsNullOrEmpty(name) ? "unknown" : name,
+            cwd,
+            state,
+            lastActivity);
+    }
+
+    private static bool IsLiveClaudeProcess(int pid, DateTimeOffset? startedAt)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+
+            // A self-update renames the image of running terminals to
+            // claude.exe.old.<timestamp>, so match on the prefix.
+            if (!process.ProcessName.StartsWith("claude", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            // The registry records when the session started, which is after
+            // its process launched (startup lag, /clear, /resume). A pid that
+            // was reused later belongs to a process born after that moment.
+            return startedAt is null ||
+                new DateTimeOffset(process.StartTime.ToUniversalTime(), TimeSpan.Zero)
+                    <= startedAt.Value + TimeSpan.FromSeconds(60);
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The newest write among the session transcript and its
+    /// subagent transcripts, so live background agents count as activity.</summary>
+    private static DateTimeOffset LatestActivity(string projectDir, string sessionId, DateTimeOffset floor)
+    {
+        var latest = floor;
+        try
+        {
+            var transcript = new FileInfo(Path.Combine(projectDir, sessionId + ".jsonl"));
+            if (transcript.Exists && transcript.LastWriteTimeUtc > latest.UtcDateTime)
+            {
+                latest = new DateTimeOffset(transcript.LastWriteTimeUtc, TimeSpan.Zero);
+            }
+
+            var subagents = Path.Combine(projectDir, sessionId, "subagents");
+            if (Directory.Exists(subagents))
+            {
+                foreach (var file in Directory.EnumerateFiles(subagents, "*.jsonl"))
+                {
+                    var writeTime = File.GetLastWriteTimeUtc(file);
+                    if (writeTime > latest.UtcDateTime)
+                    {
+                        latest = new DateTimeOffset(writeTime, TimeSpan.Zero);
+                    }
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+        }
+
+        return latest;
+    }
+
+    /// <summary>Claude Code stores each project's transcripts in a folder named
+    /// after the working directory with every non-alphanumeric character
+    /// dashed: C:\Users\kir → C--Users-kir.</summary>
+    private static string FlattenProjectPath(string cwd)
+    {
+        var trimmed = cwd.TrimEnd('\\', '/');
+        var builder = new StringBuilder(trimmed.Length);
+        foreach (var character in trimmed)
+        {
+            builder.Append(char.IsLetterOrDigit(character) ? character : '-');
+        }
+
+        return builder.ToString();
+    }
+
+    // ----- Transcript fallback (Claude Code without the session registry) --
+
+    private List<TerminalStatus> ScanTranscripts(TimeSpan lookback)
     {
         var results = new List<TerminalStatus>();
         if (!Directory.Exists(ProjectsRoot))
@@ -102,15 +313,7 @@ public sealed class TerminalStatusService
             results = kept;
         }
 
-        return results
-            .OrderBy(status => status.State switch
-            {
-                TerminalState.Ready => 0,
-                TerminalState.Waiting => 1,
-                _ => 2
-            })
-            .ThenByDescending(status => status.LastActivity)
-            .ToList();
+        return results;
     }
 
     private static string NormalizePath(string path) => path.TrimEnd('\\', '/');
@@ -300,8 +503,18 @@ public sealed class TerminalStatusService
                         break;
 
                     case "user":
+                        var text = UserEntryText(root);
+
+                        // Slash-command records (/context, /effort …) are logged
+                        // as user entries but are not prompts; skip them.
+                        if (text.StartsWith("<command-name>", StringComparison.Ordinal) ||
+                            text.StartsWith("<local-command", StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+
                         // An interrupted turn leaves the terminal at the prompt.
-                        state = UserEntryText(root).StartsWith("[Request interrupted", StringComparison.Ordinal)
+                        state = text.StartsWith("[Request interrupted", StringComparison.Ordinal)
                             ? TerminalState.Ready
                             : TerminalState.Working;
                         break;
