@@ -578,6 +578,59 @@ public sealed class UsageDatabase
         return rows;
     }
 
+    /// <summary>
+    /// Estimated cost and token total of Claude subscription usage that landed
+    /// inside any of the given wall-clock spans — used to attribute local usage
+    /// to whichever account was signed in at the time. Bedrock and Codex events
+    /// don't draw on a Claude plan and are excluded.
+    /// </summary>
+    public async Task<(double Cost, long Tokens)> GetClaudeUsageInSpansAsync(
+        IReadOnlyList<(long StartMs, long EndMs)> spans,
+        PricingService pricing,
+        CancellationToken cancellationToken = default)
+    {
+        if (spans.Count == 0)
+        {
+            return (0, 0);
+        }
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        var clauses = new List<string>();
+        // Spans are one merged stretch per sign-in, so a week holds a few dozen.
+        foreach (var (index, span) in spans.Take(400).Index())
+        {
+            clauses.Add($"(timestamp_ms >= $s{index} AND timestamp_ms < $e{index})");
+            command.Parameters.AddWithValue($"$s{index}", span.StartMs);
+            command.Parameters.AddWithValue($"$e{index}", span.EndMs);
+        }
+
+        command.CommandText = $"""
+            SELECT provider, model, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens
+            FROM usage_events
+            WHERE client = 'claude' AND provider = 'anthropic'
+              AND ({string.Join(" OR ", clauses)});
+            """;
+
+        var cost = 0d;
+        var total = 0L;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var tokens = new TokenBreakdown(
+                reader.GetInt64(2),
+                reader.GetInt64(3),
+                reader.GetInt64(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6));
+            cost += pricing.Calculate(reader.GetString(0), reader.GetString(1), tokens).Cost;
+            total += tokens.Total;
+        }
+
+        return (cost, total);
+    }
+
     private static async Task<double> ComputeCostAsync(
         SqliteConnection connection,
         long startMs,

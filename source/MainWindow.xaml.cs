@@ -376,6 +376,30 @@ public partial class MainWindow : Window
             }).ToList();
             LimitsStrip.Visibility = Visibility.Visible;
 
+            // Local usage attributed per account: events that landed while the
+            // account was the signed-in one (the transcripts themselves carry
+            // no account identity, so the observed sign-in timeline is the map).
+            var attributionSinceMs = DateTimeOffset.UtcNow.AddDays(-7).ToUnixTimeMilliseconds();
+            var usageTexts = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var account in accounts)
+            {
+                var spans = _limitsService.SignedInSpans(account.Id, attributionSinceMs);
+                if (spans.Count == 0)
+                {
+                    usageTexts[account.Id] = "no local usage attributed yet — starts counting while its sign-ins are observed";
+                    continue;
+                }
+
+                var (cost, tokens) = await _database.GetClaudeUsageInSpansAsync(spans, _pricing);
+                usageTexts[account.Id] =
+                    $"≈ {FormatMoney(cost)} · {FormatCompact(tokens)} tok of local usage attributed · last 7 days";
+            }
+
+            if (_disposed)
+            {
+                return;
+            }
+
             LimitsDetailList.ItemsSource = accounts.Select(account => new AccountVm(
                 account.Email,
                 PlanLabel(account.Plan, account.RateLimitTier),
@@ -387,6 +411,7 @@ public partial class MainWindow : Window
                             : "stale — waiting for its next sign-in"
                         : "tracked in the background",
                 account.IsActive ? (Brush)FindResource("AccentBrush") : (Brush)FindResource("MutedBrush"),
+                usageTexts.GetValueOrDefault(account.Id, ""),
                 account.Limits.Select(limit =>
                 {
                     // The thin bar under the usage bar: how far through the
@@ -541,6 +566,7 @@ public partial class MainWindow : Window
         string PlanText,
         string StatusText,
         Brush StatusBrush,
+        string UsageText,
         List<LimitDetailVm> Limits);
 
     protected override void OnSourceInitialized(EventArgs e)

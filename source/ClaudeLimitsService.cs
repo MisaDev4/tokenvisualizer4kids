@@ -45,7 +45,15 @@ public sealed class ClaudeLimitsService : IDisposable
     /// <summary>A failed token refresh is not retried for this long.</summary>
     private const long RefreshRetryMs = 900_000;
 
+    /// <summary>Polls run every ~60 s; a quiet stretch under this still counts
+    /// as the same continuous sign-in when building the attribution timeline.</summary>
+    private const long SpanMergeGapMs = 300_000;
+
+    /// <summary>Sign-in history older than this is dropped.</summary>
+    private const long TimelineKeepMs = 30L * 86_400_000;
+
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly List<ActiveSpan> _timeline = [];
     private readonly Dictionary<string, StoredAccount> _accounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _tokenOwner = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _refreshFailedAtMs = new(StringComparer.Ordinal);
@@ -66,6 +74,10 @@ public sealed class ClaudeLimitsService : IDisposable
         LoadStore();
         var activeId = await AdoptCurrentCredentialsAsync(cancellationToken).ConfigureAwait(false);
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (activeId is not null)
+        {
+            RecordActiveSpan(activeId, nowMs);
+        }
 
         foreach (var account in _accounts.Values)
         {
@@ -86,6 +98,43 @@ public sealed class ClaudeLimitsService : IDisposable
             .ThenBy(account => account.Email, StringComparer.OrdinalIgnoreCase)
             .Select(account => ToResult(account, account.Id == activeId, nowMs))
             .ToList();
+    }
+
+    /// <summary>Extends the sign-in timeline used to attribute local usage to
+    /// accounts. Transcripts carry no account identity, so which account was
+    /// signed in at the time an event landed is the only attribution there is.</summary>
+    private void RecordActiveSpan(string accountId, long nowMs)
+    {
+        var last = _timeline.Count > 0 ? _timeline[^1] : null;
+        if (last is not null && last.AccountId == accountId && nowMs - last.EndMs < SpanMergeGapMs)
+        {
+            last.EndMs = nowMs;
+        }
+        else
+        {
+            _timeline.Add(new ActiveSpan { AccountId = accountId, StartMs = nowMs, EndMs = nowMs });
+        }
+
+        _timeline.RemoveAll(span => span.EndMs < nowMs - TimelineKeepMs);
+    }
+
+    /// <summary>Windows during which the account was the signed-in one, newest
+    /// last, clipped to sinceMs. The end of each span is padded by the merge
+    /// gap so usage between two polls of the same account still counts.</summary>
+    public IReadOnlyList<(long StartMs, long EndMs)> SignedInSpans(string accountId, long sinceMs)
+    {
+        var results = new List<(long, long)>();
+        foreach (var span in _timeline)
+        {
+            if (span.AccountId != accountId || span.EndMs + SpanMergeGapMs <= sinceMs)
+            {
+                continue;
+            }
+
+            results.Add((Math.Max(span.StartMs, sinceMs), span.EndMs + SpanMergeGapMs));
+        }
+
+        return results;
     }
 
     /// <summary>Reads the Claude Code credentials file and folds the signed-in
@@ -416,6 +465,8 @@ public sealed class ClaudeLimitsService : IDisposable
                     }
                 }
             }
+
+            _timeline.AddRange((store?.Timeline ?? []).Where(span => !string.IsNullOrEmpty(span.AccountId)));
         }
         catch (Exception exception) when (exception is IOException or JsonException or UnauthorizedAccessException)
         {
@@ -431,7 +482,7 @@ public sealed class ClaudeLimitsService : IDisposable
             File.WriteAllText(
                 AccountStorePath,
                 JsonSerializer.Serialize(
-                    new AccountStore { Accounts = _accounts.Values.ToList() },
+                    new AccountStore { Accounts = _accounts.Values.ToList(), Timeline = _timeline },
                     new JsonSerializerOptions { WriteIndented = true }));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
@@ -456,6 +507,17 @@ public sealed class ClaudeLimitsService : IDisposable
 internal sealed class AccountStore
 {
     public List<StoredAccount> Accounts { get; set; } = [];
+
+    public List<ActiveSpan> Timeline { get; set; } = [];
+}
+
+/// <summary>One stretch of wall-clock time during which an account was the
+/// one signed into Claude Code.</summary>
+internal sealed class ActiveSpan
+{
+    public string AccountId { get; set; } = "";
+    public long StartMs { get; set; }
+    public long EndMs { get; set; }
 }
 
 internal sealed class StoredAccount

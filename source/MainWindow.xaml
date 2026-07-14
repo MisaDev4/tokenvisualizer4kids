@@ -590,6 +590,10 @@
                                    Foreground="{StaticResource InkBrush}" />
                         <TextBlock Text="{Binding StatusText}" FontSize="12"
                                    Foreground="{Binding StatusBrush}" Margin="0,3,0,0" />
+                        <TextBlock Text="{Binding UsageText}" FontSize="11"
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                                   TextWrapping="Wrap"
+                                   ToolTip="Estimated from local logs: usage that landed while this account was the one signed into Claude Code. Attribution is only as complete as the time the tracker has been running." />
                       </StackPanel>
                       <TextBlock Grid.Column="1" Text="{Binding PlanText}" FontSize="12"
                                  FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
