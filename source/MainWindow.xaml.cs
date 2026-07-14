@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private readonly PricingService _pricing;
     private readonly UsageDatabase _database;
     private readonly UsageCollector _collector;
+    private readonly ClaudeLimitsService _limitsService = new();
     private readonly SemaphoreSlim _dashboardLock = new(1, 1);
     private bool _loaded;
     private bool _disposed;
@@ -200,7 +201,66 @@ public partial class MainWindow : Window
             }
         };
         liveRefresh.Start();
+
+        // Plan limits move slowly and the endpoint is rate-limit-friendly at
+        // this cadence; failures just keep the last snapshot on screen.
+        var limitsRefresh = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(60)
+        };
+        limitsRefresh.Tick += async (_, _) => await RefreshLimitsAsync();
+        limitsRefresh.Start();
     }
+
+    private async Task RefreshLimitsAsync()
+    {
+        var limits = await _limitsService.FetchAsync();
+        if (limits is null || _disposed)
+        {
+            return;
+        }
+
+        LimitsPanel.ItemsSource = limits.Select(limit =>
+        {
+            var brush = limit.Severity switch
+            {
+                "critical" => LimitCriticalBrush,
+                "warning" => LimitWarningBrush,
+                _ => limit.Percent >= 90 ? LimitCriticalBrush
+                    : limit.Percent >= 70 ? LimitWarningBrush
+                    : (Brush)FindResource("AccentBrush")
+            };
+            var name = limit.Label switch
+            {
+                "5h" => "5-hour session limit",
+                "Week" => "Weekly limit · all models",
+                _ => $"Weekly limit · {limit.Label}"
+            };
+            var resets = limit.ResetsAt is { } at
+                ? $" · resets {FormatResetTime(at.ToLocalTime())}"
+                : "";
+            return new LimitVm(
+                limit.Label,
+                Math.Clamp(limit.Percent / 100.0, 0, 1),
+                brush,
+                $"{limit.Percent:0}%",
+                $"{name} — {limit.Percent:0}% used{resets}");
+        }).ToList();
+        LimitsPanel.Visibility = Visibility.Visible;
+    }
+
+    private static string FormatResetTime(DateTimeOffset local)
+    {
+        var now = DateTimeOffset.Now;
+        return local.Date == now.Date
+            ? local.ToString("h:mm tt", Usd)
+            : local.ToString("ddd h:mm tt", Usd);
+    }
+
+    private static readonly Brush LimitWarningBrush = new SolidColorBrush(Color.FromRgb(0xE0, 0xA4, 0x58));
+    private static readonly Brush LimitCriticalBrush = new SolidColorBrush(Color.FromRgb(0xE5, 0x53, 0x4B));
+
+    private sealed record LimitVm(string Label, double Share, Brush BarBrush, string PercentText, string Tooltip);
 
     protected override void OnSourceInitialized(EventArgs e)
     {
@@ -247,6 +307,7 @@ public partial class MainWindow : Window
             await ReseedRiverAsync();
             _liveStarted = true;
             _liveTimer.Start();
+            _ = RefreshLimitsAsync();
         }
         catch (Exception exception)
         {
@@ -2180,6 +2241,7 @@ public partial class MainWindow : Window
         {
             _disposed = true;
             _collector.Dispose();
+            _limitsService.Dispose();
         }
     }
 
