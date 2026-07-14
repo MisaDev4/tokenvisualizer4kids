@@ -100,15 +100,6 @@
       </StackPanel>
 
       <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-        <Border x:Name="PanelGroupBorder" Style="{StaticResource SegmentGroup}" Margin="0,0,10,0"
-                ToolTip="Right panel: the per-model breakdown or the live cup.">
-          <StackPanel Orientation="Horizontal">
-            <RadioButton x:Name="PanelModels" Style="{StaticResource SegmentButton}" GroupName="dashPanel"
-                         Content="By model" Tag="models" IsChecked="True" Checked="PanelButton_Checked" />
-            <RadioButton x:Name="PanelLive" Style="{StaticResource SegmentButton}" GroupName="dashPanel"
-                         Content="Live" Tag="live" Checked="PanelButton_Checked" />
-          </StackPanel>
-        </Border>
         <Border x:Name="RangeGroupBorder" Style="{StaticResource SegmentGroup}">
           <StackPanel Orientation="Horizontal">
             <RadioButton x:Name="RangeLast1" Style="{StaticResource SegmentButton}" GroupName="range"
@@ -349,12 +340,30 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
           </Grid.RowDefinitions>
-          <StackPanel Margin="0,0,0,12">
-            <TextBlock Text="By model" FontSize="16" FontWeight="SemiBold"
-                       Foreground="{StaticResource InkBrush}" />
-            <TextBlock x:Name="ModelsSubtitle" Text="" FontSize="12"
-                       Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
-          </StackPanel>
+          <Grid x:Name="ModelsHeaderGrid" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text="By model" FontSize="16" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="ModelsSubtitle" Text="" FontSize="12"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+            </StackPanel>
+            <!-- Swaps this panel between the model breakdown and the live cup;
+                 rides along into whichever card is showing. -->
+            <Border x:Name="PanelGroup" Grid.Column="1" Style="{StaticResource SegmentGroup}"
+                    VerticalAlignment="Top" Margin="12,0,0,0"
+                    ToolTip="This panel: the per-model breakdown or the live cup.">
+              <StackPanel Orientation="Horizontal">
+                <RadioButton x:Name="PanelModels" Style="{StaticResource SegmentButton}" GroupName="dashPanel"
+                             Content="By model" Tag="models" IsChecked="True" Checked="PanelButton_Checked" />
+                <RadioButton x:Name="PanelLive" Style="{StaticResource SegmentButton}" GroupName="dashPanel"
+                             Content="Live" Tag="live" Checked="PanelButton_Checked" />
+              </StackPanel>
+            </Border>
+          </Grid>
           <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
             <ItemsControl x:Name="ModelsList">
               <ItemsControl.ItemTemplate>
@@ -480,7 +489,8 @@
                          Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
                          Margin="14,1,0,0" />
             </StackPanel>
-            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+            <StackPanel x:Name="LiveHeaderControls" Grid.Column="1" Orientation="Horizontal"
+                        VerticalAlignment="Top">
               <ItemsControl x:Name="RoundHistoryBars" Height="26" Margin="0,2,12,0"
                             VerticalAlignment="Center">
                 <ItemsControl.ItemsPanel>

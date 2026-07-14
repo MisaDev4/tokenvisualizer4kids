@@ -721,12 +721,12 @@ public partial class MainWindow : Window
         DashboardHero.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         DashboardContent.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         RangeGroupBorder.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
-        PanelGroupBorder.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         LiveRoot.Visibility = live ? Visibility.Visible : Visibility.Collapsed;
         LimitsRoot.Visibility = limits ? Visibility.Visible : Visibility.Collapsed;
         TerminalsRoot.Visibility = terminals ? Visibility.Visible : Visibility.Collapsed;
         ModelsCard.Visibility = livePanel ? Visibility.Collapsed : Visibility.Visible;
         PlaceLiveFeedCard(livePanel);
+        PlacePanelGroup(livePanel);
         // Live state keeps running in the background; the tab switch only
         // pauses the per-frame rendering.
         if (live || livePanel)
@@ -800,6 +800,38 @@ public partial class MainWindow : Window
         }
 
         _cupLayoutDirty = true;
+    }
+
+    /// <summary>The panel toggle lives on the panel it switches: in the By model
+    /// header normally, appended to the live feed card's controls while the
+    /// dashboard shows the cup. On other tabs it parks (hidden) with ModelsCard,
+    /// so the Live tab never shows a dashboard-only control.</summary>
+    private void PlacePanelGroup(bool intoLiveHeader)
+    {
+        var parent = PanelGroup.Parent as System.Windows.Controls.Panel;
+        if (intoLiveHeader)
+        {
+            if (ReferenceEquals(parent, LiveHeaderControls))
+            {
+                return;
+            }
+
+            parent?.Children.Remove(PanelGroup);
+            PanelGroup.Margin = new Thickness(8, 0, 0, 0);
+            LiveHeaderControls.Children.Add(PanelGroup);
+        }
+        else
+        {
+            if (ReferenceEquals(parent, ModelsHeaderGrid))
+            {
+                return;
+            }
+
+            parent?.Children.Remove(PanelGroup);
+            PanelGroup.Margin = new Thickness(12, 0, 0, 0);
+            Grid.SetColumn(PanelGroup, 1);
+            ModelsHeaderGrid.Children.Add(PanelGroup);
+        }
     }
 
     private void StartLiveFrames()
