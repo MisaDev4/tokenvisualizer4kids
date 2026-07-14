@@ -4,11 +4,13 @@ A native Windows dashboard for local AI token usage. Every Claude Code and Codex
 
 Double-click **`TokenTracker.exe`**. There is nothing to install. Closing the window leaves it running in the notification area; use the tray icon's **Exit** to stop it completely.
 
+A **Hide personal data** toggle in Settings swaps account emails, project names and folder paths for placeholders wherever they appear — for screenshots and screen shares (every screenshot below was taken with it on). Display only; nothing stored changes.
+
 ## Dashboard
 
 ![Dashboard](docs/dashboard.png)
 
-The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), a stacked per-model timeline, and a by-model breakdown. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — down to 15-second bars over the last hour or minute bars across a half day, whatever combination fits; **Auto** chooses sensibly, and the selector only offers sizes that make sense for the current range (no 1-day bars on a 1-hour view). The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text. A header toggle swaps the right panel between the **By model** breakdown and the **live cup** — the same cup as the Live tab, same state, still interactive — so the totals and the real-time view share one page.
+The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), live burn-rate and token-rate tiles (the last 60 seconds, same numbers as the Live page, ticking on every tab), a stacked per-model timeline, and a by-model breakdown. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — down to 15-second bars over the last hour or minute bars across a half day, whatever combination fits; **Auto** chooses sensibly, and the selector only offers sizes that make sense for the current range (no 1-day bars on a 1-hour view). The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text. A header toggle swaps the right panel between the **By model** breakdown and the **live cup** — the same cup as the Live tab, same state, still interactive — so the totals and the real-time view share one page.
 
 ## Insights
 
