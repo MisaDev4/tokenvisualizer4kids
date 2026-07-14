@@ -222,7 +222,9 @@ public partial class MainWindow : Window
 
         LimitsPanel.ItemsSource = limits.Select(limit =>
         {
-            var brush = limit.Severity switch
+            var elevated = limit.Severity is "critical" or "warning" ||
+                           limit.Percent >= 70;
+            var barBrush = limit.Severity switch
             {
                 "critical" => LimitCriticalBrush,
                 "warning" => LimitWarningBrush,
@@ -237,16 +239,18 @@ public partial class MainWindow : Window
                 _ => $"Weekly limit · {limit.Label}"
             };
             var resets = limit.ResetsAt is { } at
-                ? $" · resets {FormatResetTime(at.ToLocalTime())}"
+                ? $"resets {FormatResetTime(at.ToLocalTime())}"
                 : "";
             return new LimitVm(
                 limit.Label,
                 Math.Clamp(limit.Percent / 100.0, 0, 1),
-                brush,
+                barBrush,
                 $"{limit.Percent:0}%",
-                $"{name} — {limit.Percent:0}% used{resets}");
+                elevated ? barBrush : (Brush)FindResource("InkBrush"),
+                resets,
+                $"{name} — {limit.Percent:0}% used" + (resets.Length > 0 ? $" · {resets}" : ""));
         }).ToList();
-        LimitsPanel.Visibility = Visibility.Visible;
+        LimitsBar.Visibility = Visibility.Visible;
     }
 
     private static string FormatResetTime(DateTimeOffset local)
@@ -260,7 +264,14 @@ public partial class MainWindow : Window
     private static readonly Brush LimitWarningBrush = new SolidColorBrush(Color.FromRgb(0xE0, 0xA4, 0x58));
     private static readonly Brush LimitCriticalBrush = new SolidColorBrush(Color.FromRgb(0xE5, 0x53, 0x4B));
 
-    private sealed record LimitVm(string Label, double Share, Brush BarBrush, string PercentText, string Tooltip);
+    private sealed record LimitVm(
+        string Label,
+        double Share,
+        Brush BarBrush,
+        string PercentText,
+        Brush PercentBrush,
+        string ResetText,
+        string Tooltip);
 
     protected override void OnSourceInitialized(EventArgs e)
     {
@@ -304,6 +315,7 @@ public partial class MainWindow : Window
             // Both live views start with the app, whatever tab or mode is
             // showing, so nothing ever resets on a view switch.
             StartCupRound();
+            await RebuildCupLayersAsync();
             await ReseedRiverAsync();
             _liveStarted = true;
             _liveTimer.Start();
@@ -576,17 +588,14 @@ public partial class MainWindow : Window
         _settings.Save();
         UpdateLiveWindowLabels();
         RebuildLiveAxis();
-        if (_liveModeKey == "cup")
-        {
-            // The running round simply adopts the new length: a longer round
-            // keeps its blocks and countdown; a shorter one settles on the
-            // next tick. Nothing is discarded and nothing is re-ingested.
-            UpdateRoundText(DateTimeOffset.Now.ToUnixTimeMilliseconds());
-        }
-        else
-        {
-            await ReseedRiverAsync();
-        }
+        // Both views share the window length, so both refill from the index —
+        // whichever is hidden must not come back later showing a stale window.
+        // The cup's running round simply adopts the new length (a longer round
+        // keeps its blocks and countdown; a shorter one settles on the next
+        // tick) while the sediment below is re-partitioned at the new size.
+        UpdateRoundText(DateTimeOffset.Now.ToUnixTimeMilliseconds());
+        await RebuildCupLayersAsync();
+        await ReseedRiverAsync();
     }
 
     private void UpdateLiveWindowLabels()
@@ -660,7 +669,8 @@ public partial class MainWindow : Window
         await PullLiveEventsAsync();
     }
 
-    /// <summary>Starts cup tracking from scratch: fresh round, no sediment. App start only.</summary>
+    /// <summary>Resets cup tracking: fresh round, empty canvas. App start only —
+    /// RebuildCupLayersAsync then backfills the sediment from the index.</summary>
     private void StartCupRound()
     {
         foreach (var bubble in _cupBubbles.Values)
@@ -679,7 +689,9 @@ public partial class MainWindow : Window
         UpdateRoundText(_roundStartMs);
     }
 
-    /// <summary>Forgets the river and replays the current window from the index.</summary>
+    /// <summary>Forgets the river and replays the current window from the index,
+    /// by event time — so widening the window backfills real history, including
+    /// activity from before the app started.</summary>
     private async Task ReseedRiverAsync()
     {
         foreach (var bubble in _riverBubbles.Values)
@@ -690,8 +702,23 @@ public partial class MainWindow : Window
         _riverBubbles.Clear();
         _liveLanes.Clear();
         _liveLaneSeq.Clear();
-        _riverLastSeenMs = DateTimeOffset.Now.ToUnixTimeMilliseconds() - _liveWindowMs;
-        await PullLiveEventsAsync();
+        var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        try
+        {
+            var rows = await _database.GetEventsInRangeAsync(nowMs - _liveWindowMs, long.MaxValue, 600);
+            foreach (var row in rows)
+            {
+                UpsertRiverBubble(row);
+            }
+        }
+        catch
+        {
+            // Best effort: the live pull keeps feeding new events regardless.
+        }
+
+        // Slightly behind now: a re-pull of an event already backfilled is a
+        // harmless in-place update, a missed one would be a hole in the river.
+        _riverLastSeenMs = Math.Max(_riverLastSeenMs, nowMs - 2_000);
         UpdateLiveLegend();
     }
 
@@ -757,7 +784,7 @@ public partial class MainWindow : Window
         }
 
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-        if (nowMs - row.UpdatedMs > _liveWindowMs)
+        if (nowMs - row.TimestampMs > _liveWindowMs)
         {
             return;
         }
@@ -775,7 +802,9 @@ public partial class MainWindow : Window
         {
             Event = row,
             Visual = null!,
-            FirstSeenMs = row.UpdatedMs,
+            // Anchored to when the response happened, so backfilled history
+            // lands at its true spot on the time axis instead of "just now".
+            FirstSeenMs = row.TimestampMs,
             SpawnedAtMs = nowMs,
             Lane = lane,
             LaneSlot = slot,
@@ -811,7 +840,7 @@ public partial class MainWindow : Window
         {
             Event = row,
             Visual = null!,
-            FirstSeenMs = row.UpdatedMs,
+            FirstSeenMs = row.TimestampMs,
             SpawnedAtMs = DateTimeOffset.Now.ToUnixTimeMilliseconds(),
             Lane = 0,
             LaneSlot = 0,
@@ -989,22 +1018,7 @@ public partial class MainWindow : Window
                 bubble.Frozen = true;
             }
 
-            var caption = new TextBlock
-            {
-                Text = $"{DateTime.Now:h:mm tt}  ·  {FormatMoney(cost)}  ·  {FormatCompact(tokens)} tok",
-                FontSize = 10,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = (Brush)FindResource("MutedBrush")
-            };
-            var divider = new Line
-            {
-                Stroke = (Brush)FindResource("HairlineBrush"),
-                StrokeThickness = 1,
-                StrokeDashArray = new DoubleCollection { 3, 3 }
-            };
-            Canvas.SetTop(caption, -1000);
-            LiveCanvas.Children.Add(divider);
-            LiveCanvas.Children.Add(caption);
+            var (caption, divider) = CreateLayerChrome(DateTime.Now, cost, tokens);
             _cupLayers.Insert(0, new CupLayer
             {
                 Blocks = active.OrderBy(bubble => bubble.FirstSeenMs).ToList(),
@@ -1039,6 +1053,167 @@ public partial class MainWindow : Window
         {
             LiveScroll.ScrollToVerticalOffset(0);
         }
+    }
+
+    /// <summary>Divider line + score caption that separate one sediment layer from the next.</summary>
+    private (TextBlock Caption, Line Divider) CreateLayerChrome(DateTime endedAt, double cost, long tokens)
+    {
+        var caption = new TextBlock
+        {
+            Text = $"{endedAt:h:mm tt}  ·  {FormatMoney(cost)}  ·  {FormatCompact(tokens)} tok",
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = (Brush)FindResource("MutedBrush")
+        };
+        var divider = new Line
+        {
+            Stroke = (Brush)FindResource("HairlineBrush"),
+            StrokeThickness = 1,
+            StrokeDashArray = new DoubleCollection { 3, 3 }
+        };
+        Canvas.SetTop(caption, -1000);
+        LiveCanvas.Children.Add(divider);
+        LiveCanvas.Children.Add(caption);
+        return (caption, divider);
+    }
+
+    /// <summary>
+    /// Rebuilds the sediment from the index: the time before the active round is
+    /// re-partitioned into rounds of the current length, so changing the round
+    /// size (or starting the app) shows real history instead of an empty cup.
+    /// The active round is untouched; existing layers are replaced wholesale,
+    /// which is also what prevents any event from being counted twice.
+    /// </summary>
+    private async Task RebuildCupLayersAsync()
+    {
+        const int maxLayers = 12;
+
+        List<LiveEventRow> rows;
+        try
+        {
+            rows = await _database.GetEventsInRangeAsync(
+                _roundStartMs - maxLayers * _liveWindowMs, _roundStartMs, 2500);
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var layer in _cupLayers)
+        {
+            LiveCanvas.Children.Remove(layer.Divider);
+            LiveCanvas.Children.Remove(layer.Caption);
+            foreach (var bubble in layer.Blocks)
+            {
+                LiveCanvas.Children.Remove(bubble.Visual);
+                _cupBubbles.Remove(bubble.Event.EventKey);
+            }
+        }
+
+        _cupLayers.Clear();
+        _roundHistory.Clear();
+
+        // Pack budget per history layer: roughly what a settled round gets on
+        // screen. Falls back to sane defaults before the live tab has a size.
+        var width = LiveScroll.ActualWidth > 60 ? LiveScroll.ActualWidth
+            : RiverCanvas.ActualWidth > 60 ? RiverCanvas.ActualWidth
+            : 900;
+        var budget = LiveScroll.ViewportHeight > 120 ? LiveScroll.ViewportHeight * 0.8 : 320;
+
+        var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        for (var i = 0; i < maxLayers; i++)
+        {
+            var windowEnd = _roundStartMs - i * _liveWindowMs;
+            var windowStart = windowEnd - _liveWindowMs;
+            var blocks = new List<LiveBubble>();
+            double cost = 0;
+            long tokens = 0;
+            foreach (var row in rows)
+            {
+                // Skip events outside this window and events already on the
+                // canvas (a straggler indexed after round start stays active).
+                if (row.TimestampMs < windowStart || row.TimestampMs >= windowEnd ||
+                    _cupBubbles.ContainsKey(row.EventKey))
+                {
+                    continue;
+                }
+
+                var estimate = _pricing.Calculate(row.Provider, row.Model, row.Tokens);
+                AssignLiveModelSlot(row.Model);
+                var bubble = new LiveBubble
+                {
+                    Event = row,
+                    Visual = null!,
+                    FirstSeenMs = row.TimestampMs,
+                    SpawnedAtMs = nowMs,
+                    Lane = 0,
+                    LaneSlot = 0,
+                    Jitter = 0,
+                    Cost = estimate.Cost,
+                    Frozen = true
+                };
+                bubble.Visual = CreateCupVisual(bubble);
+                bubble.Visual.Width = 0;
+                bubble.Visual.Height = 0;
+                _cupBubbles[row.EventKey] = bubble;
+                LiveCanvas.Children.Add(bubble.Visual);
+                blocks.Add(bubble);
+                cost += estimate.Cost;
+                tokens += row.Tokens.Total;
+            }
+
+            var endedAt = DateTimeOffset.FromUnixTimeMilliseconds(windowEnd).LocalDateTime;
+            _roundHistory.Insert(0, (endedAt, cost, tokens));
+            if (blocks.Count == 0)
+            {
+                continue;
+            }
+
+            var scale = 1.0;
+            for (var attempt = 0; attempt < 8; attempt++)
+            {
+                var needed = PackHeight(blocks, width, 16, scale);
+                if (needed <= budget || scale <= 0.08)
+                {
+                    break;
+                }
+
+                scale *= Math.Max(0.4, Math.Sqrt(budget / needed) * 0.96);
+            }
+
+            var (caption, divider) = CreateLayerChrome(endedAt, cost, tokens);
+            _cupLayers.Add(new CupLayer
+            {
+                Blocks = blocks,
+                EndedAt = endedAt,
+                Cost = cost,
+                Tokens = tokens,
+                Scale = scale,
+                Divider = divider,
+                Caption = caption
+            });
+        }
+
+        // A quiet stretch before the first real activity is not a score of
+        // zero, it is no round at all: trim leading empties from the bars.
+        while (_roundHistory.Count > 0 && _roundHistory[0].Cost == 0 && _roundHistory[0].Tokens == 0)
+        {
+            _roundHistory.RemoveAt(0);
+        }
+
+        if (_roundHistory.Count > 0)
+        {
+            var last = _roundHistory[^1];
+            _lastRoundCost = last.Cost;
+            _lastRoundTokens = last.Tokens;
+            _bestRoundCost = Math.Max(_bestRoundCost, _roundHistory.Max(round => round.Cost));
+            _bestRoundTokens = Math.Max(_bestRoundTokens, _roundHistory.Max(round => round.Tokens));
+        }
+
+        UpdateRoundHistoryBars();
+        UpdateRoundText(nowMs);
+        UpdateLiveLegend();
+        _cupLayoutDirty = true;
     }
 
     private void UpdateRoundText(long nowMs)

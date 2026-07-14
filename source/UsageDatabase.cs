@@ -530,6 +530,54 @@ public sealed class UsageDatabase
         return rows;
     }
 
+    /// <summary>Events by when they happened (not when they were indexed):
+    /// this is what lets the live views backfill real history.</summary>
+    public async Task<List<LiveEventRow>> GetEventsInRangeAsync(
+        long startTimestampMs,
+        long endTimestampMs,
+        int limit = 2000,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT event_key, client, provider, model, session_id, timestamp_ms, updated_ms,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   reasoning_tokens, message_count
+            FROM usage_events
+            WHERE timestamp_ms >= $start AND timestamp_ms < $end
+            ORDER BY timestamp_ms DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$start", startTimestampMs);
+        command.Parameters.AddWithValue("$end", endTimestampMs);
+        command.Parameters.AddWithValue("$limit", limit);
+
+        var rows = new List<LiveEventRow>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new LiveEventRow(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6),
+                new TokenBreakdown(
+                    reader.GetInt64(7),
+                    reader.GetInt64(8),
+                    reader.GetInt64(9),
+                    reader.GetInt64(10),
+                    reader.GetInt64(11)),
+                reader.GetInt64(12)));
+        }
+
+        rows.Reverse();
+        return rows;
+    }
+
     private static async Task<double> ComputeCostAsync(
         SqliteConnection connection,
         long startMs,
