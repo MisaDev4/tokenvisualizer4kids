@@ -453,12 +453,12 @@
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <StackPanel>
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
               <TextBlock Text="Live feed" FontSize="16" FontWeight="SemiBold"
-                         Foreground="{StaticResource InkBrush}" />
-              <TextBlock x:Name="LiveFeedSubtitle"
-                         Text="Every response drifts in from the right the moment it is logged. Bubble area = estimated cost; one row per session. Hover for details."
-                         FontSize="12" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+                         Foreground="{StaticResource InkBrush}" VerticalAlignment="Center" />
+              <TextBlock x:Name="LiveRoundText" FontSize="12" FontWeight="SemiBold"
+                         Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
+                         Margin="14,1,0,0" Visibility="Collapsed" />
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
               <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0">
