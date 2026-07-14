@@ -1685,10 +1685,18 @@ public partial class MainWindow : Window
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         TickCupRound(nowMs);
 
-        double costWindow = 0, cost60 = 0;
-        long tokensWindow = 0, tokens60 = 0, messagesWindow = 0;
+        double costWindow = 0, cost60 = 0, cost5m = 0;
+        long tokensWindow = 0, tokens60 = 0, tokens5m = 0, messagesWindow = 0;
         foreach (var bubble in _cupBubbles.Values)
         {
+            // Frozen (settled) blocks are out of the current round but still
+            // count toward the rolling 5-minute pace.
+            if (nowMs - bubble.FirstSeenMs <= 300_000)
+            {
+                cost5m += bubble.Cost;
+                tokens5m += bubble.Event.Tokens.Total;
+            }
+
             if (bubble.Frozen)
             {
                 continue;
@@ -1710,10 +1718,9 @@ public partial class MainWindow : Window
         LiveMessagesText.Text = messagesWindow.ToString("N0");
         LiveRateText.Text = $"{FormatMoney(cost60)}/min";
         LiveTokenRateText.Text = $"{FormatCompact((long)(tokens60 / 60.0))}/s";
-        // The dashboard hero mirrors the two live rates; this timer runs on
-        // every tab, so they stay current without the Live view being open.
-        DashBurnRateText.Text = LiveRateText.Text;
-        DashTokenRateText.Text = LiveTokenRateText.Text;
+        LiveFeedRateText.Text = cost5m > 0 || tokens5m > 0
+            ? $"{FormatMoney(cost5m / 5)}/min · {FormatCompact((long)(tokens5m / 300.0))} tok/s · 5 m avg"
+            : "";
     }
 
     /// <summary>Cup round lifecycle: countdown → the pile settles into a layer → fresh round on top.</summary>

@@ -194,7 +194,7 @@
         </StackPanel>
         <Border Grid.Column="1" Width="1" Background="{StaticResource GridlineBrush}"
                 Margin="24,4" />
-        <UniformGrid Grid.Column="2" Columns="8" VerticalAlignment="Center">
+        <UniformGrid Grid.Column="2" Columns="6" VerticalAlignment="Center">
           <StackPanel Margin="6,0">
             <TextBlock Text="Total tokens" Style="{StaticResource TileLabel}" />
             <TextBlock x:Name="TotalTokensText" Text="—" Style="{StaticResource TileValue}" />
@@ -219,16 +219,6 @@
           <StackPanel Margin="6,0">
             <TextBlock Text="Cache write" Style="{StaticResource TileLabel}" />
             <TextBlock x:Name="CacheWriteTokensText" Text="—" Style="{StaticResource TileValue}" />
-          </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Burn rate · 60 s" Style="{StaticResource TileLabel}"
-                       ToolTip="Spend over the last 60 seconds, shown per minute. Live, whatever range is selected." />
-            <TextBlock x:Name="DashBurnRateText" Text="—" Style="{StaticResource TileValue}" />
-          </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Token rate · 60 s" Style="{StaticResource TileLabel}"
-                       ToolTip="Tokens per second over the last 60 seconds. Live, whatever range is selected." />
-            <TextBlock x:Name="DashTokenRateText" Text="—" Style="{StaticResource TileValue}" />
           </StackPanel>
         </UniformGrid>
       </Grid>
@@ -539,6 +529,11 @@
               <TextBlock x:Name="LiveRoundText" FontSize="12" FontWeight="SemiBold"
                          Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
                          Margin="14,1,0,0" />
+              <!-- Smoothed working pace; rides with the card onto the dashboard. -->
+              <TextBlock x:Name="LiveFeedRateText" FontSize="12" FontWeight="SemiBold"
+                         Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
+                         Margin="14,1,0,0"
+                         ToolTip="Average burn over the last 5 minutes: cost per minute and tokens per second. Smoother than the 60-second tiles above the cup." />
             </StackPanel>
             <WrapPanel x:Name="LiveHeaderControls" Grid.Column="1" VerticalAlignment="Top"
                        SizeChanged="ResponsiveHeader_SizeChanged">
