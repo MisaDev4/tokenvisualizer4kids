@@ -90,6 +90,9 @@
             <RadioButton x:Name="TabLive" Style="{StaticResource SegmentButton}" GroupName="tab"
                          Content="Live" Tag="live" Checked="TabButton_Checked"
                          ToolTip="Ultra real time: every response appears as a bubble the moment it is logged." />
+            <RadioButton x:Name="TabLimits" Style="{StaticResource SegmentButton}" GroupName="tab"
+                         Content="Limits" Tag="limits" Checked="TabButton_Checked"
+                         ToolTip="Your Claude plan rate limits, with reset countdowns." />
           </StackPanel>
         </Border>
       </StackPanel>
@@ -158,7 +161,8 @@
 
     <!-- ═══ Claude plan limits (5h session · weekly · per-model weekly), same data as /usage ═══ -->
     <Border x:Name="LimitsBar" Grid.Row="1" Style="{StaticResource Card}" Padding="18,9" Margin="0,0,0,14"
-            Visibility="Collapsed">
+            Visibility="Collapsed" Cursor="Hand" MouseLeftButtonUp="LimitsBar_Clicked"
+            ToolTip="Click for the full limits page.">
       <!-- Meters wrap on narrow windows instead of clipping off the edge. -->
       <ItemsControl x:Name="LimitsPanel" VerticalAlignment="Center">
         <ItemsControl.ItemsPanel>
@@ -561,6 +565,59 @@
           </Grid>
         </Grid>
       </Border>
+    </Grid>
+
+    <!-- ═══ Limits page: one big card per plan limit ═══ -->
+    <Grid x:Name="LimitsRoot" Grid.Row="2" Grid.RowSpan="2" Visibility="Collapsed">
+      <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                    Focusable="False" BorderThickness="0" Padding="0">
+        <StackPanel MaxWidth="860" HorizontalAlignment="Center">
+          <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+            <StackPanel>
+              <TextBlock Text="Claude usage limits" FontSize="18" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="LimitsPageSubtitle" FontSize="12"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
+                         Text="The same numbers Claude Code shows under /usage." />
+            </StackPanel>
+          </Border>
+          <ItemsControl x:Name="LimitsDetailList">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border Style="{StaticResource Card}" Padding="24,20" Margin="0,0,0,14">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                      </Grid.ColumnDefinitions>
+                      <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="{Binding Title}" FontSize="15" FontWeight="SemiBold"
+                                   Foreground="{StaticResource InkBrush}" />
+                        <TextBlock Text="{Binding ResetText}" FontSize="12"
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0" />
+                      </StackPanel>
+                      <TextBlock Grid.Column="1" Text="{Binding PercentText}" FontSize="34"
+                                 FontWeight="SemiBold" Foreground="{Binding PercentBrush}"
+                                 VerticalAlignment="Center" Margin="16,0,0,0" />
+                    </Grid>
+                    <ProgressBar Grid.Row="1" Style="{StaticResource ShareBar}" Height="10"
+                                 Value="{Binding Share, Mode=OneWay}" Foreground="{Binding BarBrush}"
+                                 Margin="0,14,0,0" />
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock x:Name="LimitsPageEmpty" FontSize="13" Foreground="{StaticResource MutedBrush}"
+                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,26,0,0" Visibility="Collapsed"
+                     Text="No limit data yet. Sign in to Claude Code on this machine and the limits will appear here within a minute." />
+        </StackPanel>
+      </ScrollViewer>
     </Grid>
 
     <!-- ═══ Status strip ═══ -->

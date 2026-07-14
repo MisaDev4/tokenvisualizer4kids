@@ -8,6 +8,9 @@ namespace TokenTracker;
 /// <summary>One plan rate limit as reported by the Claude usage endpoint.</summary>
 public sealed record ClaudeLimit(string Label, double Percent, string Severity, DateTimeOffset? ResetsAt);
 
+/// <summary>All current limits plus the subscription they belong to.</summary>
+public sealed record ClaudeLimitsSnapshot(IReadOnlyList<ClaudeLimit> Limits, string? Plan);
+
 /// <summary>
 /// Reads the subscription rate limits (5-hour session, weekly, per-model weekly)
 /// from the same endpoint Claude Code's /usage screen uses, authenticated with
@@ -29,11 +32,11 @@ public sealed class ClaudeLimitsService : IDisposable
 
     /// <summary>Returns the current limits, or null when unavailable (no Claude Code
     /// sign-in, expired token, offline). Callers should keep showing the last snapshot.</summary>
-    public async Task<IReadOnlyList<ClaudeLimit>?> FetchAsync(CancellationToken cancellationToken = default)
+    public async Task<ClaudeLimitsSnapshot?> FetchAsync(CancellationToken cancellationToken = default)
     {
         try
         {
-            var token = ReadAccessToken();
+            var (token, plan) = ReadCredentials();
             if (token is null)
             {
                 return null;
@@ -51,7 +54,8 @@ public sealed class ClaudeLimitsService : IDisposable
 
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             using var document = await JsonDocument.ParseAsync(stream, default, cancellationToken).ConfigureAwait(false);
-            return ParseLimits(document.RootElement);
+            var limits = ParseLimits(document.RootElement);
+            return limits is null ? null : new ClaudeLimitsSnapshot(limits, plan);
         }
         catch (Exception exception) when (exception is IOException or HttpRequestException or JsonException
                                               or TaskCanceledException or UnauthorizedAccessException)
@@ -60,11 +64,11 @@ public sealed class ClaudeLimitsService : IDisposable
         }
     }
 
-    private string? ReadAccessToken()
+    private (string? Token, string? Plan) ReadCredentials()
     {
         if (!File.Exists(CredentialsPath))
         {
-            return null;
+            return (null, null);
         }
 
         using var document = JsonDocument.Parse(File.ReadAllText(CredentialsPath));
@@ -72,10 +76,10 @@ public sealed class ClaudeLimitsService : IDisposable
             !oauth.TryGetProperty("accessToken", out var token) ||
             token.ValueKind != JsonValueKind.String)
         {
-            return null;
+            return (null, null);
         }
 
-        return token.GetString();
+        return (token.GetString(), StringOf(oauth, "subscriptionType"));
     }
 
     private static List<ClaudeLimit>? ParseLimits(JsonElement root)

@@ -30,6 +30,7 @@ public partial class MainWindow : Window
     private string _metricKey = "cost";
     private string _barsKey = "auto";
     private DashboardData? _latestData;
+    private bool _haveLimits;
 
     // ── Live view state ────────────────────────────────────────────────────
     private string _tabKey = "dashboard";
@@ -214,11 +215,23 @@ public partial class MainWindow : Window
 
     private async Task RefreshLimitsAsync()
     {
-        var limits = await _limitsService.FetchAsync();
-        if (limits is null || _disposed)
+        var snapshot = await _limitsService.FetchAsync();
+        if (_disposed)
         {
             return;
         }
+
+        if (snapshot is null)
+        {
+            // Keep whatever was last shown; only the never-signed-in case
+            // gets the explainer on the limits page.
+            LimitsPageEmpty.Visibility = _haveLimits ? Visibility.Collapsed : Visibility.Visible;
+            return;
+        }
+
+        _haveLimits = true;
+        LimitsPageEmpty.Visibility = Visibility.Collapsed;
+        var limits = snapshot.Limits;
 
         LimitsPanel.ItemsSource = limits.Select(limit =>
         {
@@ -251,6 +264,60 @@ public partial class MainWindow : Window
                 $"{name} — {limit.Percent:0}% used" + (resets.Length > 0 ? $" · {resets}" : ""));
         }).ToList();
         LimitsBar.Visibility = Visibility.Visible;
+
+        LimitsDetailList.ItemsSource = limits.Select(limit =>
+        {
+            var barBrush = limit.Severity switch
+            {
+                "critical" => LimitCriticalBrush,
+                "warning" => LimitWarningBrush,
+                _ => limit.Percent >= 90 ? LimitCriticalBrush
+                    : limit.Percent >= 70 ? LimitWarningBrush
+                    : (Brush)FindResource("AccentBrush")
+            };
+            return new LimitDetailVm(
+                limit.Label switch
+                {
+                    "5h" => "5-hour session",
+                    "Week" => "Weekly · all models",
+                    _ => $"Weekly · {limit.Label}"
+                },
+                limit.ResetsAt is { } at ? FormatResetDetail(at) : "reset time unknown",
+                $"{limit.Percent:0}%",
+                barBrush,
+                Math.Clamp(limit.Percent / 100.0, 0, 1),
+                barBrush);
+        }).ToList();
+
+        var plan = snapshot.Plan switch
+        {
+            "max" => "Max plan",
+            "pro" => "Pro plan",
+            "team" => "Team plan",
+            "enterprise" => "Enterprise plan",
+            null or "" => "Claude subscription",
+            _ => $"{char.ToUpperInvariant(snapshot.Plan[0])}{snapshot.Plan[1..]} plan"
+        };
+        LimitsPageSubtitle.Text =
+            $"{plan} · the same numbers Claude Code shows under /usage · updated {DateTime.Now:h:mm tt}";
+    }
+
+    /// <summary>"resets in 2 h 41 m · 11:39 PM" — countdown plus wall-clock time.</summary>
+    private static string FormatResetDetail(DateTimeOffset at)
+    {
+        var local = at.ToLocalTime();
+        var span = at - DateTimeOffset.Now;
+        if (span <= TimeSpan.Zero)
+        {
+            return "resetting now";
+        }
+
+        var countdown = span.TotalHours >= 24
+            ? $"{(int)span.TotalDays} d {span.Hours} h"
+            : span.TotalHours >= 1
+                ? $"{(int)span.TotalHours} h {span.Minutes} m"
+                : $"{Math.Max(1, span.Minutes)} m";
+        return $"resets in {countdown} · {FormatResetTime(local)}";
     }
 
     private static string FormatResetTime(DateTimeOffset local)
@@ -272,6 +339,14 @@ public partial class MainWindow : Window
         Brush PercentBrush,
         string ResetText,
         string Tooltip);
+
+    private sealed record LimitDetailVm(
+        string Title,
+        string ResetText,
+        string PercentText,
+        Brush PercentBrush,
+        double Share,
+        Brush BarBrush);
 
     protected override void OnSourceInitialized(EventArgs e)
     {
@@ -479,10 +554,13 @@ public partial class MainWindow : Window
     private void ApplyTab()
     {
         var live = _tabKey == "live";
-        DashboardHero.Visibility = live ? Visibility.Collapsed : Visibility.Visible;
-        DashboardContent.Visibility = live ? Visibility.Collapsed : Visibility.Visible;
-        RangeGroupBorder.Visibility = live ? Visibility.Collapsed : Visibility.Visible;
+        var limits = _tabKey == "limits";
+        var dashboard = !live && !limits;
+        DashboardHero.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
+        DashboardContent.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
+        RangeGroupBorder.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         LiveRoot.Visibility = live ? Visibility.Visible : Visibility.Collapsed;
+        LimitsRoot.Visibility = limits ? Visibility.Visible : Visibility.Collapsed;
         // Live state keeps running in the background; the tab switch only
         // pauses the per-frame rendering.
         if (live)
@@ -494,7 +572,16 @@ public partial class MainWindow : Window
         {
             StopLiveFrames();
         }
+
+        if (limits && _loaded)
+        {
+            // Fresh numbers the moment the page opens, not up to a minute stale.
+            _ = RefreshLimitsAsync();
+        }
     }
+
+    private void LimitsBar_Clicked(object sender, System.Windows.Input.MouseButtonEventArgs e) =>
+        TabLimits.IsChecked = true;
 
     private void StartLiveFrames()
     {
@@ -1584,9 +1671,14 @@ public partial class MainWindow : Window
         return hash;
     }
 
-    private RadioButton TabRadioFor(string key) => key == "live" ? TabLive : TabDashboard;
+    private RadioButton TabRadioFor(string key) => key switch
+    {
+        "live" => TabLive,
+        "limits" => TabLimits,
+        _ => TabDashboard
+    };
 
-    private static string NormalizeTabKey(string key) => key == "live" ? "live" : "dashboard";
+    private static string NormalizeTabKey(string key) => key is "live" or "limits" ? key : "dashboard";
 
     private RadioButton LiveWindowRadioFor(string key) => key switch
     {
