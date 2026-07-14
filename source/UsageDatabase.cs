@@ -711,6 +711,8 @@ public sealed class UsageDatabase
     /// <summary>Typical bucket width, used only to estimate series length.</summary>
     private static double ApproximateUnitMs(BucketUnit unit) => unit switch
     {
+        BucketUnit.Second15 => 15_000,
+        BucketUnit.Second30 => 30_000,
         BucketUnit.Minute1 => 60_000,
         BucketUnit.Minute5 => 300_000,
         BucketUnit.Minute15 => 900_000,
@@ -750,6 +752,8 @@ public sealed class UsageDatabase
     /// <summary>Fixed bucket duration for epoch-aligned units; 0 for calendar units.</summary>
     private static long UnitDurationMs(BucketUnit unit) => unit switch
     {
+        BucketUnit.Second15 => 15_000,
+        BucketUnit.Second30 => 30_000,
         BucketUnit.Minute1 => 60_000,
         BucketUnit.Minute5 => 300_000,
         BucketUnit.Minute15 => 900_000,

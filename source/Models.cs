@@ -76,6 +76,8 @@ public sealed record ModelUsageRow(
 /// <summary>Granularity of one timeline bucket.</summary>
 public enum BucketUnit
 {
+    Second15,
+    Second30,
     Minute1,
     Minute5,
     Minute15,

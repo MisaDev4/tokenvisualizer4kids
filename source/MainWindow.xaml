@@ -237,10 +237,14 @@
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
               <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0"
-                      ToolTip="Bar size. Auto picks a width to fit the range; sizes too fine for the range are disabled.">
+                      ToolTip="Bar size. Auto picks a width to fit the range; only sizes that make sense for the range are offered.">
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="BarsAuto" Style="{StaticResource SegmentButton}" GroupName="bars"
                                Content="Auto" Tag="auto" IsChecked="True" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsS15" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="15s" Tag="s15" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsS30" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="30s" Tag="s30" Checked="BarsButton_Checked" />
                   <RadioButton x:Name="BarsM1" Style="{StaticResource SegmentButton}" GroupName="bars"
                                Content="1m" Tag="m1" Checked="BarsButton_Checked" />
                   <RadioButton x:Name="BarsM5" Style="{StaticResource SegmentButton}" GroupName="bars"

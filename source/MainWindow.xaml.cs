@@ -650,23 +650,28 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Disables bar sizes too fine for the selected range (more bars than the
-    /// series cap allows). A selection that just became invalid falls back to Auto.
+    /// Offers only the bar sizes that make sense for the selected range: fine
+    /// enough to stay under the series cap, coarse enough to produce at least
+    /// a few bars (1d bars on a 1h view is one bar — noise). A selection that
+    /// just became invalid falls back to Auto.
     /// </summary>
     private void UpdateBarsAvailability()
     {
         var spanMs = RangeSpanMs(_rangeKey);
         foreach (var (radio, key) in new[]
                  {
-                     (BarsM1, "m1"), (BarsM5, "m5"), (BarsM15, "m15"),
-                     (BarsM30, "m30"), (BarsH1, "h1"), (BarsD1, "d1")
+                     (BarsS15, "s15"), (BarsS30, "s30"), (BarsM1, "m1"), (BarsM5, "m5"),
+                     (BarsM15, "m15"), (BarsM30, "m30"), (BarsH1, "h1"), (BarsD1, "d1")
                  })
         {
             var unitMs = BarsUnitMs(key);
-            radio.IsEnabled = spanMs is { } span && unitMs > 0 && span / (double)unitMs <= MaxChartBars;
+            var bars = spanMs is { } span && unitMs > 0 ? span / (double)unitMs : 0;
+            radio.Visibility = bars >= 3 && bars <= MaxChartBars
+                ? Visibility.Visible
+                : Visibility.Collapsed;
         }
 
-        if (BarsRadioFor(_barsKey) is { IsEnabled: false })
+        if (BarsRadioFor(_barsKey) is { Visibility: not Visibility.Visible })
         {
             _barsKey = "auto";
             BarsAuto.IsChecked = true;
@@ -701,6 +706,8 @@ public partial class MainWindow : Window
 
     private static long BarsUnitMs(string key) => key switch
     {
+        "s15" => 15_000,
+        "s30" => 30_000,
         "m1" => 60_000,
         "m5" => 300_000,
         "m15" => 900_000,
@@ -712,6 +719,8 @@ public partial class MainWindow : Window
 
     private static BucketUnit? BarsUnitFor(string key) => key switch
     {
+        "s15" => BucketUnit.Second15,
+        "s30" => BucketUnit.Second30,
         "m1" => BucketUnit.Minute1,
         "m5" => BucketUnit.Minute5,
         "m15" => BucketUnit.Minute15,
@@ -1919,6 +1928,8 @@ public partial class MainWindow : Window
 
         var unitWord = data.Unit switch
         {
+            BucketUnit.Second15 => "15 s",
+            BucketUnit.Second30 => "30 s",
             BucketUnit.Minute1 => "minute",
             BucketUnit.Minute5 => "5 min",
             BucketUnit.Minute15 => "15 min",
@@ -2356,6 +2367,7 @@ public partial class MainWindow : Window
 
     private static string FormatAxisLabel(DateTime start, BucketUnit unit, bool markMidnight) => unit switch
     {
+        BucketUnit.Second15 or BucketUnit.Second30 => start.ToString("h:mm:ss"),
         BucketUnit.Minute1 or BucketUnit.Minute5 or BucketUnit.Minute15 or BucketUnit.Minute30 =>
             start.ToString("h:mm tt"),
         BucketUnit.Hour => markMidnight ? start.ToString("ddd") : start.ToString("h tt"),
@@ -2365,6 +2377,8 @@ public partial class MainWindow : Window
 
     private static string FormatPeriod(DateTime start, BucketUnit unit) => unit switch
     {
+        BucketUnit.Second15 => $"{start:ddd, MMM d} · {start:h:mm:ss}–{start.AddSeconds(15):h:mm:ss tt}",
+        BucketUnit.Second30 => $"{start:ddd, MMM d} · {start:h:mm:ss}–{start.AddSeconds(30):h:mm:ss tt}",
         BucketUnit.Minute1 => $"{start:ddd, MMM d} · {start:h:mm}–{start.AddMinutes(1):h:mm tt}",
         BucketUnit.Minute5 => $"{start:ddd, MMM d} · {start:h:mm}–{start.AddMinutes(5):h:mm tt}",
         BucketUnit.Minute15 => $"{start:ddd, MMM d} · {start:h:mm}–{start.AddMinutes(15):h:mm tt}",
@@ -2489,6 +2503,8 @@ public partial class MainWindow : Window
 
     private RadioButton BarsRadioFor(string key) => key switch
     {
+        "s15" => BarsS15,
+        "s30" => BarsS30,
         "m1" => BarsM1,
         "m5" => BarsM5,
         "m15" => BarsM15,
@@ -2500,7 +2516,7 @@ public partial class MainWindow : Window
 
     private static string NormalizeBarsKey(string key) => key switch
     {
-        "m1" or "m5" or "m15" or "m30" or "h1" or "d1" => key,
+        "s15" or "s30" or "m1" or "m5" or "m15" or "m30" or "h1" or "d1" => key,
         _ => "auto"
     };
 
