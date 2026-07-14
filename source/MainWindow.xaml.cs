@@ -36,7 +36,6 @@ public partial class MainWindow : Window
     private string _liveModeKey = "river";
     private string _liveMetricKey = "cost";
     private long _liveWindowMs = 300_000;
-    private long _liveLastSeenMs;
     private bool _livePulling;
     private bool _cupLayoutDirty;
     private bool _liveFramesActive;
@@ -57,6 +56,13 @@ public partial class MainWindow : Window
     private readonly List<CupLayer> _cupLayers = [];
     private readonly List<(DateTime EndedAt, double Cost, long Tokens)> _roundHistory = [];
 
+    // River and cup keep independent stores fed by one shared pull, each with
+    // its own cursor: switching mode or round length never discards the other
+    // view's state (and a longer round must not re-ingest events that already
+    // settled into layers).
+    private long _riverLastSeenMs;
+    private long _cupLastSeenMs;
+
     /// <summary>One settled round: its blocks stay packed below the active floor.</summary>
     private sealed class CupLayer
     {
@@ -69,7 +75,8 @@ public partial class MainWindow : Window
         public required TextBlock Caption { get; init; }
         public double Height { get; set; }
     }
-    private readonly Dictionary<string, LiveBubble> _liveBubbles = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LiveBubble> _riverBubbles = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LiveBubble> _cupBubbles = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _liveLanes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _liveLaneSeq = new(StringComparer.Ordinal);
     private readonly System.Windows.Threading.DispatcherTimer _liveTimer;
@@ -159,6 +166,7 @@ public partial class MainWindow : Window
         (_liveModeKey == "cup" ? LiveModeCup : LiveModeRiver).IsChecked = true;
         _liveMetricKey = _settings.SelectedLiveMetric == "tokens" ? "tokens" : "cost";
         (_liveMetricKey == "tokens" ? LiveMetricTokens : LiveMetricCost).IsChecked = true;
+        ApplyLiveModeVisibility();
         UpdateLiveWindowLabels();
         _tabKey = NormalizeTabKey(_settings.SelectedTab);
         TabRadioFor(_tabKey).IsChecked = true;
@@ -233,17 +241,10 @@ public partial class MainWindow : Window
             await Task.WhenAll(_collector.StartAsync(), _pricing.InitializeAsync());
             await RefreshDashboardAsync();
 
-            // Live state starts with the app, whatever tab is showing, so a
-            // cup round is never reset by switching views.
-            if (_liveModeKey == "cup")
-            {
-                StartCupRound();
-            }
-            else
-            {
-                await ReseedLiveAsync();
-            }
-
+            // Both live views start with the app, whatever tab or mode is
+            // showing, so nothing ever resets on a view switch.
+            StartCupRound();
+            await ReseedRiverAsync();
             _liveStarted = true;
             _liveTimer.Start();
         }
@@ -448,7 +449,7 @@ public partial class MainWindow : Window
     /// <summary>Runs once per rendered frame (display refresh rate) while the live tab is open.</summary>
     private void LiveFrame(object? sender, EventArgs e)
     {
-        if (!IsVisible || _liveBubbles.Count == 0 && !_cupLayoutDirty)
+        if (!IsVisible)
         {
             return;
         }
@@ -458,31 +459,33 @@ public partial class MainWindow : Window
             (ticks - _lastFrameTicks) / (double)System.Diagnostics.Stopwatch.Frequency, 0, 0.1);
         _lastFrameTicks = ticks;
 
-        var width = LiveScroll.ViewportWidth;
-        var viewportHeight = LiveScroll.ViewportHeight;
-        if (width < 40 || viewportHeight < 40)
-        {
-            return;
-        }
-
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         if (_liveModeKey == "cup")
         {
+            if (_cupBubbles.Count == 0 && !_cupLayoutDirty)
+            {
+                return;
+            }
+
+            var width = LiveScroll.ViewportWidth;
+            var viewportHeight = LiveScroll.ViewportHeight;
+            if (width < 40 || viewportHeight < 40)
+            {
+                return;
+            }
+
             AdvanceCup(nowMs, width, viewportHeight, dt);
         }
         else
         {
-            if (double.IsNaN(LiveCanvas.Width) || Math.Abs(LiveCanvas.Width - width) > 0.5)
+            var width = RiverCanvas.ActualWidth;
+            var height = RiverCanvas.ActualHeight;
+            if (_riverBubbles.Count == 0 || width < 40 || height < 40)
             {
-                LiveCanvas.Width = width;
+                return;
             }
 
-            if (double.IsNaN(LiveCanvas.Height) || Math.Abs(LiveCanvas.Height - viewportHeight) > 0.5)
-            {
-                LiveCanvas.Height = viewportHeight;
-            }
-
-            AdvanceRiver(nowMs, width, viewportHeight);
+            AdvanceRiver(nowMs, width, height);
         }
     }
 
@@ -514,11 +517,14 @@ public partial class MainWindow : Window
         RebuildLiveAxis();
         if (_liveModeKey == "cup")
         {
-            StartCupRound();
+            // The running round simply adopts the new length: a longer round
+            // keeps its blocks and countdown; a shorter one settles on the
+            // next tick. Nothing is discarded and nothing is re-ingested.
+            UpdateRoundText(DateTimeOffset.Now.ToUnixTimeMilliseconds());
         }
         else
         {
-            await ReseedLiveAsync();
+            await ReseedRiverAsync();
         }
     }
 
@@ -555,18 +561,22 @@ public partial class MainWindow : Window
 
         _settings.SelectedLiveMode = key;
         _settings.Save();
+        // Both views keep running in the background; switching is only a
+        // visibility change, so the cup's sediment survives a trip to the river.
         UpdateLiveWindowLabels();
+        ApplyLiveModeVisibility();
         RebuildLiveAxis();
-        if (key == "cup")
-        {
-            StartCupRound();
-        }
-        else
-        {
-            LiveRoundText.Visibility = Visibility.Collapsed;
-            RoundHistoryBars.Visibility = Visibility.Collapsed;
-            await ReseedLiveAsync();
-        }
+        UpdateLiveLegend();
+        _cupLayoutDirty = true;
+    }
+
+    private void ApplyLiveModeVisibility()
+    {
+        var cup = _liveModeKey == "cup";
+        LiveScroll.Visibility = cup ? Visibility.Visible : Visibility.Collapsed;
+        RiverCanvas.Visibility = cup ? Visibility.Collapsed : Visibility.Visible;
+        LiveRoundText.Visibility = cup ? Visibility.Visible : Visibility.Collapsed;
+        RoundHistoryBars.Visibility = cup ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private async void LiveMetricButton_Checked(object sender, RoutedEventArgs e)
@@ -589,35 +599,39 @@ public partial class MainWindow : Window
         await PullLiveEventsAsync();
     }
 
-    /// <summary>Empties the cup (and its layers) and starts a fresh timed round.</summary>
+    /// <summary>Starts cup tracking from scratch: fresh round, no sediment. App start only.</summary>
     private void StartCupRound()
     {
-        _liveBubbles.Clear();
-        _liveLanes.Clear();
-        _liveLaneSeq.Clear();
+        foreach (var bubble in _cupBubbles.Values)
+        {
+            LiveCanvas.Children.Remove(bubble.Visual);
+        }
+
+        _cupBubbles.Clear();
         _cupLayers.Clear();
         _cupWalls = null;
         LiveCanvas.Children.Clear();
-        LiveLegend.ItemsSource = null;
         _roundStartMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-        _liveLastSeenMs = _roundStartMs;
+        _cupLastSeenMs = _roundStartMs;
         _cupLayoutDirty = true;
-        LiveRoundText.Visibility = Visibility.Visible;
-        RoundHistoryBars.Visibility = Visibility.Visible;
         UpdateRoundHistoryBars();
         UpdateRoundText(_roundStartMs);
     }
 
-    /// <summary>Forgets every bubble and replays the current window from the index.</summary>
-    private async Task ReseedLiveAsync()
+    /// <summary>Forgets the river and replays the current window from the index.</summary>
+    private async Task ReseedRiverAsync()
     {
-        _liveBubbles.Clear();
+        foreach (var bubble in _riverBubbles.Values)
+        {
+            RiverCanvas.Children.Remove(bubble.Visual);
+        }
+
+        _riverBubbles.Clear();
         _liveLanes.Clear();
         _liveLaneSeq.Clear();
-        LiveCanvas.Children.Clear();
-        LiveLegend.ItemsSource = null;
-        _liveLastSeenMs = DateTimeOffset.Now.ToUnixTimeMilliseconds() - _liveWindowMs;
+        _riverLastSeenMs = DateTimeOffset.Now.ToUnixTimeMilliseconds() - _liveWindowMs;
         await PullLiveEventsAsync();
+        UpdateLiveLegend();
     }
 
     private async Task PullLiveEventsAsync()
@@ -630,16 +644,30 @@ public partial class MainWindow : Window
         _livePulling = true;
         try
         {
-            // Hour-long windows can hold far more events than the short ones.
-            var rows = await _database.GetEventsUpdatedSinceAsync(_liveLastSeenMs, 1200);
+            // One shared fetch feeds both stores; each keeps its own cursor so
+            // a river reseed can rewind without re-ingesting settled cup events.
+            var since = Math.Min(_riverLastSeenMs, _cupLastSeenMs);
+            var rows = await _database.GetEventsUpdatedSinceAsync(since, 1200);
+            var maxUpdated = 0L;
             foreach (var row in rows)
             {
-                _liveLastSeenMs = Math.Max(_liveLastSeenMs, row.UpdatedMs);
-                UpsertLiveBubble(row);
+                if (row.UpdatedMs > _riverLastSeenMs)
+                {
+                    UpsertRiverBubble(row);
+                }
+
+                if (row.UpdatedMs > _cupLastSeenMs)
+                {
+                    UpsertCupBubble(row);
+                }
+
+                maxUpdated = Math.Max(maxUpdated, row.UpdatedMs);
             }
 
             if (rows.Count > 0)
             {
+                _riverLastSeenMs = Math.Max(_riverLastSeenMs, maxUpdated);
+                _cupLastSeenMs = Math.Max(_cupLastSeenMs, maxUpdated);
                 LivePulseDot.Opacity = 1.0;
                 LivePulseText.Text = $"last update {DateTime.Now:h:mm:ss tt}";
                 UpdateLiveLegend();
@@ -655,30 +683,25 @@ public partial class MainWindow : Window
         }
     }
 
-    private void UpsertLiveBubble(LiveEventRow row)
+    private void UpsertRiverBubble(LiveEventRow row)
     {
         var estimate = _pricing.Calculate(row.Provider, row.Model, row.Tokens);
-        if (_liveBubbles.TryGetValue(row.EventKey, out var existing))
+        if (_riverBubbles.TryGetValue(row.EventKey, out var existing))
         {
             // Same message grew (output still streaming in): inflate in place.
             existing.Event = row;
             existing.Cost = estimate.Cost;
             existing.Visual.ToolTip = BuildLiveTooltip(row, estimate);
-            _cupLayoutDirty = true;
             return;
         }
 
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-        if (_liveModeKey != "cup" && nowMs - row.UpdatedMs > _liveWindowMs)
+        if (nowMs - row.UpdatedMs > _liveWindowMs)
         {
             return;
         }
 
-        if (!_modelSlots.ContainsKey(row.Model) && _modelSlots.Count < MaxModelSlots)
-        {
-            _modelSlots[row.Model] = _modelSlots.Count;
-        }
-
+        AssignLiveModelSlot(row.Model);
         if (!_liveLanes.TryGetValue(row.SessionId, out var lane))
         {
             _liveLanes[row.SessionId] = lane = _liveLanes.Count;
@@ -698,57 +721,107 @@ public partial class MainWindow : Window
             Jitter = (Math.Abs(StableHash(row.EventKey)) % 1000) / 1000.0 - 0.5,
             Cost = estimate.Cost
         };
-        bubble.Visual = CreateLiveVisual(bubble);
-        // Invisible until the first layout pass positions and sizes it.
+        bubble.Visual = CreateRiverVisual(bubble);
+        // Invisible until the first frame positions and sizes it.
         bubble.Visual.Width = 0;
         bubble.Visual.Height = 0;
-        _liveBubbles[row.EventKey] = bubble;
+        _riverBubbles[row.EventKey] = bubble;
+        RiverCanvas.Children.Add(bubble.Visual);
+    }
+
+    private void UpsertCupBubble(LiveEventRow row)
+    {
+        var estimate = _pricing.Calculate(row.Provider, row.Model, row.Tokens);
+        if (_cupBubbles.TryGetValue(row.EventKey, out var existing))
+        {
+            existing.Event = row;
+            existing.Cost = estimate.Cost;
+            existing.Visual.ToolTip = BuildLiveTooltip(row, estimate);
+            if (!existing.Frozen)
+            {
+                _cupLayoutDirty = true;
+            }
+
+            return;
+        }
+
+        AssignLiveModelSlot(row.Model);
+        var bubble = new LiveBubble
+        {
+            Event = row,
+            Visual = null!,
+            FirstSeenMs = row.UpdatedMs,
+            SpawnedAtMs = DateTimeOffset.Now.ToUnixTimeMilliseconds(),
+            Lane = 0,
+            LaneSlot = 0,
+            Jitter = 0,
+            Cost = estimate.Cost
+        };
+        bubble.Visual = CreateCupVisual(bubble);
+        bubble.Visual.Width = 0;
+        bubble.Visual.Height = 0;
+        _cupBubbles[row.EventKey] = bubble;
         LiveCanvas.Children.Add(bubble.Visual);
         _cupLayoutDirty = true;
     }
 
-    private FrameworkElement CreateLiveVisual(LiveBubble bubble)
+    private void AssignLiveModelSlot(string model)
+    {
+        if (!_modelSlots.ContainsKey(model) && _modelSlots.Count < MaxModelSlots)
+        {
+            _modelSlots[model] = _modelSlots.Count;
+        }
+    }
+
+    private Color LiveModelColor(string model) => BrushForModel(model) is SolidColorBrush solid
+        ? solid.Color
+        : ((SolidColorBrush)FindResource("AccentBrush")).Color;
+
+    private static SolidColorBrush LiveStrokeBrush()
+    {
+        var stroke = new SolidColorBrush(Color.FromArgb(70, 255, 255, 255));
+        stroke.Freeze();
+        return stroke;
+    }
+
+    private FrameworkElement CreateCupVisual(LiveBubble bubble)
     {
         var row = bubble.Event;
         var estimate = new PricingEstimate(bubble.Cost, bubble.Cost > 0);
-        var color = BrushForModel(row.Model) is SolidColorBrush solid
-            ? solid.Color
-            : ((SolidColorBrush)FindResource("AccentBrush")).Color;
-        var stroke = new SolidColorBrush(Color.FromArgb(70, 255, 255, 255));
-        stroke.Freeze();
-
-        if (_liveModeKey == "cup")
+        var fill = new SolidColorBrush(LiveModelColor(row.Model)) { Opacity = 0.85 };
+        fill.Freeze();
+        var label = new TextBlock
         {
-            var fill = new SolidColorBrush(color) { Opacity = 0.85 };
-            fill.Freeze();
-            var label = new TextBlock
-            {
-                FontWeight = FontWeights.SemiBold,
-                Foreground = Brushes.White,
-                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
-                VerticalAlignment = System.Windows.VerticalAlignment.Center,
-                IsHitTestVisible = false,
-                TextTrimming = TextTrimming.CharacterEllipsis
-            };
-            bubble.Label = label;
-            return new Border
-            {
-                Background = fill,
-                BorderBrush = stroke,
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(5),
-                Child = label,
-                ToolTip = BuildLiveTooltip(row, estimate)
-            };
-        }
+            FontWeight = FontWeights.SemiBold,
+            Foreground = Brushes.White,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+            VerticalAlignment = System.Windows.VerticalAlignment.Center,
+            IsHitTestVisible = false,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        bubble.Label = label;
+        return new Border
+        {
+            Background = fill,
+            BorderBrush = LiveStrokeBrush(),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5),
+            Child = label,
+            ToolTip = BuildLiveTooltip(row, estimate)
+        };
+    }
 
-        var bubbleFill = new SolidColorBrush(color) { Opacity = 0.8 };
+    private FrameworkElement CreateRiverVisual(LiveBubble bubble)
+    {
+        var row = bubble.Event;
+        var estimate = new PricingEstimate(bubble.Cost, bubble.Cost > 0);
+        var bubbleFill = new SolidColorBrush(LiveModelColor(row.Model)) { Opacity = 0.8 };
         bubbleFill.Freeze();
         bubble.Label = null;
         return new Ellipse
         {
             Fill = bubbleFill,
-            Stroke = stroke,
+            Stroke = LiveStrokeBrush(),
             StrokeThickness = 1,
             ToolTip = BuildLiveTooltip(row, estimate)
         };
@@ -767,37 +840,34 @@ public partial class MainWindow : Window
             LivePulseDot.Opacity = Math.Max(0.35, LivePulseDot.Opacity - 0.08);
         }
 
+        // Both views tick in the background regardless of which is showing.
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-        if (_liveModeKey == "cup")
-        {
-            TickCupRound(nowMs);
-        }
-        else
-        {
-            List<string>? expired = null;
-            foreach (var (key, bubble) in _liveBubbles)
-            {
-                if (nowMs - bubble.FirstSeenMs > _liveWindowMs + 2_000)
-                {
-                    (expired ??= []).Add(key);
-                }
-            }
+        TickCupRound(nowMs);
 
-            if (expired is not null)
+        List<string>? expired = null;
+        foreach (var (key, bubble) in _riverBubbles)
+        {
+            if (nowMs - bubble.FirstSeenMs > _liveWindowMs + 2_000)
             {
-                foreach (var key in expired)
-                {
-                    LiveCanvas.Children.Remove(_liveBubbles[key].Visual);
-                    _liveBubbles.Remove(key);
-                }
-
-                UpdateLiveLegend();
+                (expired ??= []).Add(key);
             }
         }
 
+        if (expired is not null)
+        {
+            foreach (var key in expired)
+            {
+                RiverCanvas.Children.Remove(_riverBubbles[key].Visual);
+                _riverBubbles.Remove(key);
+            }
+
+            UpdateLiveLegend();
+        }
+
+        var store = _liveModeKey == "cup" ? _cupBubbles : _riverBubbles;
         double costWindow = 0, cost60 = 0;
         long tokensWindow = 0, tokens60 = 0, messagesWindow = 0;
-        foreach (var bubble in _liveBubbles.Values)
+        foreach (var bubble in store.Values)
         {
             if (bubble.Frozen)
             {
@@ -814,7 +884,7 @@ public partial class MainWindow : Window
             }
         }
 
-        LiveEmptyText.Visibility = _liveBubbles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        LiveEmptyText.Visibility = store.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         LiveSpendText.Text = FormatMoney(costWindow);
         LiveTokensText.Text = FormatCompact(tokensWindow);
         LiveMessagesText.Text = messagesWindow.ToString("N0");
@@ -836,7 +906,7 @@ public partial class MainWindow : Window
     /// <summary>Freezes the active round into a sediment layer and raises the floor.</summary>
     private void SettleRound(long nowMs)
     {
-        var active = _liveBubbles.Values.Where(bubble => !bubble.Frozen).ToList();
+        var active = _cupBubbles.Values.Where(bubble => !bubble.Frozen).ToList();
         var cost = active.Sum(bubble => bubble.Cost);
         var tokens = active.Sum(bubble => bubble.Event.Tokens.Total);
         _lastRoundCost = cost;
@@ -895,7 +965,7 @@ public partial class MainWindow : Window
                 foreach (var bubble in oldest.Blocks)
                 {
                     LiveCanvas.Children.Remove(bubble.Visual);
-                    _liveBubbles.Remove(bubble.Event.EventKey);
+                    _cupBubbles.Remove(bubble.Event.EventKey);
                 }
             }
 
@@ -954,7 +1024,7 @@ public partial class MainWindow : Window
         var laneCount = Math.Max(1, (int)((height - 36) / 52));
         var laneHeight = (height - 36) / laneCount;
 
-        foreach (var bubble in _liveBubbles.Values)
+        foreach (var bubble in _riverBubbles.Values)
         {
             var age = nowMs - bubble.FirstSeenMs;
             var spawnAge = nowMs - bubble.SpawnedAtMs;
@@ -985,7 +1055,7 @@ public partial class MainWindow : Window
 
         // Frame-rate independent easing: the same settle speed at 30 or 120 fps.
         var ease = 1 - Math.Exp(-9 * dt);
-        foreach (var bubble in _liveBubbles.Values)
+        foreach (var bubble in _cupBubbles.Values)
         {
             if (bubble.Side <= 0)
             {
@@ -1010,10 +1080,6 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Shelf-packs blocks in arrival order from the cup floor upward: rows fill
-    /// left to right, each new row sits on top of the tallest block below it.
-    /// </summary>
-    /// <summary>
     /// Lays out the whole cup: the active round packs into the visible region
     /// at the top (scale-to-fit), and each settled layer stacks below it with
     /// a divider and score caption. The canvas grows downward; scroll for history.
@@ -1025,7 +1091,7 @@ public partial class MainWindow : Window
         const double topPad = 10;
         const double captionBand = 22;
 
-        var active = _liveBubbles.Values
+        var active = _cupBubbles.Values
             .Where(item => !item.Frozen)
             .OrderBy(item => item.FirstSeenMs)
             .ToList();
@@ -1247,7 +1313,8 @@ public partial class MainWindow : Window
 
     private void UpdateLiveLegend()
     {
-        LiveLegend.ItemsSource = _liveBubbles.Values
+        var store = _liveModeKey == "cup" ? _cupBubbles : _riverBubbles;
+        LiveLegend.ItemsSource = store.Values
             .Where(bubble => !bubble.Frozen)
             .GroupBy(bubble => bubble.Event.Model, StringComparer.OrdinalIgnoreCase)
             .Select(group => (Model: group.Key, Cost: group.Sum(bubble => bubble.Cost)))

@@ -516,6 +516,7 @@
           </ItemsControl>
           <Grid Grid.Row="2" Margin="0,6,0,0" SizeChanged="LiveCanvas_SizeChanged">
             <Canvas x:Name="LiveAxisCanvas" ClipToBounds="True" Background="Transparent" />
+            <Canvas x:Name="RiverCanvas" ClipToBounds="True" Background="Transparent" />
             <ScrollViewer x:Name="LiveScroll" VerticalScrollBarVisibility="Auto"
                           HorizontalScrollBarVisibility="Disabled" Focusable="False"
                           Background="Transparent" BorderThickness="0" Padding="0">
