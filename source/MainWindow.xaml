@@ -442,6 +442,9 @@
                            Content="45 m" Tag="w45" Checked="LiveWindowButton_Checked" />
               <RadioButton x:Name="LiveW60" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
                            Content="1 h" Tag="w60" Checked="LiveWindowButton_Checked" />
+              <RadioButton x:Name="LiveWInf" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="∞" Tag="inf" Checked="LiveWindowButton_Checked"
+                           ToolTip="Endless: nothing ever settles, the pile just keeps growing." />
             </StackPanel>
           </Border>
         </Grid>
@@ -513,6 +516,10 @@
             </ItemsControl.ItemTemplate>
           </ItemsControl>
           <Grid Grid.Row="2" Margin="0,6,0,0" SizeChanged="LiveCanvas_SizeChanged">
+            <!-- Round timer as the cup's rim: fills over the round, warms near the end. -->
+            <ProgressBar x:Name="RoundProgress" Style="{StaticResource ShareBar}" Height="4"
+                         VerticalAlignment="Top" Margin="8,0,8,0" Panel.ZIndex="2"
+                         ToolTip="Time until this round settles into a layer." />
             <ScrollViewer x:Name="LiveScroll" VerticalScrollBarVisibility="Auto"
                           HorizontalScrollBarVisibility="Disabled" Focusable="False"
                           Background="Transparent" BorderThickness="0" Padding="0">

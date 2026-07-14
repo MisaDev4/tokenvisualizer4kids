@@ -37,6 +37,9 @@ public partial class MainWindow : Window
     private string _tabKey = "dashboard";
     private string _liveWindowKey = "w5";
     private string _liveMetricKey = "cost";
+
+    /// <summary>Endless mode: rounds never settle, the pile only grows.</summary>
+    private bool IsEndless => _liveWindowKey == "inf";
     private long _liveWindowMs = 300_000;
     private bool _livePulling;
     private bool _cupLayoutDirty;
@@ -693,6 +696,9 @@ public partial class MainWindow : Window
             "w30" => 1_800_000L,
             "w45" => 2_700_000L,
             "w60" => 3_600_000L,
+            // Endless: sentinel far beyond any real elapsed time; guarded
+            // wherever the window length enters arithmetic.
+            "inf" => long.MaxValue / 8,
             _ => 300_000L
         };
         if (!_loaded)
@@ -704,16 +710,22 @@ public partial class MainWindow : Window
         _settings.Save();
         // The running round simply adopts the new length (a longer round keeps
         // its blocks and countdown; a shorter one settles on the next tick)
-        // while the sediment below is re-partitioned at the new size.
-        UpdateRoundText(DateTimeOffset.Now.ToUnixTimeMilliseconds());
+        // while the sediment below is re-partitioned at the new size. Endless
+        // keeps whatever sediment already exists and just stops settling.
+        UpdateLiveWindowLabels();
+        var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        UpdateRoundText(nowMs);
+        UpdateRoundProgress(nowMs);
+        _cupLayoutDirty = true;
         await RebuildCupLayersAsync();
     }
 
     private void UpdateLiveWindowLabels()
     {
-        LiveSpendLabel.Text = "Spend · this round";
-        LiveTokensLabel.Text = "Tokens · this round";
-        LiveMessagesLabel.Text = "Responses · this round";
+        var name = IsEndless ? "stacked" : "this round";
+        LiveSpendLabel.Text = $"Spend · {name}";
+        LiveTokensLabel.Text = $"Tokens · {name}";
+        LiveMessagesLabel.Text = $"Responses · {name}";
     }
 
     private async void LiveMetricButton_Checked(object sender, RoutedEventArgs e)
@@ -918,12 +930,30 @@ public partial class MainWindow : Window
     /// <summary>Cup round lifecycle: countdown → the pile settles into a layer → fresh round on top.</summary>
     private void TickCupRound(long nowMs)
     {
-        if (nowMs - _roundStartMs >= _liveWindowMs)
+        if (!IsEndless && nowMs - _roundStartMs >= _liveWindowMs)
         {
             SettleRound(nowMs);
         }
 
         UpdateRoundText(nowMs);
+        UpdateRoundProgress(nowMs);
+    }
+
+    /// <summary>The rim above the cup fills over the round and warms near the end.</summary>
+    private void UpdateRoundProgress(long nowMs)
+    {
+        if (IsEndless)
+        {
+            RoundProgress.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        RoundProgress.Visibility = Visibility.Visible;
+        var fraction = Math.Clamp((nowMs - _roundStartMs) / (double)_liveWindowMs, 0, 1);
+        RoundProgress.Value = fraction;
+        RoundProgress.Foreground = fraction >= 0.95 ? LimitCriticalBrush
+            : fraction >= 0.8 ? LimitWarningBrush
+            : (Brush)FindResource("AccentBrush");
     }
 
     /// <summary>Freezes the active round into a sediment layer and raises the floor.</summary>
@@ -1020,6 +1050,12 @@ public partial class MainWindow : Window
     private async Task RebuildCupLayersAsync()
     {
         const int maxLayers = 12;
+        if (IsEndless)
+        {
+            // No round length to partition history by; the existing sediment
+            // stays as it was and the pile grows from here.
+            return;
+        }
 
         List<LiveEventRow> rows;
         try
@@ -1146,6 +1182,15 @@ public partial class MainWindow : Window
 
     private void UpdateRoundText(long nowMs)
     {
+        if (IsEndless)
+        {
+            var stacked = _cupBubbles.Values.Count(bubble => !bubble.Frozen);
+            LiveRoundText.Text = stacked == 1
+                ? "endless · 1 block stacked"
+                : $"endless · {stacked} blocks stacked";
+            return;
+        }
+
         var score = _liveMetricKey == "tokens"
             ? (_lastRoundTokens is { } lastTokens ? $"   ·   last round {FormatCompact(lastTokens)}" : string.Empty) +
               (_bestRoundTokens > 0 ? $"   ·   best {FormatCompact(_bestRoundTokens)}" : string.Empty)
@@ -1236,17 +1281,21 @@ public partial class MainWindow : Window
 
         // Scale-to-fit: when the active stack would overflow the rim, shrink
         // every block by one shared factor so relative areas stay honest.
+        // Endless mode never shrinks — the canvas grows and you scroll instead.
         var available = Math.Max(40, viewportHeight - floorInset - topPad);
         var scale = 1.0;
-        for (var attempt = 0; attempt < 8; attempt++)
+        if (!IsEndless)
         {
-            var needed = PackHeight(active, width, wallInset, scale);
-            if (needed <= available || scale <= 0.08)
+            for (var attempt = 0; attempt < 8; attempt++)
             {
-                break;
-            }
+                var needed = PackHeight(active, width, wallInset, scale);
+                if (needed <= available || scale <= 0.08)
+                {
+                    break;
+                }
 
-            scale *= Math.Max(0.4, Math.Sqrt(available / needed) * 0.96);
+                scale *= Math.Max(0.4, Math.Sqrt(available / needed) * 0.96);
+            }
         }
 
         _activeCupScale = scale;
@@ -1256,13 +1305,16 @@ public partial class MainWindow : Window
             layer.Height = PackHeight(layer.Blocks, width, wallInset, layer.Scale) + captionBand + 6;
         }
 
-        var canvasHeight = viewportHeight + _cupLayers.Sum(layer => layer.Height);
+        var activeHeight = IsEndless
+            ? Math.Max(viewportHeight, PackHeight(active, width, wallInset, 1) + topPad + floorInset)
+            : viewportHeight;
+        var canvasHeight = activeHeight + _cupLayers.Sum(layer => layer.Height);
         LiveCanvas.Width = width;
         LiveCanvas.Height = canvasHeight;
 
-        PackInto(active, width, wallInset, scale, viewportHeight - floorInset);
+        PackInto(active, width, wallInset, scale, activeHeight - floorInset);
 
-        var bandTop = viewportHeight;
+        var bandTop = activeHeight;
         foreach (var layer in _cupLayers)
         {
             layer.Divider.X1 = 8;
@@ -1430,12 +1482,13 @@ public partial class MainWindow : Window
         "w30" => LiveW30,
         "w45" => LiveW45,
         "w60" => LiveW60,
+        "inf" => LiveWInf,
         _ => LiveW5
     };
 
     private static string NormalizeLiveWindowKey(string key) => key switch
     {
-        "w1" or "w15" or "w30" or "w45" or "w60" => key,
+        "w1" or "w15" or "w30" or "w45" or "w60" or "inf" => key,
         _ => "w5"
     };
 
