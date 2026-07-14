@@ -8,23 +8,17 @@ Double-click **`TokenTracker.exe`**. There is nothing to install. Closing the wi
 
 ![Dashboard](docs/dashboard.png)
 
-The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), a stacked per-model timeline, and a by-model breakdown. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — 1-minute bars over the last hour, 15-minute bars over 8 hours, whatever combination fits; **Auto** chooses sensibly and sizes too fine for the range disable themselves. The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text.
+The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), a stacked per-model timeline, and a by-model breakdown. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — 1-minute bars over the last hour, 15-minute bars over 8 hours, whatever combination fits; **Auto** chooses sensibly and sizes too fine for the range disable themselves. The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text. A header toggle swaps the right panel between the **By model** breakdown and the **live cup** — the same cup as the Live tab, same state, still interactive — so the totals and the real-time view share one page.
 
 ## Terminals
 
-The bar under the header (visible on every tab) tracks each Claude Code terminal on the machine by tailing its session transcript: **green** means the turn finished and the terminal is sitting at the prompt, **blue** means it is mid-turn working, and **amber** means it has been quiet mid-turn for a while — usually a permission prompt waiting for an answer. No hooks or integration needed; state flips within a few seconds.
+A page with one tile per **open** Claude Code terminal, found by tailing session transcripts and matching them against the running processes (so closed terminals don't linger): **green** means the turn finished and the terminal is sitting at the prompt, **blue** means it is mid-turn working, and **amber** means it has been quiet mid-turn for a while — usually a permission prompt waiting for an answer. No hooks or integration needed; states flip within a few seconds.
 
 ## Live
 
 ![Live](docs/live.png)
 
 Ultra real time: every response drops into the cup as a block within about a second of being logged, sized by cost or token count with the value printed on it. Rounds are timed — the rim above the cup fills as the countdown runs (amber near the end, red just before), then the pile settles into a sediment layer, the floor rises, and the next round stacks on top. Scroll down through the layers to wander back in time; the small bars in the header score your recent rounds against your best. Round lengths run from 60 seconds to an hour, plus **∞ endless mode**, where nothing ever settles and the tower just keeps growing. Changing the round length re-partitions history instead of discarding it, and the live state keeps running in the background whatever tab is showing.
-
-## Multi
-
-![Multi](docs/multi.png)
-
-The main chart, cost totals, and the live cup on one page — it is literally the same cup as the Live tab (same state, still interactive), moved into the dashboard's side column.
 
 ## Limits
 

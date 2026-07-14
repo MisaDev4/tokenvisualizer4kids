@@ -39,6 +39,11 @@ public partial class MainWindow : Window
     private string _tabKey = "dashboard";
     private string _liveWindowKey = "w5";
     private string _liveMetricKey = "cost";
+    private string _dashPanelKey = "models";
+
+    /// <summary>The cup is on screen: the Live tab, or the dashboard with its live panel.</summary>
+    private bool LiveViewVisible =>
+        _tabKey == "live" || (_tabKey == "dashboard" && _dashPanelKey == "live");
 
     /// <summary>Endless mode: rounds never settle, the pile only grows.</summary>
     private bool IsEndless => _liveWindowKey == "inf";
@@ -159,6 +164,15 @@ public partial class MainWindow : Window
         _liveMetricKey = _settings.SelectedLiveMetric == "tokens" ? "tokens" : "cost";
         (_liveMetricKey == "tokens" ? LiveMetricTokens : LiveMetricCost).IsChecked = true;
         UpdateLiveWindowLabels();
+        // The old Multi tab became the dashboard's live panel toggle.
+        if (_settings.SelectedTab == "multi")
+        {
+            _settings.SelectedTab = "dashboard";
+            _settings.SelectedDashPanel = "live";
+        }
+
+        _dashPanelKey = _settings.SelectedDashPanel == "live" ? "live" : "models";
+        (_dashPanelKey == "live" ? PanelLive : PanelModels).IsChecked = true;
         _tabKey = NormalizeTabKey(_settings.SelectedTab);
         TabRadioFor(_tabKey).IsChecked = true;
 
@@ -233,10 +247,10 @@ public partial class MainWindow : Window
                 .Where(group => group.Count() > 1)
                 .Select(group => group.Key)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            TerminalsPanel.ItemsSource = terminals.Take(14).Select(status =>
+            TerminalsPanel.ItemsSource = terminals.Take(24).Select(status =>
             {
                 var age = DateTimeOffset.UtcNow - status.LastActivity;
-                var (dot, text, meaning) = status.State switch
+                var (state, text, meaning) = status.State switch
                 {
                     TerminalState.Ready => (
                         (Brush)FindResource("Series2Brush"),
@@ -254,13 +268,23 @@ public partial class MainWindow : Window
                 var name = duplicateNames.Contains(status.ProjectName)
                     ? $"{status.ProjectName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
                     : status.ProjectName;
-                return new TerminalVm(
+                return new TerminalTileVm(
                     name,
                     text,
-                    dot,
-                    $"{status.ProjectPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt}");
+                    state,
+                    state,
+                    EdgeBrushFor(state),
+                    status.ProjectPath,
+                    $"{status.ProjectPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}");
             }).ToList();
-            TerminalsBar.Visibility = terminals.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            var ready = terminals.Count(status => status.State == TerminalState.Ready);
+            var working = terminals.Count(status => status.State == TerminalState.Working);
+            var waiting = terminals.Count(status => status.State == TerminalState.Waiting);
+            TerminalsSubtitle.Text =
+                $"{ready} ready · {working} working · {waiting} waiting · " +
+                $"open terminals, matched to running Claude Code processes";
+            TerminalsEmpty.Visibility = terminals.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         finally
         {
@@ -268,11 +292,32 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>The tile outline: the state color at a whisper.</summary>
+    private static Brush EdgeBrushFor(Brush state)
+    {
+        if (state is not SolidColorBrush solid)
+        {
+            return state;
+        }
+
+        var color = solid.Color;
+        var edge = new SolidColorBrush(Color.FromArgb(70, color.R, color.G, color.B));
+        edge.Freeze();
+        return edge;
+    }
+
     private static string AgeText(TimeSpan age) => age.TotalHours >= 1
         ? $"{(int)age.TotalHours}h {age.Minutes}m"
         : $"{Math.Max(1, (int)age.TotalMinutes)}m";
 
-    private sealed record TerminalVm(string Name, string StatusText, Brush DotBrush, string Tooltip);
+    private sealed record TerminalTileVm(
+        string Name,
+        string StatusText,
+        Brush StatusBrush,
+        Brush DotBrush,
+        Brush EdgeBrush,
+        string PathText,
+        string Tooltip);
 
     private async Task RefreshLimitsAsync()
     {
@@ -670,18 +715,21 @@ public partial class MainWindow : Window
     {
         var live = _tabKey == "live";
         var limits = _tabKey == "limits";
-        var multi = _tabKey == "multi";
-        var chartVisible = !live && !limits;
-        DashboardHero.Visibility = chartVisible ? Visibility.Visible : Visibility.Collapsed;
-        DashboardContent.Visibility = chartVisible ? Visibility.Visible : Visibility.Collapsed;
-        RangeGroupBorder.Visibility = chartVisible ? Visibility.Visible : Visibility.Collapsed;
+        var terminals = _tabKey == "terminals";
+        var dashboard = !live && !limits && !terminals;
+        var livePanel = dashboard && _dashPanelKey == "live";
+        DashboardHero.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
+        DashboardContent.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
+        RangeGroupBorder.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
+        PanelGroupBorder.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         LiveRoot.Visibility = live ? Visibility.Visible : Visibility.Collapsed;
         LimitsRoot.Visibility = limits ? Visibility.Visible : Visibility.Collapsed;
-        ModelsCard.Visibility = multi ? Visibility.Collapsed : Visibility.Visible;
-        PlaceLiveFeedCard(multi);
+        TerminalsRoot.Visibility = terminals ? Visibility.Visible : Visibility.Collapsed;
+        ModelsCard.Visibility = livePanel ? Visibility.Collapsed : Visibility.Visible;
+        PlaceLiveFeedCard(livePanel);
         // Live state keeps running in the background; the tab switch only
         // pauses the per-frame rendering.
-        if (live || multi)
+        if (live || livePanel)
         {
             StartLiveFrames();
         }
@@ -694,6 +742,32 @@ public partial class MainWindow : Window
         {
             // Fresh numbers the moment the page opens, not up to a minute stale.
             _ = RefreshLimitsAsync();
+        }
+
+        if (terminals && _loaded)
+        {
+            _ = RefreshTerminalsAsync();
+        }
+    }
+
+    private void PanelButton_Checked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: string key } || key == _dashPanelKey && _loaded)
+        {
+            return;
+        }
+
+        _dashPanelKey = key;
+        if (LiveRoot is null)
+        {
+            return;
+        }
+
+        ApplyTab();
+        if (_loaded)
+        {
+            _settings.SelectedDashPanel = key;
+            _settings.Save();
         }
     }
 
@@ -1111,7 +1185,7 @@ public partial class MainWindow : Window
 
         _roundStartMs = nowMs;
         _cupLayoutDirty = true;
-        if (_tabKey is "live" or "multi")
+        if (LiveViewVisible)
         {
             LiveScroll.ScrollToVerticalOffset(0);
         }
@@ -1567,12 +1641,12 @@ public partial class MainWindow : Window
     {
         "live" => TabLive,
         "limits" => TabLimits,
-        "multi" => TabMulti,
+        "terminals" => TabTerminals,
         _ => TabDashboard
     };
 
     private static string NormalizeTabKey(string key) =>
-        key is "live" or "limits" or "multi" ? key : "dashboard";
+        key is "live" or "limits" or "terminals" ? key : "dashboard";
 
     private RadioButton LiveWindowRadioFor(string key) => key switch
     {

@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -79,6 +81,27 @@ public sealed class TerminalStatusService
             }
         }
 
+        // A closed terminal leaves a transcript that looks exactly like an idle
+        // one, so match against running claude processes: per working directory,
+        // keep at most as many sessions (newest first) as there are processes.
+        var openCounts = OpenTerminalCwds();
+        if (openCounts is not null)
+        {
+            var kept = new List<TerminalStatus>();
+            var used = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var status in results.OrderByDescending(item => item.LastActivity))
+            {
+                var key = NormalizePath(status.ProjectPath);
+                if (used.GetValueOrDefault(key) < openCounts.GetValueOrDefault(key))
+                {
+                    used[key] = used.GetValueOrDefault(key) + 1;
+                    kept.Add(status);
+                }
+            }
+
+            results = kept;
+        }
+
         return results
             .OrderBy(status => status.State switch
             {
@@ -88,6 +111,117 @@ public sealed class TerminalStatusService
             })
             .ThenByDescending(status => status.LastActivity)
             .ToList();
+    }
+
+    private static string NormalizePath(string path) => path.TrimEnd('\\', '/');
+
+    /// <summary>Working directories of running claude processes, with counts.
+    /// Null when enumeration itself fails, so the caller can skip filtering
+    /// rather than blank the page.</summary>
+    private static Dictionary<string, int>? OpenTerminalCwds()
+    {
+        try
+        {
+            var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var process in Process.GetProcessesByName("claude"))
+            {
+                using (process)
+                {
+                    var cwd = TryGetProcessCwd(process);
+                    if (!string.IsNullOrEmpty(cwd))
+                    {
+                        var key = NormalizePath(cwd);
+                        counts[key] = counts.GetValueOrDefault(key) + 1;
+                    }
+                }
+            }
+
+            return counts;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessBasicInformation
+    {
+        public IntPtr ExitStatus;
+        public IntPtr PebBaseAddress;
+        public IntPtr AffinityMask;
+        public IntPtr BasePriority;
+        public IntPtr UniqueProcessId;
+        public IntPtr InheritedFromUniqueProcessId;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(
+        IntPtr processHandle,
+        int informationClass,
+        ref ProcessBasicInformation information,
+        int informationLength,
+        out int returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(
+        IntPtr processHandle,
+        IntPtr baseAddress,
+        byte[] buffer,
+        IntPtr size,
+        out IntPtr bytesRead);
+
+    /// <summary>Reads another process's current directory from its PEB
+    /// (x64 layout: PEB+0x20 → RTL_USER_PROCESS_PARAMETERS, +0x38 → CurrentDirectory.DosPath).</summary>
+    private static string? TryGetProcessCwd(Process process)
+    {
+        try
+        {
+            var information = new ProcessBasicInformation();
+            if (NtQueryInformationProcess(
+                    process.Handle, 0, ref information, Marshal.SizeOf<ProcessBasicInformation>(), out _) != 0 ||
+                information.PebBaseAddress == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            var parameters = ReadPointer(process.Handle, information.PebBaseAddress + 0x20);
+            if (parameters == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            var unicodeString = new byte[16];
+            if (!ReadProcessMemory(process.Handle, parameters + 0x38, unicodeString, (IntPtr)16, out _))
+            {
+                return null;
+            }
+
+            var length = BitConverter.ToUInt16(unicodeString, 0);
+            var buffer = (IntPtr)BitConverter.ToInt64(unicodeString, 8);
+            if (length == 0 || length > 8192 || buffer == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            var pathBytes = new byte[length];
+            return ReadProcessMemory(process.Handle, buffer, pathBytes, (IntPtr)length, out _)
+                ? Encoding.Unicode.GetString(pathBytes)
+                : null;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // The process exited mid-read or denies access.
+            return null;
+        }
+    }
+
+    private static IntPtr ReadPointer(IntPtr processHandle, IntPtr address)
+    {
+        var buffer = new byte[8];
+        return ReadProcessMemory(processHandle, address, buffer, (IntPtr)8, out _)
+            ? (IntPtr)BitConverter.ToInt64(buffer, 0)
+            : IntPtr.Zero;
     }
 
     private static TerminalStatus? Classify(FileInfo file)

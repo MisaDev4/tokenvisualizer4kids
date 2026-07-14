@@ -15,6 +15,8 @@ public sealed class AppSettings
 
     public string SelectedTab { get; set; } = "dashboard";
 
+    public string SelectedDashPanel { get; set; } = "models";
+
     public string SelectedLiveWindow { get; set; } = "w5";
 
     public string SelectedLiveMetric { get; set; } = "cost";
