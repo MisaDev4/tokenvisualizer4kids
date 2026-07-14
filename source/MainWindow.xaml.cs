@@ -799,6 +799,9 @@ public partial class MainWindow : Window
             LiveRoot.Children.Add(LiveFeedCard);
         }
 
+        // The dashboard column is too narrow for the score bars alongside the
+        // toggles; the round countdown text keeps that space instead.
+        RoundHistoryBars.Visibility = multi ? Visibility.Collapsed : Visibility.Visible;
         _cupLayoutDirty = true;
     }
 
