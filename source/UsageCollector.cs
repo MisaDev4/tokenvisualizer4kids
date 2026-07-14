@@ -376,6 +376,7 @@ public sealed class UsageCollector : IDisposable
         yield return new SourceRoot(AppPaths.CodexSessionsPath, "codex");
         yield return new SourceRoot(AppPaths.ClaudeProjectsPath, "claude");
         yield return new SourceRoot(AppPaths.ClaudeTranscriptsPath, "claude");
+        yield return new SourceRoot(AppPaths.BenchResultsPath, "claude");
     }
 
     public void Dispose()

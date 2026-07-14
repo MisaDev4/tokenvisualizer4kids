@@ -4,6 +4,8 @@ namespace TokenTracker;
 
 public sealed class UsageDatabase
 {
+    private const int MaxBuckets = 500;
+
     private readonly string _databasePath;
     private readonly string _connectionString;
 
@@ -248,6 +250,7 @@ public sealed class UsageDatabase
     public async Task<DashboardData> GetDashboardAsync(
         string rangeKey,
         PricingService? pricing = null,
+        BucketUnit? unitOverride = null,
         CancellationToken cancellationToken = default)
     {
         var (startMs, endMs) = ResolveRange(rangeKey);
@@ -265,7 +268,9 @@ public sealed class UsageDatabase
                 COALESCE(SUM(message_count), 0),
                 COUNT(*),
                 (SELECT COUNT(*) FROM source_files),
-                COALESCE(MAX(updated_ms), 0)
+                COALESCE(MAX(updated_ms), 0),
+                COALESCE(MIN(timestamp_ms), 0),
+                COALESCE(MAX(timestamp_ms), 0)
             FROM usage_events
             {where};
             """;
@@ -273,6 +278,8 @@ public sealed class UsageDatabase
 
         UsageTotals totals;
         long lastUpdated;
+        long firstEventMs;
+        long lastEventMs;
         await using (var reader = await totalsCommand.ExecuteReaderAsync(cancellationToken))
         {
             await reader.ReadAsync(cancellationToken);
@@ -286,7 +293,11 @@ public sealed class UsageDatabase
                 reader.GetInt64(6),
                 reader.GetInt64(7));
             lastUpdated = reader.GetInt64(8);
+            firstEventMs = reader.GetInt64(9);
+            lastEventMs = reader.GetInt64(10);
         }
+
+        var unit = ResolveEffectiveUnit(rangeKey, unitOverride, startMs ?? firstEventMs, endMs, lastEventMs);
 
         var models = new List<ModelUsageRow>();
         var modelCommand = connection.CreateCommand();
@@ -317,52 +328,62 @@ public sealed class UsageDatabase
             }
         }
 
-        var daily = new List<DailyUsageRow>();
-        var dailyCommand = connection.CreateCommand();
-        dailyCommand.CommandText = $"""
-            SELECT strftime('%Y-%m-%d', timestamp_ms / 1000, 'unixepoch', 'localtime') AS day,
+        var bucketRows = new Dictionary<string, UsageBucket>(StringComparer.Ordinal);
+        var bucketCommand = connection.CreateCommand();
+        bucketCommand.CommandText = $"""
+            SELECT {BucketExpression(unit)} AS period,
                    SUM(message_count), SUM(input_tokens), SUM(output_tokens),
                    SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens)
             FROM usage_events
             {where}
-            GROUP BY day
-            ORDER BY day DESC
-            LIMIT 120;
+            GROUP BY period;
             """;
-        AddRangeParameters(dailyCommand, startMs, endMs);
-        await using (var reader = await dailyCommand.ExecuteReaderAsync(cancellationToken))
+        AddRangeParameters(bucketCommand, startMs, endMs);
+        await using (var reader = await bucketCommand.ExecuteReaderAsync(cancellationToken))
         {
             while (await reader.ReadAsync(cancellationToken))
             {
-                daily.Add(new DailyUsageRow(
-                    reader.GetString(0),
+                bucketRows[reader.GetString(0)] = new UsageBucket(
+                    0,
                     reader.GetInt64(1),
                     reader.GetInt64(2),
                     reader.GetInt64(3),
                     reader.GetInt64(4),
                     reader.GetInt64(5),
-                    reader.GetInt64(6)));
+                    reader.GetInt64(6));
             }
         }
 
+        double? previousCost = null;
         if (pricing is not null)
         {
-            (totals, models, daily) = await ApplyCostsAsync(
+            (totals, models, bucketRows) = await ApplyCostsAsync(
                 connection,
                 where,
                 startMs,
                 endMs,
                 totals,
                 models,
-                daily,
+                bucketRows,
                 pricing,
+                unit,
                 cancellationToken);
+
+            if (ResolvePreviousRange(rangeKey) is { } previousRange)
+            {
+                previousCost = await ComputeCostAsync(
+                    connection, previousRange.StartMs, previousRange.EndMs, pricing, cancellationToken);
+            }
         }
 
-        return new DashboardData(totals, models, daily, lastUpdated);
+        var buckets = FillBuckets(bucketRows, unit, startMs ?? firstEventMs, endMs);
+        return new DashboardData(totals, models, buckets, unit, lastUpdated)
+        {
+            PreviousCost = previousCost
+        };
     }
 
-    private static async Task<(UsageTotals Totals, List<ModelUsageRow> Models, List<DailyUsageRow> Daily)>
+    private static async Task<(UsageTotals Totals, List<ModelUsageRow> Models, Dictionary<string, UsageBucket> Buckets)>
         ApplyCostsAsync(
             SqliteConnection connection,
             string where,
@@ -370,15 +391,16 @@ public sealed class UsageDatabase
             long? endMs,
             UsageTotals totals,
             List<ModelUsageRow> models,
-            List<DailyUsageRow> daily,
+            Dictionary<string, UsageBucket> buckets,
             PricingService pricing,
+            BucketUnit unit,
             CancellationToken cancellationToken)
     {
         var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT client, provider, model, timestamp_ms,
                    input_tokens, output_tokens, cache_read_tokens,
-                   cache_write_tokens, reasoning_tokens
+                   cache_write_tokens, reasoning_tokens, message_count
             FROM usage_events
             {where};
             """;
@@ -387,7 +409,8 @@ public sealed class UsageDatabase
         var totalCost = 0d;
         var totalUnpriced = 0L;
         var modelCosts = new Dictionary<(string Client, string Provider, string Model), (double Cost, long Unpriced)>();
-        var dailyCosts = new Dictionary<string, (double Cost, long Unpriced)>(StringComparer.Ordinal);
+        var bucketCosts = new Dictionary<string, (double Cost, long Unpriced)>(StringComparer.Ordinal);
+        var bucketSlices = new Dictionary<string, Dictionary<string, (double Cost, long Tokens, long Messages)>>(StringComparer.Ordinal);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
@@ -402,6 +425,7 @@ public sealed class UsageDatabase
                 reader.GetInt64(6),
                 reader.GetInt64(7),
                 reader.GetInt64(8));
+            var messages = reader.GetInt64(9);
             var estimate = pricing.Calculate(provider, model, tokens);
             var unpriced = estimate.IsPriced ? 0L : 1L;
             totalCost += estimate.Cost;
@@ -411,9 +435,17 @@ public sealed class UsageDatabase
             modelCosts.TryGetValue(modelKey, out var modelCost);
             modelCosts[modelKey] = (modelCost.Cost + estimate.Cost, modelCost.Unpriced + unpriced);
 
-            var day = DateTimeOffset.FromUnixTimeMilliseconds(timestamp).ToLocalTime().ToString("yyyy-MM-dd");
-            dailyCosts.TryGetValue(day, out var dailyCost);
-            dailyCosts[day] = (dailyCost.Cost + estimate.Cost, dailyCost.Unpriced + unpriced);
+            var bucketKey = BucketKey(timestamp, unit);
+            bucketCosts.TryGetValue(bucketKey, out var bucketCost);
+            bucketCosts[bucketKey] = (bucketCost.Cost + estimate.Cost, bucketCost.Unpriced + unpriced);
+
+            if (!bucketSlices.TryGetValue(bucketKey, out var slices))
+            {
+                bucketSlices[bucketKey] = slices = new Dictionary<string, (double, long, long)>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            slices.TryGetValue(model, out var slice);
+            slices[model] = (slice.Cost + estimate.Cost, slice.Tokens + tokens.Total, slice.Messages + messages);
         }
 
         totals = totals with { EstimatedCost = totalCost, UnpricedEvents = totalUnpriced };
@@ -426,16 +458,298 @@ public sealed class UsageDatabase
             .OrderByDescending(row => row.EstimatedCost)
             .ThenByDescending(row => row.Total)
             .ToList();
-        daily = daily
-            .Select(row =>
+        buckets = buckets.ToDictionary(
+            pair => pair.Key,
+            pair =>
             {
-                dailyCosts.TryGetValue(row.Date, out var cost);
-                return row with { EstimatedCost = cost.Cost, UnpricedEvents = cost.Unpriced };
-            })
-            .ToList();
+                bucketCosts.TryGetValue(pair.Key, out var cost);
+                var slices = bucketSlices.TryGetValue(pair.Key, out var byModel)
+                    ? byModel
+                        .Select(item => new BucketModelSlice(item.Key, item.Value.Cost, item.Value.Tokens, item.Value.Messages))
+                        .OrderByDescending(slice => slice.Cost)
+                        .ToList()
+                    : [];
+                return pair.Value with
+                {
+                    EstimatedCost = cost.Cost,
+                    UnpricedEvents = cost.Unpriced,
+                    Slices = slices
+                };
+            },
+            StringComparer.Ordinal);
 
-        return (totals, models, daily);
+        return (totals, models, buckets);
     }
+
+    /// <summary>
+    /// Newest events indexed after <paramref name="sinceUpdatedMs"/>, ascending.
+    /// The limit keeps a full rescan (which re-stamps every row) from flooding
+    /// the live view with ancient history.
+    /// </summary>
+    public async Task<List<LiveEventRow>> GetEventsUpdatedSinceAsync(
+        long sinceUpdatedMs,
+        int limit = 400,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT event_key, client, provider, model, session_id, timestamp_ms, updated_ms,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   reasoning_tokens, message_count
+            FROM usage_events
+            WHERE updated_ms > $since
+            ORDER BY updated_ms DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$since", sinceUpdatedMs);
+        command.Parameters.AddWithValue("$limit", limit);
+
+        var rows = new List<LiveEventRow>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new LiveEventRow(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6),
+                new TokenBreakdown(
+                    reader.GetInt64(7),
+                    reader.GetInt64(8),
+                    reader.GetInt64(9),
+                    reader.GetInt64(10),
+                    reader.GetInt64(11)),
+                reader.GetInt64(12)));
+        }
+
+        rows.Reverse();
+        return rows;
+    }
+
+    private static async Task<double> ComputeCostAsync(
+        SqliteConnection connection,
+        long startMs,
+        long endMs,
+        PricingService pricing,
+        CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT provider, model, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens
+            FROM usage_events
+            WHERE timestamp_ms >= $start AND timestamp_ms < $end;
+            """;
+        command.Parameters.AddWithValue("$start", startMs);
+        command.Parameters.AddWithValue("$end", endMs);
+
+        var cost = 0d;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var tokens = new TokenBreakdown(
+                reader.GetInt64(2),
+                reader.GetInt64(3),
+                reader.GetInt64(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6));
+            cost += pricing.Calculate(reader.GetString(0), reader.GetString(1), tokens).Cost;
+        }
+
+        return cost;
+    }
+
+    /// <summary>
+    /// Expands sparse bucket rows into an unbroken ascending series covering the whole
+    /// range, so quiet hours/days render as true zeros instead of disappearing.
+    /// </summary>
+    private static List<UsageBucket> FillBuckets(
+        Dictionary<string, UsageBucket> rows,
+        BucketUnit unit,
+        long startMs,
+        long? endMs)
+    {
+        var result = new List<UsageBucket>();
+        if (startMs <= 0 && rows.Count == 0)
+        {
+            return result;
+        }
+
+        var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        var effectiveEnd = Math.Min(endMs ?? nowMs, nowMs);
+        if (startMs <= 0 || startMs > effectiveEnd)
+        {
+            return result;
+        }
+
+        var duration = UnitDurationMs(unit);
+        if (duration > 0)
+        {
+            var cursorMs = startMs / duration * duration;
+            while (result.Count < MaxBuckets && cursorMs <= effectiveEnd)
+            {
+                var key = cursorMs.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                result.Add(rows.TryGetValue(key, out var minuteRow)
+                    ? minuteRow with { StartMs = cursorMs }
+                    : new UsageBucket(cursorMs, 0, 0, 0, 0, 0, 0));
+                cursorMs += duration;
+            }
+
+            return result;
+        }
+
+        var keyFormat = BucketKeyFormat(unit);
+        var cursor = FloorToUnit(DateTimeOffset.FromUnixTimeMilliseconds(startMs).ToLocalTime().DateTime, unit);
+        while (result.Count < MaxBuckets)
+        {
+            var bucketStartMs = ToUnixMs(cursor);
+            if (bucketStartMs > effectiveEnd)
+            {
+                break;
+            }
+
+            var key = cursor.ToString(keyFormat, System.Globalization.CultureInfo.InvariantCulture);
+            result.Add(rows.TryGetValue(key, out var row)
+                ? row with { StartMs = bucketStartMs }
+                : new UsageBucket(bucketStartMs, 0, 0, 0, 0, 0, 0));
+            cursor = Advance(cursor, unit);
+        }
+
+        return result;
+    }
+
+    private static string BucketKey(long timestampMs, BucketUnit unit)
+    {
+        var duration = UnitDurationMs(unit);
+        return duration > 0
+            ? (timestampMs / duration * duration).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : DateTimeOffset.FromUnixTimeMilliseconds(timestampMs).ToLocalTime()
+                .ToString(BucketKeyFormat(unit), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Honors an explicit bar-size choice but coarsens it until the series fits
+    /// under <see cref="MaxBuckets"/>; a too-fine unit would otherwise silently
+    /// truncate the newest bars when the fill loop hits the cap.
+    /// </summary>
+    private static BucketUnit ResolveEffectiveUnit(
+        string rangeKey,
+        BucketUnit? requested,
+        long startMs,
+        long? endMs,
+        long lastEventMs)
+    {
+        if (requested is not { } unit)
+        {
+            return ResolveBucketUnit(rangeKey, startMs, endMs, lastEventMs);
+        }
+
+        var end = Math.Min(
+            endMs ?? long.MaxValue,
+            DateTimeOffset.Now.ToUnixTimeMilliseconds());
+        var spanMs = startMs > 0 && end > startMs ? end - startMs : 0;
+        while (unit < BucketUnit.Month && spanMs / ApproximateUnitMs(unit) > MaxBuckets)
+        {
+            unit++;
+        }
+
+        return unit;
+    }
+
+    /// <summary>Typical bucket width, used only to estimate series length.</summary>
+    private static double ApproximateUnitMs(BucketUnit unit) => unit switch
+    {
+        BucketUnit.Minute1 => 60_000,
+        BucketUnit.Minute5 => 300_000,
+        BucketUnit.Minute15 => 900_000,
+        BucketUnit.Minute30 => 1_800_000,
+        BucketUnit.Hour => 3_600_000,
+        BucketUnit.Day => 86_400_000,
+        _ => 2_592_000_000
+    };
+
+    private static BucketUnit ResolveBucketUnit(string rangeKey, long startMs, long? endMs, long lastEventMs)
+    {
+        if (rangeKey is "last1")
+        {
+            return BucketUnit.Minute1;
+        }
+
+        if (rangeKey is "last4")
+        {
+            return BucketUnit.Minute15;
+        }
+
+        if (rangeKey is "last8" or "last12" or "last24" or "today")
+        {
+            return BucketUnit.Hour;
+        }
+
+        if (rangeKey is not "all")
+        {
+            return BucketUnit.Day;
+        }
+
+        var end = endMs ?? Math.Max(lastEventMs, DateTimeOffset.Now.ToUnixTimeMilliseconds());
+        var spanDays = startMs > 0 ? (end - startMs) / 86_400_000d : 0;
+        return spanDays > 180 ? BucketUnit.Month : BucketUnit.Day;
+    }
+
+    /// <summary>Fixed bucket duration for epoch-aligned units; 0 for calendar units.</summary>
+    private static long UnitDurationMs(BucketUnit unit) => unit switch
+    {
+        BucketUnit.Minute1 => 60_000,
+        BucketUnit.Minute5 => 300_000,
+        BucketUnit.Minute15 => 900_000,
+        BucketUnit.Minute30 => 1_800_000,
+        _ => 0
+    };
+
+    private static string BucketExpression(BucketUnit unit)
+    {
+        // Sub-hour buckets are aligned on epoch ms; every UTC offset is a multiple of 15 minutes,
+        // so the boundaries land on local clock marks too.
+        var duration = UnitDurationMs(unit);
+        if (duration > 0)
+        {
+            return $"CAST(timestamp_ms / {duration} * {duration} AS TEXT)";
+        }
+
+        return unit switch
+        {
+            BucketUnit.Hour => "strftime('%Y-%m-%d %H:00', timestamp_ms / 1000, 'unixepoch', 'localtime')",
+            BucketUnit.Month => "strftime('%Y-%m', timestamp_ms / 1000, 'unixepoch', 'localtime')",
+            _ => "strftime('%Y-%m-%d', timestamp_ms / 1000, 'unixepoch', 'localtime')"
+        };
+    }
+
+    private static string BucketKeyFormat(BucketUnit unit) => unit switch
+    {
+        BucketUnit.Hour => "yyyy-MM-dd HH:00",
+        BucketUnit.Month => "yyyy-MM",
+        _ => "yyyy-MM-dd"
+    };
+
+    private static DateTime FloorToUnit(DateTime value, BucketUnit unit) => unit switch
+    {
+        BucketUnit.Hour => new DateTime(value.Year, value.Month, value.Day, value.Hour, 0, 0),
+        BucketUnit.Month => new DateTime(value.Year, value.Month, 1),
+        _ => value.Date
+    };
+
+    private static DateTime Advance(DateTime value, BucketUnit unit) => unit switch
+    {
+        BucketUnit.Hour => value.AddHours(1),
+        BucketUnit.Month => value.AddMonths(1),
+        _ => value.AddDays(1)
+    };
+
+    private static long ToUnixMs(DateTime local) =>
+        new DateTimeOffset(local, TimeZoneInfo.Local.GetUtcOffset(local)).ToUnixTimeMilliseconds();
 
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
@@ -455,6 +769,10 @@ public sealed class UsageDatabase
 
         return key switch
         {
+            "last1" => (now.AddHours(-1).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
+            "last4" => (now.AddHours(-4).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
+            "last8" => (now.AddHours(-8).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
+            "last12" => (now.AddHours(-12).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "today" => (today.ToUnixTimeMilliseconds(), today.AddDays(1).ToUnixTimeMilliseconds()),
             "last24" => (now.AddHours(-24).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "last7" => (now.AddDays(-7).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
@@ -462,6 +780,29 @@ public sealed class UsageDatabase
             "previousMonth" => (month.AddMonths(-1).ToUnixTimeMilliseconds(), month.ToUnixTimeMilliseconds()),
             "all" => (null, null),
             _ => (month.ToUnixTimeMilliseconds(), month.AddMonths(1).ToUnixTimeMilliseconds())
+        };
+    }
+
+    /// <summary>The equivalent preceding window (same length, ending where the current one starts).</summary>
+    private static (long StartMs, long EndMs)? ResolvePreviousRange(string key)
+    {
+        var now = DateTimeOffset.Now;
+        var today = new DateTimeOffset(now.Year, now.Month, now.Day, 0, 0, 0, now.Offset);
+        var month = new DateTimeOffset(now.Year, now.Month, 1, 0, 0, 0, now.Offset);
+
+        return key switch
+        {
+            "last1" => (now.AddHours(-2).ToUnixTimeMilliseconds(), now.AddHours(-1).ToUnixTimeMilliseconds()),
+            "last4" => (now.AddHours(-8).ToUnixTimeMilliseconds(), now.AddHours(-4).ToUnixTimeMilliseconds()),
+            "last8" => (now.AddHours(-16).ToUnixTimeMilliseconds(), now.AddHours(-8).ToUnixTimeMilliseconds()),
+            "last12" => (now.AddHours(-24).ToUnixTimeMilliseconds(), now.AddHours(-12).ToUnixTimeMilliseconds()),
+            "today" => (today.AddDays(-1).ToUnixTimeMilliseconds(), now.AddDays(-1).ToUnixTimeMilliseconds()),
+            "last24" => (now.AddHours(-48).ToUnixTimeMilliseconds(), now.AddHours(-24).ToUnixTimeMilliseconds()),
+            "last7" => (now.AddDays(-14).ToUnixTimeMilliseconds(), now.AddDays(-7).ToUnixTimeMilliseconds()),
+            "last30" => (now.AddDays(-60).ToUnixTimeMilliseconds(), now.AddDays(-30).ToUnixTimeMilliseconds()),
+            "currentMonth" => (month.AddMonths(-1).ToUnixTimeMilliseconds(), now.AddMonths(-1).ToUnixTimeMilliseconds()),
+            "previousMonth" => (month.AddMonths(-2).ToUnixTimeMilliseconds(), month.AddMonths(-1).ToUnixTimeMilliseconds()),
+            _ => null
         };
     }
 

@@ -3,193 +3,524 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Token Tracker"
         Width="1280"
-        Height="820"
-        MinWidth="980"
-        MinHeight="640"
-        Background="{StaticResource WindowBackground}"
-        Foreground="{StaticResource TextBrush}"
+        Height="860"
+        MinWidth="1000"
+        MinHeight="680"
+        Background="{StaticResource PageBrush}"
+        Foreground="{StaticResource Ink2Brush}"
+        FontFamily="Segoe UI"
+        UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display"
         WindowStartupLocation="CenterScreen"
         Loaded="Window_Loaded"
         Closing="Window_Closing">
   <Window.Resources>
-    <Style x:Key="MetricCard" TargetType="Border">
-      <Setter Property="Background" Value="{StaticResource PanelBackground}" />
-      <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="12" />
-      <Setter Property="Padding" Value="16" />
-      <Setter Property="Margin" Value="0,0,10,0" />
-    </Style>
-    <Style x:Key="MetricLabel" TargetType="TextBlock">
+    <Style x:Key="GhostToggle" TargetType="ToggleButton">
       <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
-      <Setter Property="FontSize" Value="12" />
       <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Cursor" Value="Hand" />
+      <Setter Property="Padding" Value="10,6" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ToggleButton">
+            <Border x:Name="Border" Background="Transparent" BorderBrush="Transparent"
+                    BorderThickness="1" CornerRadius="7" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Border" Property="Background" Value="{StaticResource RaisedBrush}" />
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Border" Property="Background" Value="{StaticResource RaisedBrush}" />
+                <Setter TargetName="Border" Property="BorderBrush" Value="{StaticResource HairlineBrush}" />
+                <Setter Property="Foreground" Value="{StaticResource InkBrush}" />
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
-    <Style x:Key="MetricValue" TargetType="TextBlock">
-      <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
-      <Setter Property="FontSize" Value="25" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="Margin" Value="0,7,0,0" />
+
+    <!-- Share bar used in the model breakdown; Foreground carries the model's series color -->
+    <Style x:Key="ShareBar" TargetType="ProgressBar">
+      <Setter Property="Height" Value="6" />
+      <Setter Property="Minimum" Value="0" />
+      <Setter Property="Maximum" Value="1" />
+      <Setter Property="Foreground" Value="{StaticResource Series1Brush}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ProgressBar">
+            <Grid>
+              <Border x:Name="PART_Track" Background="{StaticResource BarTrackBrush}" CornerRadius="3" />
+              <Border x:Name="PART_Indicator" Background="{TemplateBinding Foreground}"
+                      CornerRadius="3" HorizontalAlignment="Left" />
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
   </Window.Resources>
 
-  <Grid Margin="24">
+  <Grid Margin="20,16,20,14">
     <Grid.RowDefinitions>
-      <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
 
-    <Grid Grid.Row="0" Margin="0,0,0,20">
+    <!-- ═══ Header: brand · range presets · actions ═══ -->
+    <Grid Grid.Row="0" Margin="0,0,0,16">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
         <ColumnDefinition Width="Auto" />
       </Grid.ColumnDefinitions>
-      <StackPanel>
-        <StackPanel Orientation="Horizontal">
-          <Border Width="10" Height="10" CornerRadius="5" Background="{StaticResource AccentBrush}"
-                  VerticalAlignment="Center" Margin="0,0,9,0" />
-          <TextBlock Text="TOKEN TRACKER" FontSize="12" FontWeight="Bold"
-                     Foreground="{StaticResource AccentBrush}" VerticalAlignment="Center" />
-        </StackPanel>
-        <TextBlock Text="Your local AI token history" FontSize="28" FontWeight="Bold" Margin="0,5,0,0" />
-        <TextBlock Text="Codex + Claude logs, stored locally and kept up to date in the background."
-                   Foreground="{StaticResource MutedBrush}" Margin="0,5,0,0" />
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <Border Width="9" Height="9" CornerRadius="4.5" Background="{StaticResource AccentBrush}"
+                VerticalAlignment="Center" Margin="0,1,10,0" />
+        <TextBlock Text="Token Tracker" FontSize="15" FontWeight="SemiBold"
+                   Foreground="{StaticResource InkBrush}" VerticalAlignment="Center" />
+        <Border Style="{StaticResource SegmentGroup}" Margin="18,0,0,0">
+          <StackPanel Orientation="Horizontal">
+            <RadioButton x:Name="TabDashboard" Style="{StaticResource SegmentButton}" GroupName="tab"
+                         Content="Dashboard" Tag="dashboard" IsChecked="True" Checked="TabButton_Checked" />
+            <RadioButton x:Name="TabLive" Style="{StaticResource SegmentButton}" GroupName="tab"
+                         Content="Live" Tag="live" Checked="TabButton_Checked"
+                         ToolTip="Ultra real time: every response appears as a bubble the moment it is logged." />
+          </StackPanel>
+        </Border>
       </StackPanel>
-      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Bottom">
-        <Button x:Name="RefreshButton" Content="Refresh now" Click="RefreshButton_Click" Margin="0,0,10,0" />
-        <Button x:Name="FullRescanButton" Content="Full rescan / repair" Style="{StaticResource AccentButton}"
-                Click="FullRescanButton_Click" ToolTip="Re-read every available log and repair the local index." />
+
+      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+        <Border x:Name="RangeGroupBorder" Style="{StaticResource SegmentGroup}">
+          <StackPanel Orientation="Horizontal">
+            <RadioButton x:Name="RangeLast1" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="1 h" Tag="last1" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast4" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="4 h" Tag="last4" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast8" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="8 h" Tag="last8" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast12" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="12 h" Tag="last12" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast24" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="24 h" Tag="last24" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeToday" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="Today" Tag="today" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast7" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="7 d" Tag="last7" ToolTip="Last 7 days" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast30" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="30 d" Tag="last30" ToolTip="Last 30 days" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeMonth" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="Month" Tag="currentMonth" ToolTip="This calendar month" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeAll" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="All" Tag="all" ToolTip="All time" Checked="RangeButton_Checked" />
+          </StackPanel>
+        </Border>
+        <Button x:Name="RefreshButton" Content="Refresh" Style="{StaticResource GhostButton}"
+                Margin="10,0,0,0" Click="RefreshButton_Click" />
+        <ToggleButton x:Name="SettingsToggle" Style="{StaticResource GhostToggle}" Margin="4,0,0,0"
+                      Content="Settings" Padding="10,7" />
+        <Popup x:Name="SettingsPopup"
+               PlacementTarget="{Binding ElementName=SettingsToggle}"
+               Placement="Bottom"
+               HorizontalOffset="-220"
+               VerticalOffset="6"
+               AllowsTransparency="True"
+               StaysOpen="False"
+               IsOpen="{Binding IsChecked, ElementName=SettingsToggle, Mode=TwoWay}">
+          <Border Style="{StaticResource Card}" Background="#1F1F1E" Width="320" Padding="18" Margin="0,0,0,8">
+            <StackPanel>
+              <TextBlock Text="Settings" FontSize="14" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock Text="Background safety check" Style="{StaticResource TileLabel}" Margin="0,14,0,6" />
+              <ComboBox x:Name="IntervalComboBox" SelectionChanged="IntervalComboBox_SelectionChanged" />
+              <CheckBox x:Name="StartupCheckBox" Content="Start with Windows" Margin="0,14,0,0"
+                        Checked="StartupCheckBox_Changed" Unchecked="StartupCheckBox_Changed" />
+              <Button x:Name="FullRescanButton" Content="Full rescan / repair" Margin="0,16,0,0"
+                      HorizontalAlignment="Stretch"
+                      ToolTip="Re-read every available log and repair the local index."
+                      Click="FullRescanButton_Click" />
+              <Border Height="1" Background="{StaticResource GridlineBrush}" Margin="0,16,0,12" />
+              <TextBlock x:Name="PricingStatusText" FontSize="11" Foreground="{StaticResource MutedBrush}"
+                         TextWrapping="Wrap" />
+              <TextBlock x:Name="DatabasePathText" FontSize="11" Foreground="{StaticResource MutedBrush}"
+                         TextWrapping="Wrap" Margin="0,4,0,0" />
+              <TextBlock FontSize="11" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,10,0,0"
+                         Text="Costs are estimated API list prices. Reasoning tokens are part of output and billed at the output rate. Raw prompts are never copied into the database." />
+            </StackPanel>
+          </Border>
+        </Popup>
       </StackPanel>
     </Grid>
 
-    <Border Grid.Row="1" Background="{StaticResource PanelBackground}" BorderBrush="{StaticResource BorderBrush}"
-            BorderThickness="1" CornerRadius="12" Padding="14" Margin="0,0,0,18">
+    <!-- ═══ Hero cost + KPI tiles ═══ -->
+    <Border x:Name="DashboardHero" Grid.Row="1" Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
       <Grid>
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto" />
-          <ColumnDefinition Width="190" />
-          <ColumnDefinition Width="24" />
-          <ColumnDefinition Width="Auto" />
-          <ColumnDefinition Width="170" />
-          <ColumnDefinition Width="24" />
           <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
-        <TextBlock Grid.Column="0" Text="Show" Foreground="{StaticResource MutedBrush}"
-                   VerticalAlignment="Center" Margin="0,0,9,0" />
-        <ComboBox x:Name="RangeComboBox" Grid.Column="1" SelectionChanged="RangeComboBox_SelectionChanged" />
-        <TextBlock Grid.Column="3" Text="Safety check" Foreground="{StaticResource MutedBrush}"
-                   VerticalAlignment="Center" Margin="0,0,9,0" />
-        <ComboBox x:Name="IntervalComboBox" Grid.Column="4" SelectionChanged="IntervalComboBox_SelectionChanged" />
-        <CheckBox x:Name="StartupCheckBox" Grid.Column="6" Content="Start with Windows"
-                  Checked="StartupCheckBox_Changed" Unchecked="StartupCheckBox_Changed" />
-        <TextBlock Grid.Column="7" x:Name="LastUpdatedText" HorizontalAlignment="Right" VerticalAlignment="Center"
-                   Foreground="{StaticResource MutedBrush}" />
+        <StackPanel Grid.Column="0" VerticalAlignment="Center" MinWidth="210">
+          <TextBlock x:Name="CostLabel" Text="Estimated cost" Style="{StaticResource TileLabel}" />
+          <TextBlock x:Name="CostText" Text="—" FontSize="44" FontWeight="SemiBold"
+                     Foreground="{StaticResource InkBrush}" Margin="0,2,0,0" />
+          <TextBlock x:Name="CostDeltaText" Text="" FontSize="12"
+                     Foreground="{StaticResource MutedBrush}" Margin="2,2,0,0" />
+        </StackPanel>
+        <Border Grid.Column="1" Width="1" Background="{StaticResource GridlineBrush}"
+                Margin="24,4" />
+        <UniformGrid Grid.Column="2" Columns="6" VerticalAlignment="Center">
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Total tokens" Style="{StaticResource TileLabel}" />
+            <TextBlock x:Name="TotalTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Input" Style="{StaticResource TileLabel}" />
+            <TextBlock x:Name="InputTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Output" Style="{StaticResource TileLabel}" />
+            <TextBlock x:Name="OutputTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Reasoning" Style="{StaticResource TileLabel}"
+                       ToolTip="Included in output tokens." />
+            <TextBlock x:Name="ReasoningTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Cache read" Style="{StaticResource TileLabel}" />
+            <TextBlock x:Name="CacheReadTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Cache write" Style="{StaticResource TileLabel}" />
+            <TextBlock x:Name="CacheWriteTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+        </UniformGrid>
       </Grid>
     </Border>
 
-    <UniformGrid Grid.Row="2" Columns="7" Margin="0,0,0,18">
-      <Border Style="{StaticResource MetricCard}" BorderBrush="{StaticResource AccentBrush}">
-        <StackPanel><TextBlock Text="EST. COST" Style="{StaticResource MetricLabel}" Foreground="{StaticResource AccentBrush}" />
-          <TextBlock x:Name="EstimatedCostText" Text="--" Style="{StaticResource MetricValue}"
-                     Foreground="{StaticResource AccentBrush}" /></StackPanel>
-      </Border>
-      <Border Style="{StaticResource MetricCard}">
-        <StackPanel><TextBlock Text="ALL TOKENS" Style="{StaticResource MetricLabel}" />
-          <TextBlock x:Name="TotalTokensText" Text="—" Style="{StaticResource MetricValue}" /></StackPanel>
-      </Border>
-      <Border Style="{StaticResource MetricCard}">
-        <StackPanel><TextBlock Text="INPUT" Style="{StaticResource MetricLabel}" />
-          <TextBlock x:Name="InputTokensText" Text="—" Style="{StaticResource MetricValue}" /></StackPanel>
-      </Border>
-      <Border Style="{StaticResource MetricCard}">
-        <StackPanel><TextBlock Text="OUTPUT" Style="{StaticResource MetricLabel}" />
-          <TextBlock x:Name="OutputTokensText" Text="—" Style="{StaticResource MetricValue}" /></StackPanel>
-      </Border>
-      <Border Style="{StaticResource MetricCard}" BorderBrush="#7C5CE7">
-        <StackPanel><TextBlock Text="REASONING" Style="{StaticResource MetricLabel}" Foreground="#AE9BFF" />
-          <TextBlock x:Name="ReasoningTokensText" Text="—" Style="{StaticResource MetricValue}" Foreground="#C8BCFF" /></StackPanel>
-      </Border>
-      <Border Style="{StaticResource MetricCard}">
-        <StackPanel><TextBlock Text="CACHE READ" Style="{StaticResource MetricLabel}" />
-          <TextBlock x:Name="CacheReadTokensText" Text="—" Style="{StaticResource MetricValue}" /></StackPanel>
-      </Border>
-      <Border Style="{StaticResource MetricCard}" Margin="0">
-        <StackPanel><TextBlock Text="CACHE WRITE" Style="{StaticResource MetricLabel}" />
-          <TextBlock x:Name="CacheWriteTokensText" Text="—" Style="{StaticResource MetricValue}" /></StackPanel>
-      </Border>
-    </UniformGrid>
-
-    <Grid Grid.Row="3">
+    <!-- ═══ Chart + model breakdown ═══ -->
+    <Grid x:Name="DashboardContent" Grid.Row="2">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="3*" />
-        <ColumnDefinition Width="16" />
-        <ColumnDefinition Width="2*" />
+        <ColumnDefinition Width="14" />
+        <ColumnDefinition Width="2*" MinWidth="330" />
       </Grid.ColumnDefinitions>
 
-      <Border Grid.Column="0" Background="{StaticResource PanelBackground}" BorderBrush="{StaticResource BorderBrush}"
-              BorderThickness="1" CornerRadius="12" Padding="1">
+      <Border Grid.Column="0" Style="{StaticResource Card}" Padding="20,16">
         <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-          <StackPanel Margin="15,13,15,11">
-            <TextBlock Text="Usage by model" FontSize="17" FontWeight="SemiBold" />
-            <TextBlock x:Name="SummaryText" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0" />
-          </StackPanel>
-          <DataGrid x:Name="ModelsGrid" Grid.Row="1" BorderThickness="0" AlternationCount="2">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Client" Binding="{Binding Client}" Width="75" />
-              <DataGridTextColumn Header="Provider" Binding="{Binding Provider}" Width="85" />
-              <DataGridTextColumn Header="Model" Binding="{Binding Model}" Width="*" MinWidth="150" />
-              <DataGridTextColumn Header="Cost" Binding="{Binding EstimatedCost, StringFormat={}{0:C2}}" Width="90" />
-              <DataGridTextColumn Header="Total" Binding="{Binding Total, StringFormat={}{0:N0}}" Width="105" />
-              <DataGridTextColumn Header="Reasoning" Binding="{Binding Reasoning, StringFormat={}{0:N0}}" Width="100" />
-              <DataGridTextColumn Header="Messages" Binding="{Binding Messages, StringFormat={}{0:N0}}" Width="85" />
-            </DataGrid.Columns>
-          </DataGrid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+          </Grid.RowDefinitions>
+
+          <Grid Grid.Row="0" Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock x:Name="ChartTitle" Text="Spend by hour" FontSize="16" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="ChartSubtitle" Text="" FontSize="12"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+              <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0"
+                      ToolTip="Bar size. Auto picks a width to fit the range; sizes too fine for the range are disabled.">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="BarsAuto" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="Auto" Tag="auto" IsChecked="True" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsM1" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="1m" Tag="m1" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsM5" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="5m" Tag="m5" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsM15" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="15m" Tag="m15" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsM30" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="30m" Tag="m30" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsH1" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="1h" Tag="h1" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsD1" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="1d" Tag="d1" Checked="BarsButton_Checked" />
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource SegmentGroup}">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="MetricCost" Style="{StaticResource SegmentButton}" GroupName="metric"
+                               Content="Cost" Tag="cost" IsChecked="True" Checked="MetricButton_Checked" />
+                  <RadioButton x:Name="MetricTokens" Style="{StaticResource SegmentButton}" GroupName="metric"
+                               Content="Tokens" Tag="tokens" Checked="MetricButton_Checked" />
+                  <RadioButton x:Name="MetricMessages" Style="{StaticResource SegmentButton}" GroupName="metric"
+                               Content="Messages" Tag="messages" Checked="MetricButton_Checked" />
+                </StackPanel>
+              </Border>
+              <ToggleButton x:Name="TableToggle" Style="{StaticResource GhostToggle}" Content="Table"
+                            Margin="8,0,0,0" Checked="TableToggle_Changed" Unchecked="TableToggle_Changed" />
+            </StackPanel>
+          </Grid>
+
+          <ItemsControl x:Name="ChartLegend" Grid.Row="1" Margin="2,4,0,2" Visibility="Collapsed">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <WrapPanel Orientation="Horizontal" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <StackPanel Orientation="Horizontal" Margin="0,0,16,3">
+                  <Rectangle Width="10" Height="10" RadiusX="2" RadiusY="2" Fill="{Binding Brush}"
+                             VerticalAlignment="Center" />
+                  <TextBlock Text="{Binding Name}" FontSize="11" Foreground="{StaticResource Ink2Brush}"
+                             Margin="6,0,0,0" />
+                </StackPanel>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+
+          <Grid Grid.Row="2" Margin="0,6,0,0">
+            <Canvas x:Name="ChartCanvas" ClipToBounds="True" Background="Transparent"
+                    SizeChanged="ChartCanvas_SizeChanged" />
+            <TextBlock x:Name="ChartEmptyText" Text="No usage recorded in this range."
+                       Foreground="{StaticResource MutedBrush}" FontSize="13"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       Visibility="Collapsed" />
+            <DataGrid x:Name="ChartTable" Visibility="Collapsed">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Period" Binding="{Binding Period}" Width="*" />
+                <DataGridTextColumn Header="Cost" Binding="{Binding Cost}" Width="80">
+                  <DataGridTextColumn.ElementStyle>
+                    <Style TargetType="TextBlock"><Setter Property="TextAlignment" Value="Right" /></Style>
+                  </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="Total" Binding="{Binding Total}" Width="90">
+                  <DataGridTextColumn.ElementStyle>
+                    <Style TargetType="TextBlock"><Setter Property="TextAlignment" Value="Right" /></Style>
+                  </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="Input" Binding="{Binding Input}" Width="90">
+                  <DataGridTextColumn.ElementStyle>
+                    <Style TargetType="TextBlock"><Setter Property="TextAlignment" Value="Right" /></Style>
+                  </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="Output" Binding="{Binding Output}" Width="90">
+                  <DataGridTextColumn.ElementStyle>
+                    <Style TargetType="TextBlock"><Setter Property="TextAlignment" Value="Right" /></Style>
+                  </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="Cache" Binding="{Binding Cache}" Width="100">
+                  <DataGridTextColumn.ElementStyle>
+                    <Style TargetType="TextBlock"><Setter Property="TextAlignment" Value="Right" /></Style>
+                  </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="Msgs" Binding="{Binding Messages}" Width="70">
+                  <DataGridTextColumn.ElementStyle>
+                    <Style TargetType="TextBlock"><Setter Property="TextAlignment" Value="Right" /></Style>
+                  </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+              </DataGrid.Columns>
+            </DataGrid>
+          </Grid>
         </Grid>
       </Border>
 
-      <Border Grid.Column="2" Background="{StaticResource PanelBackground}" BorderBrush="{StaticResource BorderBrush}"
-              BorderThickness="1" CornerRadius="12" Padding="1">
+      <Border Grid.Column="2" Style="{StaticResource Card}" Padding="20,16">
         <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-          <StackPanel Margin="15,13,15,11">
-            <TextBlock Text="Daily totals" FontSize="17" FontWeight="SemiBold" />
-            <TextBlock Text="Local calendar days" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0" />
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+          </Grid.RowDefinitions>
+          <StackPanel Margin="0,0,0,12">
+            <TextBlock Text="By model" FontSize="16" FontWeight="SemiBold"
+                       Foreground="{StaticResource InkBrush}" />
+            <TextBlock x:Name="ModelsSubtitle" Text="" FontSize="12"
+                       Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
           </StackPanel>
-          <DataGrid x:Name="DailyGrid" Grid.Row="1" BorderThickness="0" AlternationCount="2">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Date" Binding="{Binding Date}" Width="*" />
-              <DataGridTextColumn Header="Cost" Binding="{Binding EstimatedCost, StringFormat={}{0:C2}}" Width="90" />
-              <DataGridTextColumn Header="Total" Binding="{Binding Total, StringFormat={}{0:N0}}" Width="110" />
-              <DataGridTextColumn Header="Reasoning" Binding="{Binding Reasoning, StringFormat={}{0:N0}}" Width="95" />
-            </DataGrid.Columns>
-          </DataGrid>
+          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <ItemsControl x:Name="ModelsList">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Grid Margin="0,0,10,16" ToolTip="{Binding Tooltip}" Background="Transparent">
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0" Margin="0,0,0,5">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold"
+                                 Foreground="{StaticResource InkBrush}"
+                                 TextTrimming="CharacterEllipsis" Margin="0,0,10,0" />
+                      <TextBlock Grid.Column="1" Text="{Binding CostLabel}" FontSize="13" FontWeight="SemiBold"
+                                 Foreground="{StaticResource InkBrush}" />
+                    </Grid>
+                    <ProgressBar Grid.Row="1" Style="{StaticResource ShareBar}" Value="{Binding Share, Mode=OneWay}"
+                                 Foreground="{Binding BarBrush}" />
+                    <TextBlock Grid.Row="2" Text="{Binding Detail}" FontSize="11"
+                               Foreground="{StaticResource MutedBrush}" Margin="0,5,0,0"
+                               TextTrimming="CharacterEllipsis" />
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
         </Grid>
       </Border>
     </Grid>
 
-    <Grid Grid.Row="4" Margin="0,16,0,0">
-      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-      <StackPanel>
-        <StackPanel Orientation="Horizontal">
-          <ProgressBar x:Name="ScanProgress" Width="170" Height="7" Minimum="0" Maximum="1"
-                       Value="0" Foreground="{StaticResource AccentBrush}" Background="{StaticResource PanelRaised}"
-                       VerticalAlignment="Center" Margin="0,0,10,0" />
-          <TextBlock x:Name="StatusText" Text="Starting…" Foreground="{StaticResource MutedBrush}" />
-        </StackPanel>
-        <TextBlock Text="Cost is an estimated API list price; reasoning is included in output tokens and billed at the output rate. Raw prompts are never copied into the database."
-                   Foreground="#6F8D82" FontSize="11" Margin="0,7,0,0" />
+    <!-- ═══ Ultra real time: live event river ═══ -->
+    <Grid x:Name="LiveRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+
+      <Border Grid.Row="0" Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <StackPanel Grid.Column="0" VerticalAlignment="Center" MinWidth="210">
+            <TextBlock x:Name="LiveSpendLabel" Text="Spend · last 5 min" Style="{StaticResource TileLabel}" />
+            <TextBlock x:Name="LiveSpendText" Text="$0.00" FontSize="44" FontWeight="SemiBold"
+                       Foreground="{StaticResource InkBrush}" Margin="0,2,0,0" />
+            <StackPanel Orientation="Horizontal" Margin="2,2,0,0">
+              <Ellipse x:Name="LivePulseDot" Width="8" Height="8" Fill="{StaticResource AccentBrush}"
+                       Opacity="0.35" VerticalAlignment="Center" Margin="0,1,6,0" />
+              <TextBlock x:Name="LivePulseText" Text="watching for updates" FontSize="12"
+                         Foreground="{StaticResource MutedBrush}" />
+            </StackPanel>
+          </StackPanel>
+          <Border Grid.Column="1" Width="1" Background="{StaticResource GridlineBrush}" Margin="24,4" />
+          <UniformGrid Grid.Column="2" Columns="4" VerticalAlignment="Center">
+            <StackPanel Margin="6,0">
+              <TextBlock x:Name="LiveTokensLabel" Text="Tokens · last 5 min" Style="{StaticResource TileLabel}" />
+              <TextBlock x:Name="LiveTokensText" Text="—" Style="{StaticResource TileValue}" />
+            </StackPanel>
+            <StackPanel Margin="6,0">
+              <TextBlock x:Name="LiveMessagesLabel" Text="Responses · last 5 min" Style="{StaticResource TileLabel}" />
+              <TextBlock x:Name="LiveMessagesText" Text="—" Style="{StaticResource TileValue}" />
+            </StackPanel>
+            <StackPanel Margin="6,0">
+              <TextBlock Text="Burn rate · 60 s" Style="{StaticResource TileLabel}"
+                         ToolTip="Spend over the last 60 seconds, shown per minute." />
+              <TextBlock x:Name="LiveRateText" Text="—" Style="{StaticResource TileValue}" />
+            </StackPanel>
+            <StackPanel Margin="6,0">
+              <TextBlock Text="Token rate · 60 s" Style="{StaticResource TileLabel}" />
+              <TextBlock x:Name="LiveTokenRateText" Text="—" Style="{StaticResource TileValue}" />
+            </StackPanel>
+          </UniformGrid>
+          <Border Grid.Column="3" Style="{StaticResource SegmentGroup}" VerticalAlignment="Center"
+                  ToolTip="How far back the river reaches.">
+            <StackPanel Orientation="Horizontal">
+              <RadioButton x:Name="LiveW1" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="60 s" Tag="w1" Checked="LiveWindowButton_Checked" />
+              <RadioButton x:Name="LiveW5" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="5 m" Tag="w5" IsChecked="True" Checked="LiveWindowButton_Checked" />
+              <RadioButton x:Name="LiveW15" Style="{StaticResource SegmentButton}" GroupName="liveWindow"
+                           Content="15 m" Tag="w15" Checked="LiveWindowButton_Checked" />
+            </StackPanel>
+          </Border>
+        </Grid>
+      </Border>
+
+      <Border Grid.Row="1" Style="{StaticResource Card}" Padding="20,16">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+          </Grid.RowDefinitions>
+          <Grid Grid.Row="0" Margin="0,0,0,4">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text="Live feed" FontSize="16" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="LiveFeedSubtitle"
+                         Text="Every response drifts in from the right the moment it is logged. Bubble area = estimated cost; one row per session. Hover for details."
+                         FontSize="12" Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+              <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="LiveModeRiver" Style="{StaticResource SegmentButton}" GroupName="liveMode"
+                               Content="River" Tag="river" IsChecked="True" Checked="LiveModeButton_Checked"
+                               ToolTip="Time flows right to left; one row per session." />
+                  <RadioButton x:Name="LiveModeCup" Style="{StaticResource SegmentButton}" GroupName="liveMode"
+                               Content="Cup" Tag="cup" Checked="LiveModeButton_Checked"
+                               ToolTip="Responses stack up like blocks in a cup and drain as they age out." />
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource SegmentGroup}"
+                      ToolTip="What sizes the shapes (and the value printed on cup blocks).">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="LiveMetricCost" Style="{StaticResource SegmentButton}" GroupName="liveMetric"
+                               Content="Cost" Tag="cost" IsChecked="True" Checked="LiveMetricButton_Checked" />
+                  <RadioButton x:Name="LiveMetricTokens" Style="{StaticResource SegmentButton}" GroupName="liveMetric"
+                               Content="Tokens" Tag="tokens" Checked="LiveMetricButton_Checked" />
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </Grid>
+          <ItemsControl x:Name="LiveLegend" Grid.Row="1" Margin="2,4,0,2">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <WrapPanel Orientation="Horizontal" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <StackPanel Orientation="Horizontal" Margin="0,0,16,3">
+                  <Rectangle Width="10" Height="10" RadiusX="5" RadiusY="5" Fill="{Binding Brush}"
+                             VerticalAlignment="Center" />
+                  <TextBlock Text="{Binding Name}" FontSize="11" Foreground="{StaticResource Ink2Brush}"
+                             Margin="6,0,0,0" />
+                </StackPanel>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <Grid Grid.Row="2" Margin="0,6,0,0">
+            <Canvas x:Name="LiveAxisCanvas" ClipToBounds="True" Background="Transparent"
+                    SizeChanged="LiveCanvas_SizeChanged" />
+            <Canvas x:Name="LiveCanvas" ClipToBounds="True" Background="Transparent" />
+            <TextBlock x:Name="LiveEmptyText"
+                       Text="Waiting for activity — bubbles appear here within about a second of a response being logged."
+                       Foreground="{StaticResource MutedBrush}" FontSize="13"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+          </Grid>
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- ═══ Status strip ═══ -->
+    <Grid Grid.Row="3" Margin="2,12,2,0">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <ProgressBar x:Name="ScanProgress" Width="140" Height="4" Minimum="0" Maximum="1" Value="0"
+                     Foreground="{StaticResource AccentBrush}" Background="{StaticResource RaisedBrush}"
+                     BorderThickness="0" VerticalAlignment="Center" Margin="0,1,10,0" />
+        <TextBlock x:Name="StatusText" Text="Starting…" FontSize="11"
+                   Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
       </StackPanel>
-      <StackPanel Grid.Column="1" VerticalAlignment="Bottom">
-        <TextBlock x:Name="PricingStatusText" Foreground="#6F8D82" FontSize="11"
-                   HorizontalAlignment="Right" />
-        <TextBlock x:Name="DatabasePathText" Foreground="#6F8D82" FontSize="11" Margin="0,3,0,0"
-                   TextTrimming="CharacterEllipsis" MaxWidth="420" />
-      </StackPanel>
+      <TextBlock x:Name="LastUpdatedText" Grid.Column="1" FontSize="11"
+                 Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
     </Grid>
   </Grid>
 </Window>

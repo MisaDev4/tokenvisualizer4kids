@@ -11,6 +11,16 @@ public sealed class AppSettings
 
     public string SelectedRange { get; set; } = "currentMonth";
 
+    public string SelectedBars { get; set; } = "auto";
+
+    public string SelectedTab { get; set; } = "dashboard";
+
+    public string SelectedLiveWindow { get; set; } = "w5";
+
+    public string SelectedLiveMode { get; set; } = "river";
+
+    public string SelectedLiveMetric { get; set; } = "cost";
+
     public static AppSettings Load()
     {
         AppPaths.EnsureDataDirectory();

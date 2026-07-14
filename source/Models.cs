@@ -73,8 +73,43 @@ public sealed record ModelUsageRow(
     public long UnpricedEvents { get; init; }
 }
 
-public sealed record DailyUsageRow(
-    string Date,
+/// <summary>Granularity of one timeline bucket.</summary>
+public enum BucketUnit
+{
+    Minute1,
+    Minute5,
+    Minute15,
+    Minute30,
+    Hour,
+    Day,
+    Month
+}
+
+/// <summary>Per-model share of a single timeline bucket.</summary>
+public sealed record BucketModelSlice(string Model, double Cost, long Tokens, long Messages);
+
+/// <summary>
+/// One indexed usage event as surfaced to the live view. UpdatedMs is when the
+/// collector last wrote the row, which for live tailing is within ~a second of
+/// the response itself and keeps growing while output streams into the message.
+/// </summary>
+public sealed record LiveEventRow(
+    string EventKey,
+    string Client,
+    string Provider,
+    string Model,
+    string SessionId,
+    long TimestampMs,
+    long UpdatedMs,
+    TokenBreakdown Tokens,
+    long Messages);
+
+/// <summary>
+/// One contiguous slice of the timeline. Buckets are gap-filled, so a range
+/// always yields an unbroken ascending series even for silent hours/days.
+/// </summary>
+public sealed record UsageBucket(
+    long StartMs,
     long Messages,
     long Input,
     long Output,
@@ -87,13 +122,22 @@ public sealed record DailyUsageRow(
     public double EstimatedCost { get; init; }
 
     public long UnpricedEvents { get; init; }
+
+    public IReadOnlyList<BucketModelSlice> Slices { get; init; } = [];
+
+    public DateTime LocalStart => DateTimeOffset.FromUnixTimeMilliseconds(StartMs).ToLocalTime().DateTime;
 }
 
 public sealed record DashboardData(
     UsageTotals Totals,
     IReadOnlyList<ModelUsageRow> Models,
-    IReadOnlyList<DailyUsageRow> Daily,
-    long LastUpdatedMs);
+    IReadOnlyList<UsageBucket> Buckets,
+    BucketUnit Unit,
+    long LastUpdatedMs)
+{
+    /// <summary>Estimated cost of the equivalent preceding window; null when not comparable (e.g. all time).</summary>
+    public double? PreviousCost { get; init; }
+}
 
 public sealed record CollectorProgress(
     string Activity,
@@ -101,11 +145,6 @@ public sealed record CollectorProgress(
     int Total,
     string? CurrentFile = null,
     bool IsBusy = true);
-
-public sealed record DateRangeChoice(string Key, string Label)
-{
-    public override string ToString() => Label;
-}
 
 public sealed record IntervalChoice(int Seconds, string Label)
 {

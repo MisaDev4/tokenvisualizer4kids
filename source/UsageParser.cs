@@ -264,11 +264,13 @@ public sealed class UsageParser
                 return null;
             }
 
+            var messageId = GetString(message, "id");
             var provider = FirstNonEmpty(
                 GetString(message, "provider"),
                 GetString(message, "provider_id"),
                 GetString(root, "provider"),
                 GetString(root, "provider_id"),
+                messageId?.StartsWith("msg_bdrk_", StringComparison.Ordinal) == true ? "bedrock" : null,
                 InferProvider(model))!;
             var sessionId = FirstNonEmpty(GetString(root, "sessionId"), GetString(root, "session_id"), fallbackSessionId)!;
             var timestamp = ParseTimestamp(root, fallbackTimestamp);
@@ -283,7 +285,6 @@ public sealed class UsageParser
                 return null;
             }
 
-            var messageId = GetString(message, "id");
             var requestId = FirstNonEmpty(GetString(root, "requestId"), GetString(root, "request_id"));
             var identity = messageId is not null && requestId is not null
                 ? $"claude:{messageId}:{requestId}"

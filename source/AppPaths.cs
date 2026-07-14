@@ -27,5 +27,13 @@ public static class AppPaths
         ".claude",
         "transcripts");
 
+    // Docker bench trials run Claude Code against Bedrock inside containers;
+    // the host runner streams each trial's stream-json events here.
+    public static string BenchResultsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+        "master",
+        "production",
+        "bench-results");
+
     public static void EnsureDataDirectory() => Directory.CreateDirectory(DataDirectory);
 }

@@ -6,14 +6,35 @@ namespace TokenTracker;
 
 public partial class App : System.Windows.Application
 {
+    private const string InstanceMutexName = "TokenTracker.SingleInstance";
+
+    /// <summary>Broadcast by a second launch so the running instance shows its window.</summary>
+    public static readonly int ShowWindowMessage = RegisterWindowMessage("TokenTracker.ShowWindow");
+
     private Forms.NotifyIcon? _trayIcon;
     private MainWindow? _window;
+    private Mutex? _instanceMutex;
 
     public bool IsExiting { get; private set; }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int RegisterWindowMessage(string message);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam);
 
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        _instanceMutex = new Mutex(initiallyOwned: true, InstanceMutexName, out var isFirstInstance);
+        if (!isFirstInstance)
+        {
+            var broadcast = new IntPtr(0xFFFF);
+            PostMessage(broadcast, ShowWindowMessage, IntPtr.Zero, IntPtr.Zero);
+            Shutdown();
+            return;
+        }
 
         _window = new MainWindow();
         MainWindow = _window;
@@ -84,6 +105,7 @@ public partial class App : System.Windows.Application
     protected override void OnExit(ExitEventArgs e)
     {
         _trayIcon?.Dispose();
+        _instanceMutex?.Dispose();
         base.OnExit(e);
     }
 }
