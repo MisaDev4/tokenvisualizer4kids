@@ -110,6 +110,8 @@
                          Content="8 h" Tag="last8" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeLast12" Style="{StaticResource SegmentButton}" GroupName="range"
                          Content="12 h" Tag="last12" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast18" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="18 h" Tag="last18" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeLast24" Style="{StaticResource SegmentButton}" GroupName="range"
                          Content="24 h" Tag="last24" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeToday" Style="{StaticResource SegmentButton}" GroupName="range"

@@ -112,7 +112,7 @@ public partial class MainWindow : Window
     private const int MaxModelSlots = 5;
 
     // Mirrors UsageDatabase.MaxBuckets: bar sizes that would exceed it are disabled.
-    private const int MaxChartBars = 500;
+    private const int MaxChartBars = 1500;
     private readonly Dictionary<string, int> _modelSlots = new(StringComparer.OrdinalIgnoreCase);
     private readonly Brush[] _seriesBrushes;
     private readonly Brush _otherBrush;
@@ -693,6 +693,7 @@ public partial class MainWindow : Window
             "last4" => 4 * 3_600_000L,
             "last8" => 8 * 3_600_000L,
             "last12" => 12 * 3_600_000L,
+            "last18" => 18 * 3_600_000L,
             "last24" => 24 * 3_600_000L,
             "last7" => 7 * 86_400_000L,
             "last30" => 30 * 86_400_000L,
@@ -2086,7 +2087,11 @@ public partial class MainWindow : Window
 
         var count = buckets.Count;
         var slotWidth = plotWidth / count;
-        var barWidth = Math.Min(24, Math.Max(2, slotWidth - 2));
+        // Very dense series (sub-minute bars over hours) drop the inter-bar
+        // gap and fill the whole slot, reading as a continuous area.
+        var barWidth = slotWidth < 4
+            ? Math.Max(1, slotWidth)
+            : Math.Min(24, Math.Max(2, slotWidth - 2));
 
         // X labels at a stride wide enough that they never collide.
         var sampleLabel = FormatAxisLabel(buckets[count / 2].LocalStart, data.Unit, false);
@@ -2176,17 +2181,21 @@ public partial class MainWindow : Window
                 }
             }
 
-            // Full-slot hit target carrying the tooltip.
+            // Full-slot hit target carrying the tooltip, built lazily on first
+            // hover: at 1000+ buckets, eager tooltips dominate the redraw.
             var hit = new Rectangle
             {
                 Width = Math.Max(1, slotWidth),
                 Height = plotHeight,
-                Fill = Brushes.Transparent,
-                ToolTip = BuildBucketTooltip(bucket, data.Unit)
+                Fill = Brushes.Transparent
             };
             ToolTipService.SetInitialShowDelay(hit, 120);
             ToolTipService.SetShowDuration(hit, 60000);
-            hit.MouseEnter += (_, _) => wash.Visibility = Visibility.Visible;
+            hit.MouseEnter += (_, _) =>
+            {
+                wash.Visibility = Visibility.Visible;
+                hit.ToolTip ??= BuildBucketTooltip(bucket, data.Unit);
+            };
             hit.MouseLeave += (_, _) => wash.Visibility = Visibility.Hidden;
             Canvas.SetLeft(hit, slotLeft);
             Canvas.SetTop(hit, plotTop);
@@ -2397,6 +2406,7 @@ public partial class MainWindow : Window
             "last4" => "the prior 4 h",
             "last8" => "the prior 8 h",
             "last12" => "the prior 12 h",
+            "last18" => "the prior 18 h",
             "last24" => "the prior 24 h",
             "last7" => "the prior 7 days",
             "last30" => "the prior 30 days",
@@ -2485,6 +2495,7 @@ public partial class MainWindow : Window
         "last4" => RangeLast4,
         "last8" => RangeLast8,
         "last12" => RangeLast12,
+        "last18" => RangeLast18,
         "last24" => RangeLast24,
         "today" => RangeToday,
         "last30" => RangeLast30,
@@ -2496,7 +2507,7 @@ public partial class MainWindow : Window
     private static string NormalizeRangeKey(string key) => key switch
     {
         "previousMonth" => "currentMonth",
-        "last1" or "last4" or "last8" or "last12" or "last24" or "today"
+        "last1" or "last4" or "last8" or "last12" or "last18" or "last24" or "today"
             or "last7" or "last30" or "currentMonth" or "all" => key,
         _ => "last7"
     };

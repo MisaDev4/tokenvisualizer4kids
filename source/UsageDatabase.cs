@@ -4,7 +4,7 @@ namespace TokenTracker;
 
 public sealed class UsageDatabase
 {
-    private const int MaxBuckets = 500;
+    private const int MaxBuckets = 1500;
 
     private readonly string _databasePath;
     private readonly string _connectionString;
@@ -734,7 +734,7 @@ public sealed class UsageDatabase
             return BucketUnit.Minute15;
         }
 
-        if (rangeKey is "last8" or "last12" or "last24" or "today")
+        if (rangeKey is "last8" or "last12" or "last18" or "last24" or "today")
         {
             return BucketUnit.Hour;
         }
@@ -825,6 +825,7 @@ public sealed class UsageDatabase
             "last4" => (now.AddHours(-4).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "last8" => (now.AddHours(-8).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "last12" => (now.AddHours(-12).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
+            "last18" => (now.AddHours(-18).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "today" => (today.ToUnixTimeMilliseconds(), today.AddDays(1).ToUnixTimeMilliseconds()),
             "last24" => (now.AddHours(-24).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "last7" => (now.AddDays(-7).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
@@ -848,6 +849,7 @@ public sealed class UsageDatabase
             "last4" => (now.AddHours(-8).ToUnixTimeMilliseconds(), now.AddHours(-4).ToUnixTimeMilliseconds()),
             "last8" => (now.AddHours(-16).ToUnixTimeMilliseconds(), now.AddHours(-8).ToUnixTimeMilliseconds()),
             "last12" => (now.AddHours(-24).ToUnixTimeMilliseconds(), now.AddHours(-12).ToUnixTimeMilliseconds()),
+            "last18" => (now.AddHours(-36).ToUnixTimeMilliseconds(), now.AddHours(-18).ToUnixTimeMilliseconds()),
             "today" => (today.AddDays(-1).ToUnixTimeMilliseconds(), now.AddDays(-1).ToUnixTimeMilliseconds()),
             "last24" => (now.AddHours(-48).ToUnixTimeMilliseconds(), now.AddHours(-24).ToUnixTimeMilliseconds()),
             "last7" => (now.AddDays(-14).ToUnixTimeMilliseconds(), now.AddDays(-7).ToUnixTimeMilliseconds()),
