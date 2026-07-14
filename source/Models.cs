@@ -93,6 +93,15 @@ public sealed record BucketModelSlice(string Model, double Cost, long Tokens, lo
 /// <summary>One local calendar day's total, for the daily activity grid.</summary>
 public sealed record DailyUsageRow(string Day, long Tokens, double Cost);
 
+/// <summary>One usage event as fed to the insights engine.</summary>
+public sealed record InsightEventRow(
+    string Client,
+    string Provider,
+    string Model,
+    string SessionId,
+    long TimestampMs,
+    TokenBreakdown Tokens);
+
 /// <summary>
 /// One indexed usage event as surfaced to the live view. UpdatedMs is when the
 /// collector last wrote the row, which for live tailing is within ~a second of

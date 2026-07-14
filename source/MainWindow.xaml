@@ -93,6 +93,9 @@
           <StackPanel Orientation="Horizontal">
             <RadioButton x:Name="TabDashboard" Style="{StaticResource SegmentButton}" GroupName="tab"
                          Content="Dashboard" Tag="dashboard" IsChecked="True" Checked="TabButton_Checked" />
+            <RadioButton x:Name="TabInsights" Style="{StaticResource SegmentButton}" GroupName="tab"
+                         Content="Insights" Tag="insights" Checked="TabButton_Checked"
+                         ToolTip="Where your money actually goes, and what the same work could cost." />
             <RadioButton x:Name="TabLive" Style="{StaticResource SegmentButton}" GroupName="tab"
                          Content="Live" Tag="live" Checked="TabButton_Checked"
                          ToolTip="Ultra real time: every response drops into the cup the moment it is logged." />
@@ -711,6 +714,160 @@
           <TextBlock x:Name="LimitsPageEmpty" FontSize="13" Foreground="{StaticResource MutedBrush}"
                      TextWrapping="Wrap" TextAlignment="Center" Margin="0,26,0,0" Visibility="Collapsed"
                      Text="No limit data yet. Sign in to Claude Code on this machine and the limits will appear here within a minute." />
+        </StackPanel>
+      </ScrollViewer>
+    </Grid>
+
+    <!-- ═══ Insights page: where the money goes, and how to spend less ═══ -->
+    <Grid x:Name="InsightsRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
+      <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                    Focusable="False" BorderThickness="0" Padding="0">
+        <StackPanel MaxWidth="880" HorizontalAlignment="Center">
+          <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <StackPanel>
+                <TextBlock Text="Usage insights" FontSize="18" FontWeight="SemiBold"
+                           Foreground="{StaticResource InkBrush}" />
+                <TextBlock x:Name="InsightsSubtitle" FontSize="12"
+                           Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
+                           TextWrapping="Wrap"
+                           Text="What your usage costs at API list prices, and where the same work could cost less." />
+              </StackPanel>
+              <Border Grid.Column="1" Style="{StaticResource SegmentGroup}" VerticalAlignment="Center"
+                      Margin="16,0,0,0">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="InsightsR7" Style="{StaticResource SegmentButton}" GroupName="insightsRange"
+                               Content="7 d" Tag="last7" Checked="InsightsRangeButton_Checked" />
+                  <RadioButton x:Name="InsightsR30" Style="{StaticResource SegmentButton}" GroupName="insightsRange"
+                               Content="30 d" Tag="last30" IsChecked="True" Checked="InsightsRangeButton_Checked" />
+                  <RadioButton x:Name="InsightsR90" Style="{StaticResource SegmentButton}" GroupName="insightsRange"
+                               Content="90 d" Tag="last90" Checked="InsightsRangeButton_Checked" />
+                </StackPanel>
+              </Border>
+            </Grid>
+          </Border>
+
+          <!-- Cost anatomy: one stacked bar, four components. -->
+          <Border x:Name="AnatomyCard" Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+            <StackPanel>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="Where the money goes" FontSize="15" FontWeight="SemiBold"
+                             Foreground="{StaticResource InkBrush}" />
+                  <TextBlock x:Name="AnatomySubtitle" FontSize="12"
+                             Foreground="{StaticResource MutedBrush}" Margin="0,3,0,0"
+                             Text="Estimated cost split by what the tokens were doing." />
+                </StackPanel>
+                <TextBlock x:Name="AnatomyTotalText" Grid.Column="1" FontSize="26" FontWeight="SemiBold"
+                           Foreground="{StaticResource InkBrush}" VerticalAlignment="Center"
+                           Margin="16,0,0,0" />
+              </Grid>
+              <Grid x:Name="AnatomyBar" Height="14" Margin="0,16,0,0" />
+              <ItemsControl x:Name="AnatomyLegend" Margin="0,12,0,0">
+                <ItemsControl.ItemsPanel>
+                  <ItemsPanelTemplate>
+                    <WrapPanel Orientation="Horizontal" />
+                  </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,20,4" Background="Transparent"
+                                ToolTip="{Binding Tooltip}">
+                      <Rectangle Width="10" Height="10" RadiusX="2" RadiusY="2" Fill="{Binding Brush}"
+                                 VerticalAlignment="Center" />
+                      <TextBlock Text="{Binding Name}" FontSize="12" Foreground="{StaticResource Ink2Brush}"
+                                 Margin="6,0,0,0" VerticalAlignment="Center" />
+                      <TextBlock Text="{Binding Detail}" FontSize="12" FontWeight="SemiBold"
+                                 Foreground="{StaticResource InkBrush}" Margin="6,0,0,0"
+                                 VerticalAlignment="Center" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+              <TextBlock x:Name="AnatomyTakeaway" FontSize="12" Foreground="{StaticResource Ink2Brush}"
+                         TextWrapping="Wrap" Margin="0,12,0,0" />
+            </StackPanel>
+          </Border>
+
+          <!-- Cost by context size: the bands share the heatmap's color ramp. -->
+          <Border x:Name="ContextCard" Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+            <StackPanel>
+              <TextBlock Text="Cost by context size" FontSize="15" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="ContextSubtitle" FontSize="12"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,3,0,0" TextWrapping="Wrap"
+                         Text="Each reply is billed for everything it re-read — prompt, history, cache. This is where those re-reads land." />
+              <ItemsControl x:Name="ContextBandsList" Margin="0,14,0,0">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Grid Margin="0,0,0,10" Background="Transparent" ToolTip="{Binding Tooltip}">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="92" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="86" />
+                        <ColumnDefinition Width="52" />
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Label}" FontSize="12" Foreground="{StaticResource Ink2Brush}"
+                                 VerticalAlignment="Center" />
+                      <ProgressBar Grid.Column="1" Style="{StaticResource ShareBar}" Height="8"
+                                   Value="{Binding BarValue, Mode=OneWay}" Foreground="{Binding BarBrush}"
+                                   VerticalAlignment="Center" />
+                      <TextBlock Grid.Column="2" Text="{Binding CostText}" FontSize="12" FontWeight="SemiBold"
+                                 Foreground="{StaticResource InkBrush}" TextAlignment="Right"
+                                 VerticalAlignment="Center" Margin="12,0,0,0" />
+                      <TextBlock Grid.Column="3" Text="{Binding ShareText}" FontSize="12"
+                                 Foreground="{StaticResource MutedBrush}" TextAlignment="Right"
+                                 VerticalAlignment="Center" />
+                    </Grid>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </Border>
+
+          <!-- Rule-based findings, one card each. -->
+          <ItemsControl x:Name="InsightTipsList">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel>
+                      <StackPanel Orientation="Horizontal">
+                        <Ellipse Width="9" Height="9" Fill="{Binding DotBrush}" VerticalAlignment="Center"
+                                 Margin="0,1,8,0" />
+                        <TextBlock Text="{Binding KindLabel}" FontSize="11" FontWeight="SemiBold"
+                                   Foreground="{Binding DotBrush}" VerticalAlignment="Center" />
+                      </StackPanel>
+                      <TextBlock Text="{Binding Title}" FontSize="15" FontWeight="SemiBold"
+                                 Foreground="{StaticResource InkBrush}" Margin="0,7,0,0"
+                                 TextWrapping="Wrap" />
+                      <TextBlock Text="{Binding Body}" FontSize="12" Foreground="{StaticResource Ink2Brush}"
+                                 TextWrapping="Wrap" Margin="0,7,16,0" LineHeight="18" />
+                    </StackPanel>
+                    <TextBlock Grid.Column="1" Text="{Binding Figure}" FontSize="24" FontWeight="SemiBold"
+                               Foreground="{Binding FigureBrush}" VerticalAlignment="Top"
+                               Margin="16,2,0,0" />
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+
+          <TextBlock x:Name="InsightsEmpty" FontSize="13" Foreground="{StaticResource MutedBrush}"
+                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,26,0,0" Visibility="Collapsed"
+                     Text="Not enough usage in this range yet — insights appear once some work has been logged." />
         </StackPanel>
       </ScrollViewer>
     </Grid>

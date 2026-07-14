@@ -37,6 +37,9 @@ public partial class MainWindow : Window
     private bool _heatmapRefreshing;
     private string _heatmapViewKey = "year";
     private string _heatmapMetricKey = "tokens";
+    private bool _insightsRefreshing;
+    private string _insightsRangeKey = "last30";
+    private double? _planMonthlyUsd;
 
     // ── Live view state ────────────────────────────────────────────────────
     private string _tabKey = "dashboard";
@@ -171,6 +174,8 @@ public partial class MainWindow : Window
         (_heatmapViewKey == "detail" ? HeatmapDetail : HeatmapYear).IsChecked = true;
         _heatmapMetricKey = _settings.HeatmapMetric == "cost" ? "cost" : "tokens";
         (_heatmapMetricKey == "cost" ? HeatmapCost : HeatmapTokens).IsChecked = true;
+        _insightsRangeKey = NormalizeInsightsRangeKey(_settings.InsightsRange);
+        InsightsRangeRadioFor(_insightsRangeKey).IsChecked = true;
         // The old Multi tab became the dashboard's live panel toggle.
         if (_settings.SelectedTab == "multi")
         {
@@ -209,6 +214,10 @@ public partial class MainWindow : Window
             if (_loaded && IsVisible)
             {
                 await RefreshDashboardAsync();
+                if (_tabKey == "insights")
+                {
+                    await RefreshInsightsAsync();
+                }
             }
         };
         liveRefresh.Start();
@@ -368,6 +377,11 @@ public partial class MainWindow : Window
 
             _haveLimits = true;
             LimitsPageEmpty.Visibility = Visibility.Collapsed;
+
+            // Known subscription spend on this machine, for the insights page's
+            // plan-value comparison. Accounts with unknown plans contribute nothing.
+            var planTotal = accounts.Sum(account => PlanMonthlyUsd(account.Plan, account.RateLimitTier) ?? 0);
+            _planMonthlyUsd = planTotal > 0 ? planTotal : null;
 
             // The compact top bar mirrors whichever account Claude Code is
             // signed into right now; the limits page lists every account.
@@ -825,6 +839,15 @@ public partial class MainWindow : Window
         return $"{name} {multiplier.Groups[1].Value}x{price}";
     }
 
+    /// <summary>What the account's plan bills per month, when the tier makes it knowable.</summary>
+    private static double? PlanMonthlyUsd(string? plan, string? tier) => plan switch
+    {
+        "pro" => 20,
+        "max" when tier?.EndsWith("_5x", StringComparison.Ordinal) == true => 100,
+        "max" when tier?.EndsWith("_20x", StringComparison.Ordinal) == true => 200,
+        _ => null
+    };
+
     /// <summary>The part before the @, so the top bar stays compact.</summary>
     private static string ShortAccountName(string email)
     {
@@ -945,6 +968,10 @@ public partial class MainWindow : Window
             _liveTimer.Start();
             _ = RefreshLimitsAsync();
             _ = RefreshTerminalsAsync();
+            if (_tabKey == "insights")
+            {
+                _ = RefreshInsightsAsync();
+            }
         }
         catch (Exception exception)
         {
@@ -1116,7 +1143,8 @@ public partial class MainWindow : Window
         var live = _tabKey == "live";
         var limits = _tabKey == "limits";
         var terminals = _tabKey == "terminals";
-        var dashboard = !live && !limits && !terminals;
+        var insights = _tabKey == "insights";
+        var dashboard = !live && !limits && !terminals && !insights;
         var livePanel = dashboard && _dashPanelKey == "live";
         DashboardHero.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         DashboardContent.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
@@ -1124,6 +1152,7 @@ public partial class MainWindow : Window
         LiveRoot.Visibility = live ? Visibility.Visible : Visibility.Collapsed;
         LimitsRoot.Visibility = limits ? Visibility.Visible : Visibility.Collapsed;
         TerminalsRoot.Visibility = terminals ? Visibility.Visible : Visibility.Collapsed;
+        InsightsRoot.Visibility = insights ? Visibility.Visible : Visibility.Collapsed;
         ModelsCard.Visibility = livePanel ? Visibility.Collapsed : Visibility.Visible;
         PlaceLiveFeedCard(livePanel);
         PlacePanelGroup(livePanel);
@@ -1147,6 +1176,11 @@ public partial class MainWindow : Window
         if (terminals && _loaded)
         {
             _ = RefreshTerminalsAsync();
+        }
+
+        if (insights && _loaded)
+        {
+            _ = RefreshInsightsAsync();
         }
     }
 
@@ -2143,11 +2177,12 @@ public partial class MainWindow : Window
         "live" => TabLive,
         "limits" => TabLimits,
         "terminals" => TabTerminals,
+        "insights" => TabInsights,
         _ => TabDashboard
     };
 
     private static string NormalizeTabKey(string key) =>
-        key is "live" or "limits" or "terminals" ? key : "dashboard";
+        key is "live" or "limits" or "terminals" or "insights" ? key : "dashboard";
 
     private RadioButton LiveWindowRadioFor(string key) => key switch
     {
@@ -2860,6 +2895,179 @@ public partial class MainWindow : Window
     }
 
     // ── Collector plumbing ─────────────────────────────────────────────────
+
+    // ── Insights ───────────────────────────────────────────────────────────
+
+    private async void InsightsRangeButton_Checked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: string key } || key == _insightsRangeKey && _loaded)
+        {
+            return;
+        }
+
+        _insightsRangeKey = key;
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _settings.InsightsRange = key;
+        _settings.Save();
+        await RefreshInsightsAsync();
+    }
+
+    private async Task RefreshInsightsAsync()
+    {
+        if (_insightsRefreshing)
+        {
+            return;
+        }
+
+        _insightsRefreshing = true;
+        try
+        {
+            var rangeDays = _insightsRangeKey switch { "last7" => 7, "last90" => 90, _ => 30 };
+            var sinceMs = DateTimeOffset.UtcNow.AddDays(-rangeDays).ToUnixTimeMilliseconds();
+            var events = await _database.GetInsightEventsAsync(sinceMs);
+            var plan = _planMonthlyUsd;
+            var report = await Task.Run(() => InsightsEngine.Compute(events, _pricing, rangeDays, plan));
+            if (!_disposed)
+            {
+                UpdateInsights(report, rangeDays);
+            }
+        }
+        catch (Exception exception)
+        {
+            ShowError($"Could not build insights: {exception.Message}");
+        }
+        finally
+        {
+            _insightsRefreshing = false;
+        }
+    }
+
+    private void UpdateInsights(InsightsReport report, int rangeDays)
+    {
+        var hasData = report.Events > 0 && report.TotalCost > 0;
+        AnatomyCard.Visibility = hasData ? Visibility.Visible : Visibility.Collapsed;
+        ContextCard.Visibility = hasData ? Visibility.Visible : Visibility.Collapsed;
+        InsightTipsList.Visibility = hasData ? Visibility.Visible : Visibility.Collapsed;
+        InsightsEmpty.Visibility = hasData ? Visibility.Collapsed : Visibility.Visible;
+        InsightsSubtitle.Text = hasData
+            ? $"Last {rangeDays} days · {Plural(report.Events, "response")} across {Plural(report.Sessions, "session")} · estimated API list prices."
+            : "What your usage costs at API list prices, and where the same work could cost less.";
+        if (!hasData)
+        {
+            return;
+        }
+
+        AnatomyTotalText.Text = FormatMoney(report.TotalCost);
+        AnatomyTotalText.ToolTip = $"Estimated cost of the last {rangeDays} days at API list prices.";
+
+        var slices = new (string Name, double Cost, long Tokens, Brush Brush)[]
+        {
+            ("Input", report.InputCost, report.InputTokens, _seriesBrushes[0]),
+            ("Output", report.OutputCost, report.OutputTokens, _seriesBrushes[1]),
+            ("Cache read", report.CacheReadCost, report.CacheReadTokens, _seriesBrushes[2]),
+            ("Cache write", report.CacheWriteCost, report.CacheWriteTokens, _seriesBrushes[4])
+        };
+
+        AnatomyBar.Children.Clear();
+        AnatomyBar.ColumnDefinitions.Clear();
+        var visible = slices.Where(slice => slice.Cost > 0).ToList();
+        foreach (var (index, slice) in visible.Index())
+        {
+            // Star widths proportional to cost, floored so slivers stay hoverable.
+            AnatomyBar.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = new GridLength(Math.Max(slice.Cost, report.TotalCost * 0.006), GridUnitType.Star)
+            });
+            var segment = new Border
+            {
+                Background = slice.Brush,
+                CornerRadius = new CornerRadius(3),
+                Margin = new Thickness(0, 0, index == visible.Count - 1 ? 0 : 2, 0),
+                ToolTip = $"{slice.Name}: {FormatMoney(slice.Cost)} ({ShareOfTotal(slice.Cost)}) · {FormatCompact(slice.Tokens)} tokens"
+            };
+            Grid.SetColumn(segment, index);
+            AnatomyBar.Children.Add(segment);
+        }
+
+        AnatomyLegend.ItemsSource = slices.Select(slice => new AnatomySliceVm(
+            slice.Brush,
+            slice.Name,
+            $"{FormatMoney(slice.Cost)} · {ShareOfTotal(slice.Cost)}",
+            $"{slice.Tokens:N0} tokens")).ToList();
+
+        var contextShare = (report.InputCost + report.CacheReadCost) / report.TotalCost;
+        var outputShare = report.OutputCost / report.TotalCost;
+        AnatomyTakeaway.Text =
+            $"{contextShare:P0} of the money paid for context flowing into the model — prompts, history and " +
+            $"cached re-reads — while the text it actually wrote is {outputShare:P0}. Shrinking what each reply " +
+            "re-reads moves the bill; shortening answers barely does.";
+
+        var maxBandCost = report.ContextBands.Max(band => band.Cost);
+        ContextBandsList.ItemsSource = report.ContextBands.Select((band, index) =>
+        {
+            var brush = new SolidColorBrush(HeatColor(index / (double)(report.ContextBands.Count - 1)));
+            brush.Freeze();
+            return new ContextBandVm(
+                band.Label,
+                maxBandCost > 0 ? band.Cost / maxBandCost : 0,
+                brush,
+                FormatMoney(band.Cost),
+                band.ShareOfCost.ToString("P0"),
+                $"{band.Events:N0} responses re-read {band.Label} tokens of context — " +
+                $"{FormatMoney(band.Cost)} ({band.ShareOfCost:P0} of the range).");
+        }).ToList();
+
+        InsightTipsList.ItemsSource = report.Tips.Select(tip =>
+        {
+            var brush = tip.Kind switch
+            {
+                InsightKind.Saving => LimitWarningBrush,
+                InsightKind.Good => _seriesBrushes[1],
+                _ => _seriesBrushes[0]
+            };
+            var label = tip.Kind switch
+            {
+                InsightKind.Saving => "POTENTIAL SAVING",
+                InsightKind.Good => "WORKING FOR YOU",
+                _ => "PATTERN"
+            };
+            return new InsightTipVm(brush, label, tip.Title, tip.Body, tip.Figure, brush);
+        }).ToList();
+
+        string ShareOfTotal(double cost) => (cost / report.TotalCost).ToString("P0");
+    }
+
+    private RadioButton InsightsRangeRadioFor(string key) => key switch
+    {
+        "last7" => InsightsR7,
+        "last90" => InsightsR90,
+        _ => InsightsR30
+    };
+
+    private static string NormalizeInsightsRangeKey(string key) =>
+        key is "last7" or "last90" ? key : "last30";
+
+    private sealed record AnatomySliceVm(Brush Brush, string Name, string Detail, string Tooltip);
+
+    private sealed record ContextBandVm(
+        string Label,
+        double BarValue,
+        Brush BarBrush,
+        string CostText,
+        string ShareText,
+        string Tooltip);
+
+    private sealed record InsightTipVm(
+        Brush DotBrush,
+        string KindLabel,
+        string Title,
+        string Body,
+        string Figure,
+        Brush FigureBrush);
 
     private void Collector_ProgressChanged(CollectorProgress progress)
     {

@@ -25,6 +25,8 @@ public sealed class AppSettings
 
     public string HeatmapMetric { get; set; } = "tokens";
 
+    public string InsightsRange { get; set; } = "last30";
+
     public static AppSettings Load()
     {
         AppPaths.EnsureDataDirectory();

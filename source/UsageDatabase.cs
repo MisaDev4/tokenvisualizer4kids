@@ -631,6 +631,44 @@ public sealed class UsageDatabase
         return (cost, total);
     }
 
+    /// <summary>Every event since the given time, oldest first, for the insights engine.</summary>
+    public async Task<List<InsightEventRow>> GetInsightEventsAsync(
+        long sinceMs,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT client, provider, model, session_id, timestamp_ms,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   reasoning_tokens
+            FROM usage_events
+            WHERE timestamp_ms >= $since
+            ORDER BY timestamp_ms;
+            """;
+        command.Parameters.AddWithValue("$since", sinceMs);
+
+        var rows = new List<InsightEventRow>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new InsightEventRow(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetInt64(4),
+                new TokenBreakdown(
+                    reader.GetInt64(5),
+                    reader.GetInt64(6),
+                    reader.GetInt64(7),
+                    reader.GetInt64(8),
+                    reader.GetInt64(9))));
+        }
+
+        return rows;
+    }
+
     /// <summary>
     /// Per-day totals (local calendar days, all clients) since the given time,
     /// for the daily activity grid on the limits page.
