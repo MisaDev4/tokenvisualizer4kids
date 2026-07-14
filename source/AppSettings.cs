@@ -27,6 +27,8 @@ public sealed class AppSettings
 
     public string InsightsRange { get; set; } = "last30";
 
+    public bool HidePersonalData { get; set; }
+
     public static AppSettings Load()
     {
         AppPaths.EnsureDataDirectory();

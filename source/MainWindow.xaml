@@ -157,6 +157,9 @@
               <ComboBox x:Name="IntervalComboBox" SelectionChanged="IntervalComboBox_SelectionChanged" />
               <CheckBox x:Name="StartupCheckBox" Content="Start with Windows" Margin="0,14,0,0"
                         Checked="StartupCheckBox_Changed" Unchecked="StartupCheckBox_Changed" />
+              <CheckBox x:Name="PrivacyCheckBox" Content="Hide personal data" Margin="0,10,0,0"
+                        ToolTip="Swap account emails, project names and folder paths for placeholders wherever they appear — for screenshots and screen shares. Display only; nothing stored changes."
+                        Checked="PrivacyCheckBox_Changed" Unchecked="PrivacyCheckBox_Changed" />
               <Button x:Name="FullRescanButton" Content="Full rescan / repair" Margin="0,16,0,0"
                       HorizontalAlignment="Stretch"
                       ToolTip="Re-read every available log and repair the local index."
@@ -191,7 +194,7 @@
         </StackPanel>
         <Border Grid.Column="1" Width="1" Background="{StaticResource GridlineBrush}"
                 Margin="24,4" />
-        <UniformGrid Grid.Column="2" Columns="6" VerticalAlignment="Center">
+        <UniformGrid Grid.Column="2" Columns="8" VerticalAlignment="Center">
           <StackPanel Margin="6,0">
             <TextBlock Text="Total tokens" Style="{StaticResource TileLabel}" />
             <TextBlock x:Name="TotalTokensText" Text="—" Style="{StaticResource TileValue}" />
@@ -216,6 +219,16 @@
           <StackPanel Margin="6,0">
             <TextBlock Text="Cache write" Style="{StaticResource TileLabel}" />
             <TextBlock x:Name="CacheWriteTokensText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Burn rate · 60 s" Style="{StaticResource TileLabel}"
+                       ToolTip="Spend over the last 60 seconds, shown per minute. Live, whatever range is selected." />
+            <TextBlock x:Name="DashBurnRateText" Text="—" Style="{StaticResource TileValue}" />
+          </StackPanel>
+          <StackPanel Margin="6,0">
+            <TextBlock Text="Token rate · 60 s" Style="{StaticResource TileLabel}"
+                       ToolTip="Tokens per second over the last 60 seconds. Live, whatever range is selected." />
+            <TextBlock x:Name="DashTokenRateText" Text="—" Style="{StaticResource TileValue}" />
           </StackPanel>
         </UniformGrid>
       </Grid>

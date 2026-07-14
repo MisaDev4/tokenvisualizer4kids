@@ -201,7 +201,8 @@ public partial class MainWindow : Window
             StartupCheckBox.IsChecked = false;
         }
 
-        DatabasePathText.Text = $"Local index: {_database.DatabasePath}";
+        PrivacyCheckBox.IsChecked = _settings.HidePersonalData;
+        DatabasePathText.Text = $"Local index: {DisplayLocalPath(_database.DatabasePath)}";
 
         // Keeps short ranges live: the window slides and the newest bucket fills in
         // even when no file event happens to trigger a collector refresh.
@@ -281,9 +282,13 @@ public partial class MainWindow : Window
                         "working…",
                         "Mid-turn: the model is generating or running tools.")
                 };
+                var displayName = DisplayProject(status.ProjectName);
                 var name = duplicateNames.Contains(status.ProjectName)
-                    ? $"{status.ProjectName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
-                    : status.ProjectName;
+                    ? $"{displayName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
+                    : displayName;
+                var displayPath = HidePersonal
+                    ? $@"~\…\{displayName}"
+                    : status.ProjectPath;
                 var (iconGeometry, iconBrush, appName) = status.App == TerminalApp.Codex
                     ? (OpenAiIconGeometry, OpenAiIconBrush, "Codex")
                     : (AnthropicIconGeometry, AnthropicIconBrush, "Claude Code");
@@ -295,8 +300,8 @@ public partial class MainWindow : Window
                     EdgeBrushFor(state),
                     iconGeometry,
                     iconBrush,
-                    status.ProjectPath,
-                    $"{appName} · {status.ProjectPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}");
+                    displayPath,
+                    $"{appName} · {displayPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}");
             }).ToList();
 
             var ready = terminals.Count(status => status.State == TerminalState.Ready);
@@ -386,7 +391,8 @@ public partial class MainWindow : Window
             // The compact top bar mirrors whichever account Claude Code is
             // signed into right now; the limits page lists every account.
             var current = accounts.FirstOrDefault(account => account.IsActive) ?? accounts[0];
-            LimitsBarAccount.Text = ShortAccountName(current.Email);
+            var currentEmail = DisplayEmail(current.Email);
+            LimitsBarAccount.Text = ShortAccountName(currentEmail);
             LimitsPanel.ItemsSource = current.Limits.Select(limit =>
             {
                 var elevated = limit.Severity is "critical" or "warning" || limit.Percent >= 70;
@@ -401,7 +407,7 @@ public partial class MainWindow : Window
                     $"{limit.Percent:0}%",
                     elevated ? barBrush : (Brush)FindResource("InkBrush"),
                     resets,
-                    $"{current.Email} · {LimitTitle(limit.Label)} — {limit.Percent:0}% used" +
+                    $"{currentEmail} · {LimitTitle(limit.Label)} — {limit.Percent:0}% used" +
                     (resets.Length > 0 ? $" · {resets}" : ""));
             }).ToList();
             LimitsStrip.Visibility = Visibility.Visible;
@@ -431,7 +437,7 @@ public partial class MainWindow : Window
             }
 
             LimitsDetailList.ItemsSource = accounts.Select(account => new AccountVm(
-                account.Email,
+                DisplayEmail(account.Email),
                 PlanLabel(account.Plan, account.RateLimitTier),
                 account.IsActive
                     ? "signed in to Claude Code now"
@@ -847,6 +853,77 @@ public partial class MainWindow : Window
         "max" when tier?.EndsWith("_20x", StringComparison.Ordinal) == true => 200,
         _ => null
     };
+
+    // ── Hide personal data ─────────────────────────────────────────────────
+    // Display-only masking for screenshots and screen shares. Each real value
+    // maps to the same placeholder for the whole run, so cards and the status
+    // strip stay consistent with each other.
+
+    private readonly Dictionary<string, string> _maskedEmails = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _maskedProjects = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly string[] MaskAccountNames = ["sam", "alex", "kai", "riley", "jordan", "casey"];
+
+    private bool HidePersonal => _settings.HidePersonalData;
+
+    private string DisplayEmail(string email)
+    {
+        if (!HidePersonal || string.IsNullOrEmpty(email))
+        {
+            return email;
+        }
+
+        if (!_maskedEmails.TryGetValue(email, out var masked))
+        {
+            masked = $"{MaskAccountNames[_maskedEmails.Count % MaskAccountNames.Length]}@example.com";
+            _maskedEmails[email] = masked;
+        }
+
+        return masked;
+    }
+
+    private string DisplayProject(string projectName)
+    {
+        if (!HidePersonal || string.IsNullOrEmpty(projectName))
+        {
+            return projectName;
+        }
+
+        if (!_maskedProjects.TryGetValue(projectName, out var masked))
+        {
+            masked = $"project-{_maskedProjects.Count + 1}";
+            _maskedProjects[projectName] = masked;
+        }
+
+        return masked;
+    }
+
+    /// <summary>Hides the username by folding the profile directory into "~".</summary>
+    private string DisplayLocalPath(string path)
+    {
+        if (!HidePersonal)
+        {
+            return path;
+        }
+
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return path.StartsWith(profile, StringComparison.OrdinalIgnoreCase)
+            ? $"~{path[profile.Length..]}"
+            : path;
+    }
+
+    private void PrivacyCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _settings.HidePersonalData = PrivacyCheckBox.IsChecked == true;
+        _settings.Save();
+        DatabasePathText.Text = $"Local index: {DisplayLocalPath(_database.DatabasePath)}";
+        _ = RefreshLimitsAsync();
+        _ = RefreshTerminalsAsync();
+    }
 
     /// <summary>The part before the @, so the top bar stays compact.</summary>
     private static string ShortAccountName(string email)
@@ -1633,6 +1710,10 @@ public partial class MainWindow : Window
         LiveMessagesText.Text = messagesWindow.ToString("N0");
         LiveRateText.Text = $"{FormatMoney(cost60)}/min";
         LiveTokenRateText.Text = $"{FormatCompact((long)(tokens60 / 60.0))}/s";
+        // The dashboard hero mirrors the two live rates; this timer runs on
+        // every tab, so they stay current without the Live view being open.
+        DashBurnRateText.Text = LiveRateText.Text;
+        DashTokenRateText.Text = LiveTokenRateText.Text;
     }
 
     /// <summary>Cup round lifecycle: countdown → the pile settles into a layer → fresh round on top.</summary>
