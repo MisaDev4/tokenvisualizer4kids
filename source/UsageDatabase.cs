@@ -631,6 +631,47 @@ public sealed class UsageDatabase
         return (cost, total);
     }
 
+    /// <summary>
+    /// Per-day totals (local calendar days, all clients) since the given time,
+    /// for the daily activity grid on the limits page.
+    /// </summary>
+    public async Task<List<DailyUsageRow>> GetDailyUsageAsync(
+        long sinceMs,
+        PricingService? pricing = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT strftime('%Y-%m-%d', timestamp_ms / 1000, 'unixepoch', 'localtime') AS day,
+                   provider, model,
+                   SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
+                   SUM(cache_write_tokens), SUM(reasoning_tokens)
+            FROM usage_events
+            WHERE timestamp_ms >= $since
+            GROUP BY day, provider, model;
+            """;
+        command.Parameters.AddWithValue("$since", sinceMs);
+
+        var days = new Dictionary<string, (long Tokens, double Cost)>(StringComparer.Ordinal);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var day = reader.GetString(0);
+            var tokens = new TokenBreakdown(
+                reader.GetInt64(3),
+                reader.GetInt64(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6),
+                reader.GetInt64(7));
+            var cost = pricing?.Calculate(reader.GetString(1), reader.GetString(2), tokens).Cost ?? 0;
+            var current = days.GetValueOrDefault(day);
+            days[day] = (current.Tokens + tokens.Total, current.Cost + cost);
+        }
+
+        return days.Select(pair => new DailyUsageRow(pair.Key, pair.Value.Tokens, pair.Value.Cost)).ToList();
+    }
+
     private static async Task<double> ComputeCostAsync(
         SqliteConnection connection,
         long startMs,

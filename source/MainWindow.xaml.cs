@@ -34,6 +34,9 @@ public partial class MainWindow : Window
     private DashboardData? _latestData;
     private bool _haveLimits;
     private bool _limitsRefreshing;
+    private bool _heatmapRefreshing;
+    private string _heatmapViewKey = "year";
+    private string _heatmapMetricKey = "tokens";
 
     // ── Live view state ────────────────────────────────────────────────────
     private string _tabKey = "dashboard";
@@ -164,6 +167,10 @@ public partial class MainWindow : Window
         _liveMetricKey = _settings.SelectedLiveMetric == "tokens" ? "tokens" : "cost";
         (_liveMetricKey == "tokens" ? LiveMetricTokens : LiveMetricCost).IsChecked = true;
         UpdateLiveWindowLabels();
+        _heatmapViewKey = _settings.HeatmapView == "detail" ? "detail" : "year";
+        (_heatmapViewKey == "detail" ? HeatmapDetail : HeatmapYear).IsChecked = true;
+        _heatmapMetricKey = _settings.HeatmapMetric == "cost" ? "cost" : "tokens";
+        (_heatmapMetricKey == "cost" ? HeatmapCost : HeatmapTokens).IsChecked = true;
         // The old Multi tab became the dashboard's live panel toggle.
         if (_settings.SelectedTab == "multi")
         {
@@ -336,6 +343,15 @@ public partial class MainWindow : Window
         _limitsRefreshing = true;
         try
         {
+            try
+            {
+                await RefreshUsageHeatmapAsync();
+            }
+            catch
+            {
+                // Keep the last drawn grid; the next tick retries.
+            }
+
             var accounts = await _limitsService.FetchAllAsync();
             if (_disposed)
             {
@@ -431,7 +447,10 @@ public partial class MainWindow : Window
 
                     return new LimitDetailVm(
                         LimitTitle(limit.Label),
-                        limit.ResetsAt is { } at ? FormatResetDetail(at) : "reset time unknown",
+                        limit.ResetsAt is { } at ? FormatResetDetail(at)
+                        : limit is { Label: "5h", Percent: 0 }
+                            ? "idle — a new 5-hour window starts with the next message"
+                            : "reset time unknown",
                         $"{limit.Percent:0}%",
                         LimitBarBrush(limit),
                         Math.Clamp(limit.Percent / 100.0, 0, 1),
@@ -448,6 +467,316 @@ public partial class MainWindow : Window
         finally
         {
             _limitsRefreshing = false;
+        }
+    }
+
+    // ── Daily activity heatmap ─────────────────────────────────────────────
+
+    // Heat ramp for the activity grid: a full-spectrum turbo-style scale,
+    // blue → cyan → green → yellow → orange → red (weather-radar convention:
+    // cold blue lows, red-hot peaks). Trades monotone lightness for the
+    // maximum number of hue bands the eye can separate. Days are colored
+    // continuously on a log scale anchored to the year's biggest day, so only
+    // that day reaches deep red — a 200M day and a 1B day never share a color.
+    private static readonly Color[] HeatStops =
+    [
+        Color.FromRgb(0x45, 0x5B, 0xE3),
+        Color.FromRgb(0x1B, 0x95, 0xFE),
+        Color.FromRgb(0x17, 0xCC, 0xD6),
+        Color.FromRgb(0x3F, 0xF0, 0x96),
+        Color.FromRgb(0x8C, 0xFC, 0x4E),
+        Color.FromRgb(0xCF, 0xE5, 0x2A),
+        Color.FromRgb(0xF9, 0xB9, 0x1E),
+        Color.FromRgb(0xFA, 0x7A, 0x19),
+        Color.FromRgb(0xDA, 0x39, 0x0A),
+        Color.FromRgb(0xB9, 0x1E, 0x05)
+    ];
+    private static readonly Brush HeatEmpty = new SolidColorBrush(Color.FromRgb(0x24, 0x24, 0x23));
+    private static readonly Brush HeatCellInk = new SolidColorBrush(Color.FromRgb(0x10, 0x14, 0x1A));
+
+    /// <summary>Samples the heat ramp at t in [0, 1].</summary>
+    private static Color HeatColor(double t)
+    {
+        var scaled = Math.Clamp(t, 0, 1) * (HeatStops.Length - 1);
+        var index = Math.Min((int)scaled, HeatStops.Length - 2);
+        var fraction = scaled - index;
+        Color from = HeatStops[index], to = HeatStops[index + 1];
+        return Color.FromRgb(
+            (byte)(from.R + (to.R - from.R) * fraction),
+            (byte)(from.G + (to.G - from.G) * fraction),
+            (byte)(from.B + (to.B - from.B) * fraction));
+    }
+
+    /// <summary>WCAG relative luminance, for picking readable on-cell ink.</summary>
+    private static double Luminance(Color color)
+    {
+        static double Lin(byte channel)
+        {
+            var s = channel / 255.0;
+            return s <= 0.04045 ? s / 12.92 : Math.Pow((s + 0.055) / 1.055, 2.4);
+        }
+
+        return 0.2126 * Lin(color.R) + 0.7152 * Lin(color.G) + 0.0722 * Lin(color.B);
+    }
+
+    /// <summary>Fits a day's token total inside a detail cell: "999", "45K", "1.5M", "923M", "1.2B".</summary>
+    private static string CellLabel(long value) => value switch
+    {
+        >= 1_000_000_000 => $"{value / 1e9:0.#}B",
+        >= 10_000_000 => $"{value / 1e6:0}M",
+        >= 1_000_000 => $"{value / 1e6:0.#}M",
+        >= 10_000 => $"{value / 1e3:0}K",
+        >= 1_000 => $"{value / 1e3:0.#}K",
+        _ => value.ToString()
+    };
+
+    /// <summary>Fits a day's cost inside a detail cell: "$0.42", "$5.4", "$29", "$1.2K".</summary>
+    private static string CellCostLabel(double value) => value switch
+    {
+        >= 1000 => $"${value / 1000:0.#}K",
+        >= 10 => $"${value:0}",
+        >= 1 => $"${value:0.0}",
+        _ => $"${value:0.00}"
+    };
+
+    private void HeatmapViewButton_Checked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: string key } || key == _heatmapViewKey && _loaded)
+        {
+            return;
+        }
+
+        _heatmapViewKey = key;
+        if (HeatmapCanvas is null || !_loaded)
+        {
+            // Fired during XAML parse or from the ctor restoring the saved view.
+            return;
+        }
+
+        _settings.HeatmapView = key;
+        _settings.Save();
+        _ = RefreshUsageHeatmapAsync();
+    }
+
+    private void HeatmapMetricButton_Checked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: string key } || key == _heatmapMetricKey && _loaded)
+        {
+            return;
+        }
+
+        _heatmapMetricKey = key;
+        if (HeatmapCanvas is null || !_loaded)
+        {
+            return;
+        }
+
+        _settings.HeatmapMetric = key;
+        _settings.Save();
+        _ = RefreshUsageHeatmapAsync();
+    }
+
+    /// <summary>Redraws the GitHub-style grid of daily usage on the limits page.</summary>
+    private async Task RefreshUsageHeatmapAsync()
+    {
+        if (_heatmapRefreshing)
+        {
+            return;
+        }
+
+        _heatmapRefreshing = true;
+        try
+        {
+            // Detail trades the year of tiny cells for ~5 recent months of big
+            // cells, each printing its day's token total.
+            var detail = _heatmapViewKey == "detail";
+            var cell = detail ? 34.0 : 12.0;
+            var stepPx = cell + (detail ? 4 : 3);
+            var weeks = detail ? 20 : 52;
+            const double gutter = 30;   // Mon/Wed/Fri labels
+            const double header = 16;   // month labels
+
+            // Columns are Sunday-start weeks, the last one containing today.
+            // Data always covers the full year so the summary line and the
+            // intensity quartiles hold still when the view toggles.
+            var today = DateTime.Today;
+            var thisWeekStart = today.AddDays(-(int)today.DayOfWeek);
+            var gridStart = thisWeekStart.AddDays(-7 * (weeks - 1));
+            var since = new DateTimeOffset(thisWeekStart.AddDays(-7 * 51)).ToUnixTimeMilliseconds();
+
+            var days = await _database.GetDailyUsageAsync(since, _pricing);
+            if (_disposed)
+            {
+                return;
+            }
+
+            var byDay = days.ToDictionary(day => day.Day, StringComparer.Ordinal);
+
+            // Intensity follows the chosen metric. Cost can be 0 for unpriced
+            // models even when tokens landed; such days read as empty in cost mode.
+            var costMode = _heatmapMetricKey == "cost";
+            double ValueOf(DailyUsageRow day) => costMode ? day.Cost : day.Tokens;
+
+            // Continuous log scale from the year's smallest active day to its
+            // biggest: usage spans orders of magnitude, so a linear scale would
+            // pin everything to the bottom, and binning would hand the top
+            // bucket to dozens of days. Here only the maximum reaches t = 1.
+            var active = days.Select(ValueOf).Where(value => value > 0).Order().ToList();
+            var logMin = active.Count > 0 ? Math.Log(active[0]) : 0;
+            var logSpan = active.Count > 0 ? Math.Max(Math.Log(active[^1]) - logMin, 1e-9) : 1;
+            double HeatT(double value) => Math.Clamp((Math.Log(value) - logMin) / logSpan, 0, 1);
+
+            var muted = (Brush)FindResource("MutedBrush");
+            HeatmapCanvas.Children.Clear();
+            HeatmapCanvas.Width = gutter + weeks * stepPx - (stepPx - cell);
+            HeatmapCanvas.Height = header + 7 * stepPx - (stepPx - cell);
+
+            foreach (var (row, name) in new[] { (1, "Mon"), (3, "Wed"), (5, "Fri") })
+            {
+                var dayLabel = new TextBlock { Text = name, FontSize = 10, Foreground = muted };
+                Canvas.SetLeft(dayLabel, 0);
+                Canvas.SetTop(dayLabel, header + row * stepPx + (cell - 13) / 2);
+                HeatmapCanvas.Children.Add(dayLabel);
+            }
+
+            var lastMonthLabelX = double.MinValue;
+            for (var week = 0; week < weeks; week++)
+            {
+                var weekStart = gridStart.AddDays(week * 7);
+                var x = gutter + week * stepPx;
+
+                // Label the first column of each month, skipping collisions.
+                if (weekStart.Month != weekStart.AddDays(-7).Month && x - lastMonthLabelX >= 34)
+                {
+                    var monthLabel = new TextBlock
+                    {
+                        Text = weekStart.ToString("MMM"),
+                        FontSize = 10,
+                        Foreground = muted
+                    };
+                    Canvas.SetLeft(monthLabel, x);
+                    Canvas.SetTop(monthLabel, 0);
+                    HeatmapCanvas.Children.Add(monthLabel);
+                    lastMonthLabelX = x;
+                }
+
+                for (var dayOfWeek = 0; dayOfWeek < 7; dayOfWeek++)
+                {
+                    var date = weekStart.AddDays(dayOfWeek);
+                    if (date > today)
+                    {
+                        break;
+                    }
+
+                    var usage = byDay.GetValueOrDefault(date.ToString("yyyy-MM-dd"));
+                    var tokens = usage?.Tokens ?? 0;
+                    var value = usage is null ? 0 : ValueOf(usage);
+                    var heat = value > 0 ? HeatColor(HeatT(value)) : default;
+                    var rect = new Rectangle
+                    {
+                        Width = cell,
+                        Height = cell,
+                        RadiusX = detail ? 4 : 3,
+                        RadiusY = detail ? 4 : 3,
+                        Fill = value == 0 ? HeatEmpty : new SolidColorBrush(heat),
+                        StrokeThickness = 1,
+                        ToolTip = tokens == 0
+                            ? $"{date:ddd, MMM d yyyy} — no usage"
+                            : $"{date:ddd, MMM d yyyy}\n{FormatCompact(tokens)} tokens · ≈ {FormatMoney(usage!.Cost)}"
+                    };
+                    ToolTipService.SetInitialShowDelay(rect, 150);
+                    rect.MouseEnter += (_, _) => rect.Stroke = (Brush)FindResource("InkBrush");
+                    rect.MouseLeave += (_, _) => rect.Stroke = null;
+                    Canvas.SetLeft(rect, x);
+                    Canvas.SetTop(rect, header + dayOfWeek * stepPx);
+                    HeatmapCanvas.Children.Add(rect);
+
+                    if (detail && value > 0)
+                    {
+                        // Dark ink once the fill outshines it; white below.
+                        var valueLabel = new TextBlock
+                        {
+                            Text = costMode ? CellCostLabel(usage!.Cost) : CellLabel(tokens),
+                            FontSize = 9,
+                            FontWeight = FontWeights.SemiBold,
+                            Width = cell,
+                            TextAlignment = TextAlignment.Center,
+                            IsHitTestVisible = false,
+                            Foreground = Luminance(heat) > 0.2 ? HeatCellInk : Brushes.White
+                        };
+                        Canvas.SetLeft(valueLabel, x);
+                        Canvas.SetTop(valueLabel, header + dayOfWeek * stepPx + (cell - 12) / 2);
+                        HeatmapCanvas.Children.Add(valueLabel);
+                    }
+                }
+            }
+
+            if (HeatmapLegend.Children.Count == 0)
+            {
+                HeatmapLegend.Children.Add(new TextBlock
+                {
+                    Text = "Less",
+                    FontSize = 10,
+                    Foreground = muted,
+                    Margin = new Thickness(0, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                HeatmapLegend.Children.Add(new Rectangle
+                {
+                    Width = 10,
+                    Height = 10,
+                    RadiusX = 3,
+                    RadiusY = 3,
+                    Fill = HeatEmpty,
+                    Margin = new Thickness(0, 0, 3, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                var gradient = new LinearGradientBrush
+                {
+                    StartPoint = new System.Windows.Point(0, 0),
+                    EndPoint = new System.Windows.Point(1, 0)
+                };
+                for (var stop = 0; stop < HeatStops.Length; stop++)
+                {
+                    gradient.GradientStops.Add(
+                        new GradientStop(HeatStops[stop], stop / (double)(HeatStops.Length - 1)));
+                }
+
+                HeatmapLegend.Children.Add(new Rectangle
+                {
+                    Width = 72,
+                    Height = 10,
+                    RadiusX = 3,
+                    RadiusY = 3,
+                    Fill = gradient,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                HeatmapLegend.Children.Add(new TextBlock
+                {
+                    Text = "More",
+                    FontSize = 10,
+                    Foreground = muted,
+                    Margin = new Thickness(6, 0, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+            }
+
+            var totalTokens = days.Sum(day => day.Tokens);
+            var totalCost = days.Sum(day => day.Cost);
+            var activeDays = $"{active.Count} active {(active.Count == 1 ? "day" : "days")}";
+            HeatmapSubtitle.Text = active.Count == 0
+                ? costMode && totalTokens > 0
+                    ? "No cost estimated for the last year yet — the pricing feed may still be loading."
+                    : "Tokens per day over the last year, all clients combined — nothing recorded yet."
+                : costMode
+                    ? $"≈ {FormatMoney(totalCost)} over {activeDays} in the last year · " +
+                      $"busiest day {FormatMoney(active[^1])}"
+                    : $"{FormatCompact(totalTokens)} tokens over {activeDays} in the last year · " +
+                      $"busiest day {FormatCompact((long)active[^1])}";
+        }
+        finally
+        {
+            _heatmapRefreshing = false;
         }
     }
 
@@ -903,9 +1232,65 @@ public partial class MainWindow : Window
 
             parent?.Children.Remove(PanelGroup);
             PanelGroup.Margin = new Thickness(12, 0, 0, 0);
+            Grid.SetRow(PanelGroup, 0);
             Grid.SetColumn(PanelGroup, 1);
+            Grid.SetColumnSpan(PanelGroup, 1);
             ModelsHeaderGrid.Children.Add(PanelGroup);
         }
+
+        UpdateResponsiveHeaders();
+    }
+
+    // ── Responsive headers ─────────────────────────────────────────────────
+
+    private void ResponsiveHeader_SizeChanged(object sender, SizeChangedEventArgs e) =>
+        UpdateResponsiveHeaders();
+
+    /// <summary>
+    /// Headers put controls in an Auto column beside their title, and a Grid
+    /// paints overflow rather than clipping it — at narrow widths the controls
+    /// would draw over the title. Each header drops its controls onto a second
+    /// row while the two would collide, and lifts them back when they fit.
+    /// </summary>
+    private void UpdateResponsiveHeaders()
+    {
+        if (HeaderGrid is null || ChartHeaderGrid is null ||
+            LiveFeedHeaderGrid is null || ModelsHeaderGrid is null)
+        {
+            return;
+        }
+
+        StackHeaderWhenNarrow(HeaderGrid, HeaderBrandPanel, HeaderActionsPanel, new Thickness(0, 12, 0, 0));
+        StackHeaderWhenNarrow(ChartHeaderGrid, ChartTitle, ChartHeaderControls, new Thickness(0, 8, 0, 0));
+        StackHeaderWhenNarrow(LiveFeedHeaderGrid, LiveFeedTitlePanel, LiveHeaderControls, new Thickness(0, 8, 0, 0));
+        StackHeaderWhenNarrow(ModelsHeaderGrid, ModelsTitle, PanelGroup, new Thickness(0, 8, 0, 0),
+            new Thickness(12, 0, 0, 0));
+    }
+
+    private static void StackHeaderWhenNarrow(
+        Grid header,
+        FrameworkElement title,
+        FrameworkElement controls,
+        Thickness stackedMargin,
+        Thickness baseMargin = default)
+    {
+        // The panel-group toggle migrates between headers; only its current
+        // header may lay it out.
+        if (!ReferenceEquals(controls.Parent, header) || header.ActualWidth <= 0)
+        {
+            return;
+        }
+
+        // Compare natural single-line widths, not current ones — a stacked,
+        // wrapped panel reports a narrower size and would never unstack.
+        controls.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+        var stacked = title.DesiredSize.Width + controls.DesiredSize.Width + 16 > header.ActualWidth;
+        controls.InvalidateMeasure();
+
+        Grid.SetRow(controls, stacked ? 1 : 0);
+        Grid.SetColumn(controls, stacked ? 0 : 1);
+        Grid.SetColumnSpan(controls, stacked ? 2 : 1);
+        controls.Margin = stacked ? stackedMargin : baseMargin;
     }
 
     private void StartLiveFrames()

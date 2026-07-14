@@ -432,11 +432,36 @@ public sealed class ClaudeLimitsService : IDisposable
         isActive,
         account.LastFetchedMs < nowMs - StaleAfterMs,
         account.LastFetchedMs > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(account.LastFetchedMs) : null,
-        account.Limits.Select(limit => new ClaudeLimit(
-            limit.Label,
-            limit.Percent,
-            limit.Severity,
-            DateTimeOffset.TryParse(limit.ResetsAt, out var resetsAt) ? resetsAt : null)).ToList());
+        account.Limits
+            .Select(limit => RollForward(limit, DateTimeOffset.FromUnixTimeMilliseconds(nowMs)))
+            .ToList());
+
+    /// <summary>
+    /// A snapshot ages while an account can't be fetched (signed out, refresh
+    /// token dead). Once a limit's reset time passes, that window ended and its
+    /// usage is 0 no matter what the snapshot says — so expired limits roll
+    /// forward instead of showing a long-gone percentage.
+    /// </summary>
+    private static ClaudeLimit RollForward(StoredLimit limit, DateTimeOffset now)
+    {
+        DateTimeOffset? resetsAt = DateTimeOffset.TryParse(limit.ResetsAt, out var parsed) ? parsed : null;
+        if (resetsAt is not { } due || due > now)
+        {
+            return new ClaudeLimit(limit.Label, limit.Percent, limit.Severity, resetsAt);
+        }
+
+        if (limit.Label == "5h")
+        {
+            // Session windows start with the first message, so an idle account
+            // has no scheduled next reset.
+            return new ClaudeLimit(limit.Label, 0, "normal", null);
+        }
+
+        // Weekly windows stay anchored to their schedule: advance whole periods.
+        var period = TimeSpan.FromDays(7);
+        var missed = (now - due).Ticks / period.Ticks + 1;
+        return new ClaudeLimit(limit.Label, 0, "normal", due + TimeSpan.FromTicks(period.Ticks * missed));
+    }
 
     private void LoadStore()
     {

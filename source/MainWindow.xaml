@@ -72,12 +72,19 @@
     </Grid.RowDefinitions>
 
     <!-- ═══ Header: brand · range presets · actions ═══ -->
-    <Grid Grid.Row="0" Margin="0,0,0,16">
+    <!-- Two rows: the actions drop onto the second one when the window is too
+         narrow for both groups side by side (see StackHeaderWhenNarrow). -->
+    <Grid x:Name="HeaderGrid" Grid.Row="0" Margin="0,0,0,16"
+          SizeChanged="ResponsiveHeader_SizeChanged">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
         <ColumnDefinition Width="Auto" />
       </Grid.ColumnDefinitions>
-      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+      <StackPanel x:Name="HeaderBrandPanel" Orientation="Horizontal" VerticalAlignment="Center">
         <Border Width="9" Height="9" CornerRadius="4.5" Background="{StaticResource AccentBrush}"
                 VerticalAlignment="Center" Margin="0,1,10,0" />
         <TextBlock Text="Token Tracker" FontSize="15" FontWeight="SemiBold"
@@ -99,7 +106,8 @@
         </Border>
       </StackPanel>
 
-      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+      <StackPanel x:Name="HeaderActionsPanel" Grid.Column="1" Orientation="Horizontal"
+                  VerticalAlignment="Center" SizeChanged="ResponsiveHeader_SizeChanged">
         <Border x:Name="RangeGroupBorder" Style="{StaticResource SegmentGroup}">
           <StackPanel Orientation="Horizontal">
             <RadioButton x:Name="RangeLast1" Style="{StaticResource SegmentButton}" GroupName="range"
@@ -226,19 +234,28 @@
             <RowDefinition Height="*" />
           </Grid.RowDefinitions>
 
-          <Grid Grid.Row="0" Margin="0,0,0,6">
+          <Grid x:Name="ChartHeaderGrid" Grid.Row="0" Margin="0,0,0,6"
+                SizeChanged="ResponsiveHeader_SizeChanged">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
             <StackPanel>
               <TextBlock x:Name="ChartTitle" Text="Spend by hour" FontSize="16" FontWeight="SemiBold"
-                         Foreground="{StaticResource InkBrush}" />
+                         Foreground="{StaticResource InkBrush}"
+                         SizeChanged="ResponsiveHeader_SizeChanged" />
               <TextBlock x:Name="ChartSubtitle" Text="" FontSize="12"
-                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                         TextTrimming="CharacterEllipsis" />
             </StackPanel>
-            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
-              <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0"
+            <!-- WrapPanel so the groups flow onto extra lines once stacked. -->
+            <WrapPanel x:Name="ChartHeaderControls" Grid.Column="1" VerticalAlignment="Top"
+                       SizeChanged="ResponsiveHeader_SizeChanged">
+              <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,6"
                       ToolTip="Bar size. Auto picks a width to fit the range; only sizes that make sense for the range are offered.">
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="BarsAuto" Style="{StaticResource SegmentButton}" GroupName="bars"
@@ -261,7 +278,7 @@
                                Content="1d" Tag="d1" Checked="BarsButton_Checked" />
                 </StackPanel>
               </Border>
-              <Border Style="{StaticResource SegmentGroup}">
+              <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,6">
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="MetricCost" Style="{StaticResource SegmentButton}" GroupName="metric"
                                Content="Cost" Tag="cost" IsChecked="True" Checked="MetricButton_Checked" />
@@ -272,8 +289,8 @@
                 </StackPanel>
               </Border>
               <ToggleButton x:Name="TableToggle" Style="{StaticResource GhostToggle}" Content="Table"
-                            Margin="8,0,0,0" Checked="TableToggle_Changed" Unchecked="TableToggle_Changed" />
-            </StackPanel>
+                            Margin="0,0,0,6" Checked="TableToggle_Changed" Unchecked="TableToggle_Changed" />
+            </WrapPanel>
           </Grid>
 
           <ItemsControl x:Name="ChartLegend" Grid.Row="1" Margin="2,4,0,2" Visibility="Collapsed">
@@ -346,16 +363,22 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
           </Grid.RowDefinitions>
-          <Grid x:Name="ModelsHeaderGrid" Margin="0,0,0,12">
+          <Grid x:Name="ModelsHeaderGrid" Margin="0,0,0,12"
+                SizeChanged="ResponsiveHeader_SizeChanged">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
             <StackPanel>
-              <TextBlock Text="By model" FontSize="16" FontWeight="SemiBold"
+              <TextBlock x:Name="ModelsTitle" Text="By model" FontSize="16" FontWeight="SemiBold"
                          Foreground="{StaticResource InkBrush}" />
               <TextBlock x:Name="ModelsSubtitle" Text="" FontSize="12"
-                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                         TextTrimming="CharacterEllipsis" />
             </StackPanel>
             <!-- Swaps this panel between the model breakdown and the live cup;
                  rides along into whichever card is showing. -->
@@ -483,20 +506,26 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
           </Grid.RowDefinitions>
-          <Grid Grid.Row="0" Margin="0,0,0,4">
+          <Grid x:Name="LiveFeedHeaderGrid" Grid.Row="0" Margin="0,0,0,4"
+                SizeChanged="ResponsiveHeader_SizeChanged">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <StackPanel x:Name="LiveFeedTitlePanel" Orientation="Horizontal" VerticalAlignment="Center"
+                        SizeChanged="ResponsiveHeader_SizeChanged">
               <TextBlock Text="Live feed" FontSize="16" FontWeight="SemiBold"
                          Foreground="{StaticResource InkBrush}" VerticalAlignment="Center" />
               <TextBlock x:Name="LiveRoundText" FontSize="12" FontWeight="SemiBold"
                          Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"
                          Margin="14,1,0,0" />
             </StackPanel>
-            <StackPanel x:Name="LiveHeaderControls" Grid.Column="1" Orientation="Horizontal"
-                        VerticalAlignment="Top">
+            <WrapPanel x:Name="LiveHeaderControls" Grid.Column="1" VerticalAlignment="Top"
+                       SizeChanged="ResponsiveHeader_SizeChanged">
               <ItemsControl x:Name="RoundHistoryBars" Height="26" Margin="0,2,12,0"
                             VerticalAlignment="Center">
                 <ItemsControl.ItemsPanel>
@@ -521,7 +550,7 @@
                                Content="Tokens" Tag="tokens" Checked="LiveMetricButton_Checked" />
                 </StackPanel>
               </Border>
-            </StackPanel>
+            </WrapPanel>
           </Grid>
           <ItemsControl x:Name="LiveLegend" Grid.Row="1" Margin="2,4,0,2">
             <ItemsControl.ItemsPanel>
@@ -572,6 +601,49 @@
               <TextBlock x:Name="LimitsPageSubtitle" FontSize="12"
                          Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
                          Text="The same numbers Claude Code shows under /usage." />
+            </StackPanel>
+          </Border>
+          <!-- Daily activity: a GitHub-style year of local usage, one cell per day. -->
+          <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+            <StackPanel>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock Text="Daily activity" FontSize="15" FontWeight="SemiBold"
+                             Foreground="{StaticResource InkBrush}" />
+                  <TextBlock x:Name="HeatmapSubtitle" FontSize="12"
+                             Foreground="{StaticResource MutedBrush}" Margin="0,3,0,0"
+                             TextTrimming="CharacterEllipsis"
+                             Text="Tokens per day over the last year, all clients combined." />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center"
+                            Margin="16,0,0,0">
+                  <StackPanel x:Name="HeatmapLegend" Orientation="Horizontal"
+                              VerticalAlignment="Center" Margin="0,0,14,0" />
+                  <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0"
+                          ToolTip="What the color scale (and Detail's cell numbers) measure.">
+                    <StackPanel Orientation="Horizontal">
+                      <RadioButton x:Name="HeatmapTokens" Style="{StaticResource SegmentButton}" GroupName="heatmapMetric"
+                                   Content="Tokens" Tag="tokens" IsChecked="True" Checked="HeatmapMetricButton_Checked" />
+                      <RadioButton x:Name="HeatmapCost" Style="{StaticResource SegmentButton}" GroupName="heatmapMetric"
+                                   Content="Cost" Tag="cost" Checked="HeatmapMetricButton_Checked" />
+                    </StackPanel>
+                  </Border>
+                  <Border Style="{StaticResource SegmentGroup}"
+                          ToolTip="Year shows 12 months of small cells; Detail shows recent months bigger, with the day's number on each cell.">
+                    <StackPanel Orientation="Horizontal">
+                      <RadioButton x:Name="HeatmapYear" Style="{StaticResource SegmentButton}" GroupName="heatmapView"
+                                   Content="Year" Tag="year" IsChecked="True" Checked="HeatmapViewButton_Checked" />
+                      <RadioButton x:Name="HeatmapDetail" Style="{StaticResource SegmentButton}" GroupName="heatmapView"
+                                   Content="Detail" Tag="detail" Checked="HeatmapViewButton_Checked" />
+                    </StackPanel>
+                  </Border>
+                </StackPanel>
+              </Grid>
+              <Canvas x:Name="HeatmapCanvas" Margin="0,16,0,0" HorizontalAlignment="Left" />
             </StackPanel>
           </Border>
           <ItemsControl x:Name="LimitsDetailList">

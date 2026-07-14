@@ -21,6 +21,10 @@ public sealed class AppSettings
 
     public string SelectedLiveMetric { get; set; } = "cost";
 
+    public string HeatmapView { get; set; } = "year";
+
+    public string HeatmapMetric { get; set; } = "tokens";
+
     public static AppSettings Load()
     {
         AppPaths.EnsureDataDirectory();

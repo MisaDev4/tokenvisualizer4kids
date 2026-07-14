@@ -90,6 +90,9 @@ public enum BucketUnit
 /// <summary>Per-model share of a single timeline bucket.</summary>
 public sealed record BucketModelSlice(string Model, double Cost, long Tokens, long Messages);
 
+/// <summary>One local calendar day's total, for the daily activity grid.</summary>
+public sealed record DailyUsageRow(string Day, long Tokens, double Cost);
+
 /// <summary>
 /// One indexed usage event as surfaced to the live view. UpdatedMs is when the
 /// collector last wrote the row, which for live tailing is within ~a second of
