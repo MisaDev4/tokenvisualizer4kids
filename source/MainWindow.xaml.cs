@@ -42,13 +42,33 @@ public partial class MainWindow : Window
     private bool _liveFramesActive;
     private long _lastFrameTicks;
 
-    // Cup rounds: fill the cup until the timer runs out, then it tips over.
+    // Cup rounds: fill for the round length, then the pile settles into a
+    // frozen layer, the floor rises, and the next round stacks on top —
+    // scroll down through the sediment to see past runs. Live state runs in
+    // the background regardless of the visible tab.
+    private bool _liveStarted;
     private long _roundStartMs;
-    private long _cupEmptyingUntilMs;
     private double? _lastRoundCost;
     private double _bestRoundCost;
     private long? _lastRoundTokens;
     private long _bestRoundTokens;
+    private double _activeCupScale = 1;
+    private System.Windows.Shapes.Path? _cupWalls;
+    private readonly List<CupLayer> _cupLayers = [];
+    private readonly List<(DateTime EndedAt, double Cost, long Tokens)> _roundHistory = [];
+
+    /// <summary>One settled round: its blocks stay packed below the active floor.</summary>
+    private sealed class CupLayer
+    {
+        public required List<LiveBubble> Blocks { get; init; }
+        public required DateTime EndedAt { get; init; }
+        public required double Cost { get; init; }
+        public required long Tokens { get; init; }
+        public required double Scale { get; init; }
+        public required Line Divider { get; init; }
+        public required TextBlock Caption { get; init; }
+        public double Height { get; set; }
+    }
     private readonly Dictionary<string, LiveBubble> _liveBubbles = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _liveLanes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _liveLaneSeq = new(StringComparer.Ordinal);
@@ -77,8 +97,8 @@ public partial class MainWindow : Window
         public double CurrentX { get; set; } = double.NaN;
         public double CurrentY { get; set; } = double.NaN;
 
-        // Round ended: the block is falling out of the cup and ignores packing.
-        public bool Dying { get; set; }
+        // Part of a settled layer: packed below the active round's floor.
+        public bool Frozen { get; set; }
     }
 
     // Chart colors follow the model, not its current rank: slots are assigned on first
@@ -212,17 +232,20 @@ public partial class MainWindow : Window
         {
             await Task.WhenAll(_collector.StartAsync(), _pricing.InitializeAsync());
             await RefreshDashboardAsync();
-            if (_tabKey == "live")
+
+            // Live state starts with the app, whatever tab is showing, so a
+            // cup round is never reset by switching views.
+            if (_liveModeKey == "cup")
             {
-                if (_liveModeKey == "cup")
-                {
-                    StartCupRound();
-                }
-                else
-                {
-                    await ReseedLiveAsync();
-                }
+                StartCupRound();
             }
+            else
+            {
+                await ReseedLiveAsync();
+            }
+
+            _liveStarted = true;
+            _liveTimer.Start();
         }
         catch (Exception exception)
         {
@@ -386,23 +409,15 @@ public partial class MainWindow : Window
         DashboardContent.Visibility = live ? Visibility.Collapsed : Visibility.Visible;
         RangeGroupBorder.Visibility = live ? Visibility.Collapsed : Visibility.Visible;
         LiveRoot.Visibility = live ? Visibility.Visible : Visibility.Collapsed;
+        // Live state keeps running in the background; the tab switch only
+        // pauses the per-frame rendering.
         if (live)
         {
-            _liveTimer.Start();
             StartLiveFrames();
             RebuildLiveAxis();
-            if (_liveModeKey == "cup")
-            {
-                StartCupRound();
-            }
-            else if (_loaded)
-            {
-                _ = ReseedLiveAsync();
-            }
         }
         else
         {
-            _liveTimer.Stop();
             StopLiveFrames();
         }
     }
@@ -443,9 +458,9 @@ public partial class MainWindow : Window
             (ticks - _lastFrameTicks) / (double)System.Diagnostics.Stopwatch.Frequency, 0, 0.1);
         _lastFrameTicks = ticks;
 
-        var width = LiveCanvas.ActualWidth;
-        var height = LiveCanvas.ActualHeight;
-        if (width < 40 || height < 40)
+        var width = LiveScroll.ViewportWidth;
+        var viewportHeight = LiveScroll.ViewportHeight;
+        if (width < 40 || viewportHeight < 40)
         {
             return;
         }
@@ -453,11 +468,21 @@ public partial class MainWindow : Window
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         if (_liveModeKey == "cup")
         {
-            AdvanceCup(nowMs, width, height, dt);
+            AdvanceCup(nowMs, width, viewportHeight, dt);
         }
         else
         {
-            AdvanceRiver(nowMs, width, height);
+            if (double.IsNaN(LiveCanvas.Width) || Math.Abs(LiveCanvas.Width - width) > 0.5)
+            {
+                LiveCanvas.Width = width;
+            }
+
+            if (double.IsNaN(LiveCanvas.Height) || Math.Abs(LiveCanvas.Height - viewportHeight) > 0.5)
+            {
+                LiveCanvas.Height = viewportHeight;
+            }
+
+            AdvanceRiver(nowMs, width, viewportHeight);
         }
     }
 
@@ -539,6 +564,7 @@ public partial class MainWindow : Window
         else
         {
             LiveRoundText.Visibility = Visibility.Collapsed;
+            RoundHistoryBars.Visibility = Visibility.Collapsed;
             await ReseedLiveAsync();
         }
     }
@@ -559,22 +585,26 @@ public partial class MainWindow : Window
         _settings.SelectedLiveMetric = key;
         _settings.Save();
         _cupLayoutDirty = true;
+        UpdateRoundHistoryBars();
         await PullLiveEventsAsync();
     }
 
-    /// <summary>Empties the cup and starts a fresh timed round from zero.</summary>
+    /// <summary>Empties the cup (and its layers) and starts a fresh timed round.</summary>
     private void StartCupRound()
     {
         _liveBubbles.Clear();
         _liveLanes.Clear();
         _liveLaneSeq.Clear();
+        _cupLayers.Clear();
+        _cupWalls = null;
         LiveCanvas.Children.Clear();
         LiveLegend.ItemsSource = null;
-        _cupEmptyingUntilMs = 0;
         _roundStartMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         _liveLastSeenMs = _roundStartMs;
         _cupLayoutDirty = true;
         LiveRoundText.Visibility = Visibility.Visible;
+        RoundHistoryBars.Visibility = Visibility.Visible;
+        UpdateRoundHistoryBars();
         UpdateRoundText(_roundStartMs);
     }
 
@@ -727,7 +757,7 @@ public partial class MainWindow : Window
     /// <summary>Repositions the river every 100 ms and refreshes the counters.</summary>
     private void AdvanceLive(object? sender, EventArgs e)
     {
-        if (_tabKey != "live" || !IsVisible)
+        if (!_liveStarted)
         {
             return;
         }
@@ -769,7 +799,7 @@ public partial class MainWindow : Window
         long tokensWindow = 0, tokens60 = 0, messagesWindow = 0;
         foreach (var bubble in _liveBubbles.Values)
         {
-            if (bubble.Dying)
+            if (bubble.Frozen)
             {
                 continue;
             }
@@ -792,45 +822,92 @@ public partial class MainWindow : Window
         LiveTokenRateText.Text = $"{FormatCompact((long)(tokens60 / 60.0))}/s";
     }
 
-    /// <summary>Cup round lifecycle: countdown → tip over (blocks fall out) → fresh round.</summary>
+    /// <summary>Cup round lifecycle: countdown → the pile settles into a layer → fresh round on top.</summary>
     private void TickCupRound(long nowMs)
     {
-        if (_cupEmptyingUntilMs > 0)
+        if (nowMs - _roundStartMs >= _liveWindowMs)
         {
-            if (nowMs >= _cupEmptyingUntilMs)
-            {
-                var fallen = _liveBubbles.Where(pair => pair.Value.Dying).Select(pair => pair.Key).ToList();
-                foreach (var key in fallen)
-                {
-                    LiveCanvas.Children.Remove(_liveBubbles[key].Visual);
-                    _liveBubbles.Remove(key);
-                }
-
-                _cupEmptyingUntilMs = 0;
-                _roundStartMs = nowMs;
-                _cupLayoutDirty = true;
-                UpdateLiveLegend();
-            }
-        }
-        else if (nowMs - _roundStartMs >= _liveWindowMs)
-        {
-            var live = _liveBubbles.Values.Where(bubble => !bubble.Dying).ToList();
-            _lastRoundCost = live.Sum(bubble => bubble.Cost);
-            _lastRoundTokens = live.Sum(bubble => bubble.Event.Tokens.Total);
-            _bestRoundCost = Math.Max(_bestRoundCost, _lastRoundCost.Value);
-            _bestRoundTokens = Math.Max(_bestRoundTokens, _lastRoundTokens.Value);
-
-            var floor = Math.Max(200, LiveCanvas.ActualHeight);
-            foreach (var bubble in live)
-            {
-                bubble.Dying = true;
-                bubble.TargetY = floor + bubble.Side + 30;
-            }
-
-            _cupEmptyingUntilMs = nowMs + 750;
+            SettleRound(nowMs);
         }
 
         UpdateRoundText(nowMs);
+    }
+
+    /// <summary>Freezes the active round into a sediment layer and raises the floor.</summary>
+    private void SettleRound(long nowMs)
+    {
+        var active = _liveBubbles.Values.Where(bubble => !bubble.Frozen).ToList();
+        var cost = active.Sum(bubble => bubble.Cost);
+        var tokens = active.Sum(bubble => bubble.Event.Tokens.Total);
+        _lastRoundCost = cost;
+        _lastRoundTokens = tokens;
+        _bestRoundCost = Math.Max(_bestRoundCost, cost);
+        _bestRoundTokens = Math.Max(_bestRoundTokens, tokens);
+        _roundHistory.Add((DateTime.Now, cost, tokens));
+        if (_roundHistory.Count > 12)
+        {
+            _roundHistory.RemoveAt(0);
+        }
+
+        UpdateRoundHistoryBars();
+
+        if (active.Count > 0)
+        {
+            foreach (var bubble in active)
+            {
+                bubble.Frozen = true;
+            }
+
+            var caption = new TextBlock
+            {
+                Text = $"{DateTime.Now:h:mm tt}  ·  {FormatMoney(cost)}  ·  {FormatCompact(tokens)} tok",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = (Brush)FindResource("MutedBrush")
+            };
+            var divider = new Line
+            {
+                Stroke = (Brush)FindResource("HairlineBrush"),
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 3, 3 }
+            };
+            Canvas.SetTop(caption, -1000);
+            LiveCanvas.Children.Add(divider);
+            LiveCanvas.Children.Add(caption);
+            _cupLayers.Insert(0, new CupLayer
+            {
+                Blocks = active.OrderBy(bubble => bubble.FirstSeenMs).ToList(),
+                EndedAt = DateTime.Now,
+                Cost = cost,
+                Tokens = tokens,
+                Scale = _activeCupScale,
+                Divider = divider,
+                Caption = caption
+            });
+
+            // Keep the sediment bounded.
+            while (_cupLayers.Count > 20)
+            {
+                var oldest = _cupLayers[^1];
+                _cupLayers.RemoveAt(_cupLayers.Count - 1);
+                LiveCanvas.Children.Remove(oldest.Divider);
+                LiveCanvas.Children.Remove(oldest.Caption);
+                foreach (var bubble in oldest.Blocks)
+                {
+                    LiveCanvas.Children.Remove(bubble.Visual);
+                    _liveBubbles.Remove(bubble.Event.EventKey);
+                }
+            }
+
+            UpdateLiveLegend();
+        }
+
+        _roundStartMs = nowMs;
+        _cupLayoutDirty = true;
+        if (_tabKey == "live")
+        {
+            LiveScroll.ScrollToVerticalOffset(0);
+        }
     }
 
     private void UpdateRoundText(long nowMs)
@@ -840,18 +917,37 @@ public partial class MainWindow : Window
               (_bestRoundTokens > 0 ? $"   ·   best {FormatCompact(_bestRoundTokens)}" : string.Empty)
             : (_lastRoundCost is { } lastCost ? $"   ·   last round {FormatMoney(lastCost)}" : string.Empty) +
               (_bestRoundCost > 0 ? $"   ·   best {FormatMoney(_bestRoundCost)}" : string.Empty);
-        if (_cupEmptyingUntilMs > 0)
-        {
-            LiveRoundText.Text = $"cup tips over!{score}";
-            return;
-        }
-
         var remaining = TimeSpan.FromMilliseconds(Math.Max(0, _liveWindowMs - (nowMs - _roundStartMs)));
         var countdown = remaining.TotalHours >= 1
             ? remaining.ToString(@"h\:mm\:ss")
             : remaining.ToString(@"m\:ss");
-        LiveRoundText.Text = $"tips over in {countdown}{score}";
+        LiveRoundText.Text = $"next layer in {countdown}{score}";
     }
+
+    private void UpdateRoundHistoryBars()
+    {
+        if (_roundHistory.Count == 0)
+        {
+            RoundHistoryBars.ItemsSource = null;
+            return;
+        }
+
+        var values = _roundHistory
+            .Select(round => _liveMetricKey == "tokens" ? round.Tokens : round.Cost)
+            .ToList();
+        var max = Math.Max(values.Max(), 1e-9);
+        var bestIndex = values.IndexOf(values.Max());
+        var accent = (Brush)FindResource("AccentBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+        RoundHistoryBars.ItemsSource = _roundHistory
+            .Select((round, index) => new RoundBarVm(
+                Math.Max(3, 26 * values[index] / max),
+                index == bestIndex ? accent : muted,
+                $"{round.EndedAt:h:mm tt} · {FormatMoney(round.Cost)} · {FormatCompact(round.Tokens)} tokens"))
+            .ToList();
+    }
+
+    private sealed record RoundBarVm(double Height, Brush Brush, string Tooltip);
 
     private void AdvanceRiver(long nowMs, double width, double height)
     {
@@ -879,18 +975,16 @@ public partial class MainWindow : Window
         }
     }
 
-    private void AdvanceCup(long nowMs, double width, double height, double dt)
+    private void AdvanceCup(long nowMs, double width, double viewportHeight, double dt)
     {
-        // Repacking mid-tip would yank falling blocks back into the cup.
-        if (_cupLayoutDirty && _cupEmptyingUntilMs == 0)
+        if (_cupLayoutDirty)
         {
-            RepackCup(width, height);
+            LayoutCup(width, viewportHeight);
             _cupLayoutDirty = false;
         }
 
         // Frame-rate independent easing: the same settle speed at 30 or 120 fps.
         var ease = 1 - Math.Exp(-9 * dt);
-        var fallEase = 1 - Math.Exp(-13 * dt);
         foreach (var bubble in _liveBubbles.Values)
         {
             if (bubble.Side <= 0)
@@ -906,14 +1000,12 @@ public partial class MainWindow : Window
                 bubble.CurrentY = -bubble.Side - 8;
             }
 
-            var factor = bubble.Dying ? fallEase : ease;
-            bubble.CurrentX += (bubble.TargetX - bubble.CurrentX) * factor;
-            bubble.CurrentY += (bubble.TargetY - bubble.CurrentY) * factor;
+            bubble.CurrentX += (bubble.TargetX - bubble.CurrentX) * ease;
+            bubble.CurrentY += (bubble.TargetY - bubble.CurrentY) * ease;
             bubble.Visual.Width = bubble.Side;
             bubble.Visual.Height = bubble.Side;
             Canvas.SetLeft(bubble.Visual, bubble.CurrentX);
             Canvas.SetTop(bubble.Visual, bubble.CurrentY);
-            bubble.Visual.Opacity = bubble.Dying ? 0.85 : 1;
         }
     }
 
@@ -921,27 +1013,30 @@ public partial class MainWindow : Window
     /// Shelf-packs blocks in arrival order from the cup floor upward: rows fill
     /// left to right, each new row sits on top of the tallest block below it.
     /// </summary>
-    private void RepackCup(double width, double height)
+    /// <summary>
+    /// Lays out the whole cup: the active round packs into the visible region
+    /// at the top (scale-to-fit), and each settled layer stacks below it with
+    /// a divider and score caption. The canvas grows downward; scroll for history.
+    /// </summary>
+    private void LayoutCup(double width, double viewportHeight)
     {
         const double wallInset = 16;
-        const double floorInset = 12;
+        const double floorInset = 10;
         const double topPad = 10;
-        var ordered = _liveBubbles.Values
-            .Where(item => !item.Dying)
+        const double captionBand = 22;
+
+        var active = _liveBubbles.Values
+            .Where(item => !item.Frozen)
             .OrderBy(item => item.FirstSeenMs)
             .ToList();
-        if (ordered.Count == 0)
-        {
-            return;
-        }
 
-        // Scale-to-fit: when the stack would overflow the rim, shrink every
-        // block by one shared factor so relative areas stay honest.
-        var available = Math.Max(40, height - floorInset - topPad);
+        // Scale-to-fit: when the active stack would overflow the rim, shrink
+        // every block by one shared factor so relative areas stay honest.
+        var available = Math.Max(40, viewportHeight - floorInset - topPad);
         var scale = 1.0;
         for (var attempt = 0; attempt < 8; attempt++)
         {
-            var needed = PackHeight(ordered, width, wallInset, scale);
+            var needed = PackHeight(active, width, wallInset, scale);
             if (needed <= available || scale <= 0.08)
             {
                 break;
@@ -950,11 +1045,43 @@ public partial class MainWindow : Window
             scale *= Math.Max(0.4, Math.Sqrt(available / needed) * 0.96);
         }
 
+        _activeCupScale = scale;
+
+        foreach (var layer in _cupLayers)
+        {
+            layer.Height = PackHeight(layer.Blocks, width, wallInset, layer.Scale) + captionBand + 6;
+        }
+
+        var canvasHeight = viewportHeight + _cupLayers.Sum(layer => layer.Height);
+        LiveCanvas.Width = width;
+        LiveCanvas.Height = canvasHeight;
+
+        PackInto(active, width, wallInset, scale, viewportHeight - floorInset);
+
+        var bandTop = viewportHeight;
+        foreach (var layer in _cupLayers)
+        {
+            layer.Divider.X1 = 8;
+            layer.Divider.X2 = width - 8;
+            layer.Divider.Y1 = bandTop + 1;
+            layer.Divider.Y2 = bandTop + 1;
+            Canvas.SetLeft(layer.Caption, wallInset);
+            Canvas.SetTop(layer.Caption, bandTop + 4);
+            PackInto(layer.Blocks, width, wallInset, layer.Scale, bandTop + layer.Height - 4);
+            bandTop += layer.Height;
+        }
+
+        RedrawCupWalls(width, canvasHeight);
+    }
+
+    /// <summary>Shelf-packs blocks upward from the given floor, assigning targets and labels.</summary>
+    private void PackInto(List<LiveBubble> blocks, double width, double wallInset, double scale, double floorY)
+    {
         var gap = GapFor(scale);
         var x = wallInset;
         var rowBase = 0d;
         var rowHeight = 0d;
-        foreach (var bubble in ordered)
+        foreach (var bubble in blocks)
         {
             var side = Math.Max(6, CupSide(bubble) * scale);
             bubble.Side = side;
@@ -966,7 +1093,7 @@ public partial class MainWindow : Window
             }
 
             bubble.TargetX = x;
-            bubble.TargetY = height - floorInset - rowBase - side;
+            bubble.TargetY = floorY - rowBase - side;
             x += side + gap;
             rowHeight = Math.Max(rowHeight, side);
 
@@ -984,6 +1111,24 @@ public partial class MainWindow : Window
                 }
             }
         }
+    }
+
+    /// <summary>One tall cup around everything: walls run the full sediment depth.</summary>
+    private void RedrawCupWalls(double width, double canvasHeight)
+    {
+        if (_cupWalls is not null)
+        {
+            LiveCanvas.Children.Remove(_cupWalls);
+        }
+
+        _cupWalls = new System.Windows.Shapes.Path
+        {
+            Stroke = (Brush)FindResource("HairlineBrush"),
+            StrokeThickness = 1.5,
+            Data = Geometry.Parse(FormattableString.Invariant(
+                $"M 8,2 L 8,{canvasHeight - 20} Q 8,{canvasHeight - 4} 24,{canvasHeight - 4} L {width - 24},{canvasHeight - 4} Q {width - 8},{canvasHeight - 4} {width - 8},{canvasHeight - 20} L {width - 8},2"))
+        };
+        LiveCanvas.Children.Insert(0, _cupWalls);
     }
 
     /// <summary>Height the shelf-packed stack needs at the given block scale.</summary>
@@ -1060,16 +1205,7 @@ public partial class MainWindow : Window
 
         if (_liveModeKey == "cup")
         {
-            // Cup walls and floor; blocks stack inside them.
-            var wallBrush = (Brush)FindResource("HairlineBrush");
-            var walls = new System.Windows.Shapes.Path
-            {
-                Stroke = wallBrush,
-                StrokeThickness = 1.5,
-                Data = Geometry.Parse(FormattableString.Invariant(
-                    $"M 8,2 L 8,{height - 22} Q 8,{height - 6} 24,{height - 6} L {width - 24},{height - 6} Q {width - 8},{height - 6} {width - 8},{height - 22} L {width - 8},2"))
-            };
-            LiveAxisCanvas.Children.Add(walls);
+            // The cup (walls, dividers) is drawn inside the scrollable canvas.
             return;
         }
 
@@ -1112,6 +1248,7 @@ public partial class MainWindow : Window
     private void UpdateLiveLegend()
     {
         LiveLegend.ItemsSource = _liveBubbles.Values
+            .Where(bubble => !bubble.Frozen)
             .GroupBy(bubble => bubble.Event.Model, StringComparer.OrdinalIgnoreCase)
             .Select(group => (Model: group.Key, Cost: group.Sum(bubble => bubble.Cost)))
             .OrderByDescending(item => item.Cost)
@@ -1868,7 +2005,7 @@ public partial class MainWindow : Window
         Dispatcher.BeginInvoke(async () =>
         {
             await RefreshDashboardAsync();
-            if (_tabKey == "live")
+            if (_liveStarted)
             {
                 await PullLiveEventsAsync();
             }

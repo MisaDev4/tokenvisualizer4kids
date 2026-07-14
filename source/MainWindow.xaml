@@ -461,6 +461,21 @@
                          Margin="14,1,0,0" Visibility="Collapsed" />
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+              <ItemsControl x:Name="RoundHistoryBars" Height="26" Margin="0,2,12,0"
+                            VerticalAlignment="Center" Visibility="Collapsed">
+                <ItemsControl.ItemsPanel>
+                  <ItemsPanelTemplate>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Bottom" />
+                  </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Border Width="8" Height="{Binding Height}" Background="{Binding Brush}"
+                            CornerRadius="2" Margin="1,0" VerticalAlignment="Bottom"
+                            ToolTip="{Binding Tooltip}" />
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
               <Border Style="{StaticResource SegmentGroup}" Margin="0,0,8,0">
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="LiveModeRiver" Style="{StaticResource SegmentButton}" GroupName="liveMode"
@@ -499,14 +514,18 @@
               </DataTemplate>
             </ItemsControl.ItemTemplate>
           </ItemsControl>
-          <Grid Grid.Row="2" Margin="0,6,0,0">
-            <Canvas x:Name="LiveAxisCanvas" ClipToBounds="True" Background="Transparent"
-                    SizeChanged="LiveCanvas_SizeChanged" />
-            <Canvas x:Name="LiveCanvas" ClipToBounds="True" Background="Transparent" />
+          <Grid Grid.Row="2" Margin="0,6,0,0" SizeChanged="LiveCanvas_SizeChanged">
+            <Canvas x:Name="LiveAxisCanvas" ClipToBounds="True" Background="Transparent" />
+            <ScrollViewer x:Name="LiveScroll" VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled" Focusable="False"
+                          Background="Transparent" BorderThickness="0" Padding="0">
+              <Canvas x:Name="LiveCanvas" ClipToBounds="True" Background="Transparent" />
+            </ScrollViewer>
             <TextBlock x:Name="LiveEmptyText"
                        Text="Waiting for activity — bubbles appear here within about a second of a response being logged."
                        Foreground="{StaticResource MutedBrush}" FontSize="13"
-                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       IsHitTestVisible="False" />
           </Grid>
         </Grid>
       </Border>
