@@ -57,6 +57,12 @@ public sealed class ClaudeLimitsService : IDisposable
     private readonly Dictionary<string, StoredAccount> _accounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _tokenOwner = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _refreshFailedAtMs = new(StringComparer.Ordinal);
+
+    /// <summary>Accounts whose tokens a live client (the CLI credentials file or
+    /// the desktop app) is managing right now. We re-read their tokens from that
+    /// source each poll and never refresh them ourselves — a second refresh
+    /// would rotate the refresh token out from under the client and log it out.</summary>
+    private readonly HashSet<string> _externallyManaged = new(StringComparer.Ordinal);
     private bool _storeLoaded;
     private bool _disposed;
 
@@ -65,6 +71,12 @@ public sealed class ClaudeLimitsService : IDisposable
         ".claude",
         ".credentials.json");
 
+    /// <summary>The official Claude desktop app's config + os_crypt key. The app
+    /// runs Claude Code under this store rather than the CLI credentials file.</summary>
+    public string DesktopConfigPath { get; init; } = DesktopAppCredentials.DefaultConfigPath;
+
+    public string DesktopLocalStatePath { get; init; } = DesktopAppCredentials.DefaultLocalStatePath;
+
     public string AccountStorePath { get; init; } = Path.Combine(AppPaths.DataDirectory, "accounts.json");
 
     /// <summary>Current limits for every known account, the signed-in one first.
@@ -72,7 +84,26 @@ public sealed class ClaudeLimitsService : IDisposable
     public async Task<IReadOnlyList<ClaudeAccountLimits>> FetchAllAsync(CancellationToken cancellationToken = default)
     {
         LoadStore();
-        var activeId = await AdoptCurrentCredentialsAsync(cancellationToken).ConfigureAwait(false);
+        _externallyManaged.Clear();
+
+        // Claude Code signs in from two places: the CLI writes ~/.claude/
+        // .credentials.json, the desktop app keeps its own encrypted store.
+        // Adopt whichever exist; the account "signed in now" is the one whose
+        // source was touched most recently, so the compact strip follows the
+        // surface the user is actually on instead of always the CLI's.
+        var cli = await AdoptCliCredentialsAsync(cancellationToken).ConfigureAwait(false);
+        var desktop = await AdoptDesktopCredentialsAsync(cancellationToken).ConfigureAwait(false);
+        if (cli is { } c)
+        {
+            _externallyManaged.Add(c.Id);
+        }
+
+        if (desktop is { } d)
+        {
+            _externallyManaged.Add(d.Id);
+        }
+
+        var activeId = PickActive(cli, desktop);
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (activeId is not null)
         {
@@ -83,7 +114,7 @@ public sealed class ClaudeLimitsService : IDisposable
         {
             try
             {
-                await UpdateAccountAsync(account, account.Id == activeId, nowMs, cancellationToken)
+                await UpdateAccountAsync(account, nowMs, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch
@@ -137,9 +168,33 @@ public sealed class ClaudeLimitsService : IDisposable
         return results;
     }
 
-    /// <summary>Reads the Claude Code credentials file and folds the signed-in
-    /// account into the store, learning its identity on first sight.</summary>
-    private async Task<string?> AdoptCurrentCredentialsAsync(CancellationToken cancellationToken)
+    /// <summary>An adopted sign-in: the account and how recently its source was
+    /// written, used to decide which of two live sources is "signed in now".</summary>
+    private readonly record struct AdoptedCredential(string Id, long SourceWriteMs);
+
+    /// <summary>Of the CLI and desktop sign-ins, the one whose source was
+    /// touched most recently — both files move on token refresh and on activity,
+    /// so the fresher one tracks the surface in use. A tie favors the desktop
+    /// app (config.json also moves on ordinary UI activity, so a genuine tie
+    /// means the desktop app is at least as live).</summary>
+    private static string? PickActive(AdoptedCredential? cli, AdoptedCredential? desktop)
+    {
+        if (cli is not { } c)
+        {
+            return desktop?.Id;
+        }
+
+        if (desktop is not { } d)
+        {
+            return c.Id;
+        }
+
+        return d.SourceWriteMs >= c.SourceWriteMs ? d.Id : c.Id;
+    }
+
+    /// <summary>Reads the CLI credentials file and folds the signed-in account
+    /// into the store, learning its identity on first sight.</summary>
+    private async Task<AdoptedCredential?> AdoptCliCredentialsAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -160,46 +215,25 @@ public sealed class ClaudeLimitsService : IDisposable
                 return null;
             }
 
-            if (!_tokenOwner.TryGetValue(token, out var id))
-            {
-                var identity = await FetchIdentityAsync(token, cancellationToken).ConfigureAwait(false);
-                if (identity is null)
-                {
-                    // Probably an expired token; Claude Code will refresh the file.
-                    return null;
-                }
-
-                (id, var email, var plan, var tier) = identity.Value;
-                _tokenOwner[token] = id;
-                if (!_accounts.TryGetValue(id, out var known))
-                {
-                    _accounts[id] = known = new StoredAccount { Id = id };
-                }
-
-                known.Email = email;
-                // The profile is authoritative: the credentials file's
-                // subscriptionType has been seen reporting pro for Max accounts.
-                known.Plan = plan ?? known.Plan;
-                known.RateLimitTier = tier ?? known.RateLimitTier;
-            }
-
-            var account = _accounts[id];
-            account.AccessToken = token;
-            var refresh = StringOf(oauth, "refreshToken");
-            if (!string.IsNullOrEmpty(refresh))
-            {
-                account.RefreshToken = refresh;
-            }
-
-            account.ExpiresAtMs = oauth.TryGetProperty("expiresAt", out var expires) &&
-                                  expires.ValueKind == JsonValueKind.Number
+            var expiresAt = oauth.TryGetProperty("expiresAt", out var expires) &&
+                            expires.ValueKind == JsonValueKind.Number
                 ? expires.GetInt64()
-                : account.ExpiresAtMs;
-            account.Plan ??= StringOf(oauth, "subscriptionType");
-            account.RateLimitTier ??= StringOf(oauth, "rateLimitTier");
-            account.LastSeenActiveMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            _refreshFailedAtMs.Remove(id);
-            return id;
+                : (long?)null;
+            var id = await AdoptTokenAsync(
+                token,
+                StringOf(oauth, "refreshToken"),
+                expiresAt,
+                StringOf(oauth, "subscriptionType"),
+                StringOf(oauth, "rateLimitTier"),
+                cancellationToken).ConfigureAwait(false);
+            if (id is null)
+            {
+                return null;
+            }
+
+            var sourceMs = new DateTimeOffset(File.GetLastWriteTimeUtc(CredentialsPath), TimeSpan.Zero)
+                .ToUnixTimeMilliseconds();
+            return new AdoptedCredential(id, sourceMs);
         }
         catch (Exception exception) when (exception is IOException or JsonException or UnauthorizedAccessException)
         {
@@ -207,10 +241,82 @@ public sealed class ClaudeLimitsService : IDisposable
         }
     }
 
+    /// <summary>Reads the official Claude desktop app's Claude Code sign-in and
+    /// folds it into the store the same way, so a desktop-driven machine tracks
+    /// the account it is actually on rather than the CLI's last account.</summary>
+    private async Task<AdoptedCredential?> AdoptDesktopCredentialsAsync(CancellationToken cancellationToken)
+    {
+        var credential = DesktopAppCredentials.TryRead(DesktopConfigPath, DesktopLocalStatePath);
+        if (credential is null)
+        {
+            return null;
+        }
+
+        var id = await AdoptTokenAsync(
+            credential.AccessToken,
+            credential.RefreshToken,
+            credential.ExpiresAtMs,
+            credential.SubscriptionType,
+            credential.RateLimitTier,
+            cancellationToken).ConfigureAwait(false);
+        return id is null ? null : new AdoptedCredential(id, credential.SourceWriteMs);
+    }
+
+    /// <summary>Folds one live token into the store, resolving its account on
+    /// first sight and refreshing the stored token/expiry each time.</summary>
+    private async Task<string?> AdoptTokenAsync(
+        string token,
+        string? refreshToken,
+        long? expiresAtMs,
+        string? subscriptionType,
+        string? rateLimitTier,
+        CancellationToken cancellationToken)
+    {
+        if (!_tokenOwner.TryGetValue(token, out var id))
+        {
+            var identity = await FetchIdentityAsync(token, cancellationToken).ConfigureAwait(false);
+            if (identity is null)
+            {
+                // Probably an expired token; the owning client will refresh it.
+                return null;
+            }
+
+            (id, var email, var plan, var tier) = identity.Value;
+            _tokenOwner[token] = id;
+            if (!_accounts.TryGetValue(id, out var known))
+            {
+                _accounts[id] = known = new StoredAccount { Id = id };
+            }
+
+            known.Email = email;
+            // The profile is authoritative: the stored subscriptionType has been
+            // seen reporting pro for Max accounts.
+            known.Plan = plan ?? known.Plan;
+            known.RateLimitTier = tier ?? known.RateLimitTier;
+        }
+
+        var account = _accounts[id];
+        account.AccessToken = token;
+        if (!string.IsNullOrEmpty(refreshToken))
+        {
+            account.RefreshToken = refreshToken;
+        }
+
+        if (expiresAtMs is { } expiry)
+        {
+            account.ExpiresAtMs = expiry;
+        }
+
+        account.Plan ??= subscriptionType;
+        account.RateLimitTier ??= rateLimitTier;
+        account.LastSeenActiveMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _refreshFailedAtMs.Remove(id);
+        return id;
+    }
+
     /// <summary>Keeps one account's token alive and pulls its current limits.</summary>
     private async Task UpdateAccountAsync(
         StoredAccount account,
-        bool isActive,
         long nowMs,
         CancellationToken cancellationToken)
     {
@@ -230,10 +336,11 @@ public sealed class ClaudeLimitsService : IDisposable
 
         if (nowMs >= account.ExpiresAtMs - 120_000)
         {
-            if (isActive)
+            if (_externallyManaged.Contains(account.Id))
             {
-                // Claude Code owns the active account's tokens; refreshing them
-                // here would race it. The next poll re-reads the file.
+                // A live client (the CLI file or the desktop app) owns this
+                // account's tokens; refreshing here would rotate its refresh
+                // token and log it out. The next poll re-reads from the source.
                 return;
             }
 
