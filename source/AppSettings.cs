@@ -29,6 +29,10 @@ public sealed class AppSettings
 
     public bool HidePersonalData { get; set; }
 
+    public bool ApiServerEnabled { get; set; } = true;
+
+    public int ApiServerPort { get; set; } = LocalApiServer.DefaultPort;
+
     public static AppSettings Load()
     {
         AppPaths.EnsureDataDirectory();

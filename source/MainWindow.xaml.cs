@@ -24,6 +24,7 @@ public partial class MainWindow : Window
     private readonly UsageCollector _collector;
     private readonly ClaudeLimitsService _limitsService = new();
     private readonly TerminalStatusService _terminalsService = new();
+    private readonly LocalApiServer _apiServer;
     private readonly SemaphoreSlim _dashboardLock = new(1, 1);
     private bool _terminalsScanning;
     private bool _loaded;
@@ -34,6 +35,16 @@ public partial class MainWindow : Window
     private DashboardData? _latestData;
     private bool _haveLimits;
     private bool _limitsRefreshing;
+    private bool _sessionRefreshing;
+
+    /// <summary>Id of the account shown in the compact bar — the one the manual
+    /// "refresh from Claude app session" button updates.</summary>
+    private string? _currentAccountId;
+
+    /// <summary>Newest activity seen in any local Claude Code terminal — the
+    /// limits service's proof that the signed-in account's 5-hour window is
+    /// already open before it uses the header-probe fallback.</summary>
+    private DateTimeOffset _lastClaudeActivityUtc = DateTimeOffset.MinValue;
     private bool _heatmapRefreshing;
     private string _heatmapViewKey = "year";
     private string _heatmapMetricKey = "tokens";
@@ -151,6 +162,7 @@ public partial class MainWindow : Window
         _collector.ProgressChanged += Collector_ProgressChanged;
         _collector.DataChanged += Collector_DataChanged;
         _collector.Error += Collector_Error;
+        _apiServer = new LocalApiServer(_database, _pricing);
 
         _rangeKey = NormalizeRangeKey(_settings.SelectedRange);
         RangeRadioFor(_rangeKey).IsChecked = true;
@@ -202,6 +214,13 @@ public partial class MainWindow : Window
         }
 
         PrivacyCheckBox.IsChecked = _settings.HidePersonalData;
+        ApiCheckBox.IsChecked = _settings.ApiServerEnabled;
+        if (_settings.ApiServerEnabled)
+        {
+            _apiServer.Start(_settings.ApiServerPort);
+        }
+
+        UpdateApiStatusText();
         DatabasePathText.Text = $"Local index: {DisplayLocalPath(_database.DatabasePath)}";
 
         // Keeps short ranges live: the window slides and the newest bucket fills in
@@ -223,8 +242,9 @@ public partial class MainWindow : Window
         };
         liveRefresh.Start();
 
-        // Plan limits move slowly and the endpoint is rate-limit-friendly at
-        // this cadence; failures just keep the last snapshot on screen.
+        // The tick only redraws (roll-forward, reset progress) at this rate;
+        // ClaudeLimitsService paces the actual network fetches per account
+        // and backs off when the usage endpoint answers 429.
         var limitsRefresh = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(60)
@@ -254,6 +274,15 @@ public partial class MainWindow : Window
         try
         {
             var terminals = await _terminalsService.ScanAsync(TimeSpan.FromHours(6));
+            _apiServer.UpdateTerminals(terminals);
+            foreach (var terminal in terminals)
+            {
+                if (terminal.App != TerminalApp.Codex && terminal.LastActivity > _lastClaudeActivityUtc)
+                {
+                    _lastClaudeActivityUtc = terminal.LastActivity;
+                }
+            }
+
             if (_disposed)
             {
                 return;
@@ -347,6 +376,30 @@ public partial class MainWindow : Window
         string PathText,
         string Tooltip);
 
+    /// <summary>One line of truth about how live an account's numbers are —
+    /// being signed in no longer hides a feed that can't actually update.</summary>
+    private static string AccountStatusText(ClaudeAccountLimits account)
+    {
+        var status = account.IsActive
+            ? account.Stale
+                ? account.FetchedAt is { } fetched
+                    ? $"signed in to Claude Code now · limits last updated {fetched.LocalDateTime:h:mm tt}"
+                    : "signed in to Claude Code now · limits not fetched yet"
+                : "signed in to Claude Code now"
+            : account.Stale
+                ? account.FetchedAt is { } reached
+                    ? $"stale — last reached {reached.LocalDateTime:h:mm tt}, updates on its next sign-in"
+                    : "stale — waiting for its next sign-in"
+                : "tracked in the background";
+
+        // An open cooldown always shows, even while header probes keep the
+        // headline numbers fresh — it is the reason the model-scoped rows
+        // are frozen, and hiding it made the feed look silently broken.
+        return account.CooldownUntil is { } cooldown
+            ? $"{status} · rate limited by Anthropic — full refresh {cooldown.LocalDateTime:h:mm tt}"
+            : status;
+    }
+
     private async Task RefreshLimitsAsync()
     {
         if (_limitsRefreshing)
@@ -366,7 +419,9 @@ public partial class MainWindow : Window
                 // Keep the last drawn grid; the next tick retries.
             }
 
-            var accounts = await _limitsService.FetchAllAsync();
+            var accounts = await _limitsService.FetchAllAsync(
+                _lastClaudeActivityUtc > DateTimeOffset.UtcNow.AddMinutes(-10));
+            _apiServer.UpdateLimits(accounts);
             if (_disposed)
             {
                 return;
@@ -391,8 +446,24 @@ public partial class MainWindow : Window
             // The compact top bar mirrors whichever account Claude Code is
             // signed into right now; the limits page lists every account.
             var current = accounts.FirstOrDefault(account => account.IsActive) ?? accounts[0];
+            _currentAccountId = current.Id;
             var currentEmail = DisplayEmail(current.Email);
             LimitsBarAccount.Text = ShortAccountName(currentEmail);
+            var dataAgeNote = current.Stale || current.CooldownUntil is not null
+                ? current.FetchedAt is { } fetchedAt
+                    ? $" · data from {fetchedAt.LocalDateTime:h:mm tt}"
+                    : " · awaiting first fetch"
+                : "";
+
+            // The model-scoped rows only update on full usage snapshots; while
+            // header probes keep the headline rows fresher, say when the
+            // scoped numbers were actually taken instead of implying they are
+            // as live as the rest.
+            var scopedAgeNote = current.SnapshotAt is { } snapshot &&
+                                current.FetchedAt is { } freshest &&
+                                freshest - snapshot > TimeSpan.FromMinutes(20)
+                ? $" · data from {snapshot.LocalDateTime:h:mm tt}"
+                : dataAgeNote;
             LimitsPanel.ItemsSource = current.Limits.Select(limit =>
             {
                 var elevated = limit.Severity is "critical" or "warning" || limit.Percent >= 70;
@@ -408,7 +479,8 @@ public partial class MainWindow : Window
                     elevated ? barBrush : (Brush)FindResource("InkBrush"),
                     resets,
                     $"{currentEmail} · {LimitTitle(limit.Label)} — {limit.Percent:0}% used" +
-                    (resets.Length > 0 ? $" · {resets}" : ""));
+                    (resets.Length > 0 ? $" · {resets}" : "") +
+                    (limit.Label is "5h" or "Week" ? dataAgeNote : scopedAgeNote));
             }).ToList();
             LimitsStrip.Visibility = Visibility.Visible;
 
@@ -439,13 +511,7 @@ public partial class MainWindow : Window
             LimitsDetailList.ItemsSource = accounts.Select(account => new AccountVm(
                 DisplayEmail(account.Email),
                 PlanLabel(account.Plan, account.RateLimitTier),
-                account.IsActive
-                    ? "signed in to Claude Code now"
-                    : account.Stale
-                        ? account.FetchedAt is { } fetched
-                            ? $"stale — last reached {fetched.LocalDateTime:h:mm tt}, updates on its next sign-in"
-                            : "stale — waiting for its next sign-in"
-                        : "tracked in the background",
+                AccountStatusText(account),
                 account.IsActive ? (Brush)FindResource("AccentBrush") : (Brush)FindResource("MutedBrush"),
                 usageTexts.GetValueOrDefault(account.Id, ""),
                 account.Limits.Select(limit =>
@@ -480,9 +546,13 @@ public partial class MainWindow : Window
                         resetTooltip);
                 }).ToList())).ToList();
 
+            // The stamp reflects the data's age, not this render's, so a feed
+            // that can't fetch (rate limited, offline) doesn't claim freshness.
+            var lastFetch = accounts.Max(account => account.FetchedAt);
             LimitsPageSubtitle.Text =
                 $"{accounts.Count} {(accounts.Count == 1 ? "account" : "accounts")} · " +
-                $"the same numbers Claude Code shows under /usage · updated {DateTime.Now:h:mm tt}";
+                $"the same numbers Claude Code shows under /usage · " +
+                (lastFetch is { } at ? $"updated {at.LocalDateTime:h:mm tt}" : "no successful update yet");
         }
         finally
         {
@@ -923,6 +993,76 @@ public partial class MainWindow : Window
         DatabasePathText.Text = $"Local index: {DisplayLocalPath(_database.DatabasePath)}";
         _ = RefreshLimitsAsync();
         _ = RefreshTerminalsAsync();
+    }
+
+    private async void SessionRefreshButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_sessionRefreshing)
+        {
+            return;
+        }
+
+        _sessionRefreshing = true;
+        SessionRefreshButton.IsEnabled = false;
+        SessionRefreshStatus.Visibility = Visibility.Visible;
+        SessionRefreshStatus.Foreground = (Brush)FindResource("MutedBrush");
+        SessionRefreshStatus.Text = "Reading the Claude app session…";
+        try
+        {
+            var status = await _limitsService.RefreshFromSessionAsync(_currentAccountId ?? "");
+            if (_disposed)
+            {
+                return;
+            }
+
+            // Repaint straight from the store — the session refresh already wrote
+            // the fresh limits, and FetchAllAsync returns them without touching
+            // the throttled usage endpoint.
+            await RefreshLimitsAsync();
+            SessionRefreshStatus.Foreground = status.StartsWith("Updated", StringComparison.Ordinal)
+                ? (Brush)FindResource("InkBrush")
+                : (Brush)FindResource("MutedBrush");
+            SessionRefreshStatus.Text = status;
+        }
+        catch
+        {
+            SessionRefreshStatus.Text = "Couldn't refresh from the Claude app session.";
+        }
+        finally
+        {
+            _sessionRefreshing = false;
+            SessionRefreshButton.IsEnabled = true;
+        }
+    }
+
+    private void ApiCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _settings.ApiServerEnabled = ApiCheckBox.IsChecked == true;
+        _settings.Save();
+        if (_settings.ApiServerEnabled)
+        {
+            _apiServer.Start(_settings.ApiServerPort);
+        }
+        else
+        {
+            _apiServer.Stop();
+        }
+
+        UpdateApiStatusText();
+    }
+
+    private void UpdateApiStatusText()
+    {
+        ApiStatusText.Text = _apiServer.IsRunning
+            ? $"Serving http://localhost:{_apiServer.Port}/api — see docs/local-api.md"
+            : _apiServer.Error is { } error
+                ? $"API not running: {error}"
+                : "API off — other apps can't read this data.";
     }
 
     /// <summary>The part before the @, so the top bar stays compact.</summary>
@@ -3292,6 +3432,7 @@ public partial class MainWindow : Window
             _disposed = true;
             _collector.Dispose();
             _limitsService.Dispose();
+            _apiServer.Dispose();
         }
     }
 

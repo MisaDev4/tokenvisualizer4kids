@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -18,6 +20,8 @@ public sealed record ClaudeAccountLimits(
     bool IsActive,
     bool Stale,
     DateTimeOffset? FetchedAt,
+    DateTimeOffset? SnapshotAt,
+    DateTimeOffset? CooldownUntil,
     IReadOnlyList<ClaudeLimit> Limits);
 
 /// <summary>
@@ -34,16 +38,52 @@ public sealed class ClaudeLimitsService : IDisposable
     private static readonly Uri UsageEndpoint = new("https://api.anthropic.com/api/oauth/usage");
     private static readonly Uri ProfileEndpoint = new("https://api.anthropic.com/api/oauth/profile");
     private static readonly Uri TokenEndpoint = new("https://console.anthropic.com/v1/oauth/token");
+    private static readonly Uri MessagesEndpoint = new("https://api.anthropic.com/v1/messages");
 
     // Claude Code's public OAuth client id (PKCE public client, no secret) —
     // required for the refresh grant that keeps signed-out accounts readable.
     private const string ClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-    /// <summary>An account with no successful fetch in this long is shown stale.</summary>
-    private const long StaleAfterMs = 180_000;
+    /// <summary>The usage endpoint has a small per-account quota that the
+    /// signed-in account's own client (the CLI or the desktop app) is also
+    /// spending — polling it every few minutes trips that quota and the 429
+    /// cooldown then freezes the model-scoped rows the endpoint alone can
+    /// report. So full snapshots are paced gently for every account…</summary>
+    private const long UsageFetchIntervalMs = 1_800_000;
+
+    /// <summary>…while the signed-in account's headline 5h/weekly numbers stay
+    /// live between snapshots via the rate-limit headers on a minimal message
+    /// call, which spends no usage-endpoint quota at all.</summary>
+    private const long ProbeIntervalMs = 180_000;
+
+    /// <summary>A 429's Retry-After is trusted between these bounds; rejected
+    /// requests keep the window closed, so sitting the whole period out is the
+    /// only way back in.</summary>
+    private const long MinCooldownMs = 60_000;
+    private const long MaxCooldownMs = 7_200_000;
+
+    /// <summary>Consecutive 429s double the wait, up to this cap. Observed in
+    /// the wild: a single retry a full hour after the previous one still gets
+    /// 429 + Retry-After 3600, so the server's stated wait alone never drains
+    /// the account's quota — only progressively longer silence does.</summary>
+    private const long MaxEscalatedCooldownMs = 28_800_000;
+
+    /// <summary>An account with no successful fetch in this long is shown
+    /// stale — measured against its own cadence so a gently-polled background
+    /// account doesn't read as broken. Full snapshots run every 30 minutes
+    /// (probes in between only while busy), so healthy is anything within one
+    /// snapshot interval and change.</summary>
+    private const long ActiveStaleMs = 2_400_000;
+    private const long BackgroundStaleMs = 4_200_000;
 
     /// <summary>A failed token refresh is not retried for this long.</summary>
     private const long RefreshRetryMs = 900_000;
+
+    /// <summary>A snapshot that failed without a Retry-After (401, 5xx, network)
+    /// waits this long before retrying. Without this, snapshotDue stays true and
+    /// the 60 s tick hammers the endpoint — which is exactly how the edge rate
+    /// limit that froze the feed gets re-tripped.</summary>
+    private const long SnapshotRetryMs = 300_000;
 
     /// <summary>Polls run every ~60 s; a quiet stretch under this still counts
     /// as the same continuous sign-in when building the attribution timeline.</summary>
@@ -52,11 +92,21 @@ public sealed class ClaudeLimitsService : IDisposable
     /// <summary>Sign-in history older than this is dropped.</summary>
     private const long TimelineKeepMs = 30L * 86_400_000;
 
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly HttpClient _http = CreateHttp();
+
+    /// <summary>Requests without a User-Agent are the first thing an edge WAF
+    /// throttles; identify honestly instead of arriving anonymous.</summary>
+    private static HttpClient CreateHttp()
+    {
+        var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("TokenTracker/1.0");
+        return http;
+    }
     private readonly List<ActiveSpan> _timeline = [];
     private readonly Dictionary<string, StoredAccount> _accounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _tokenOwner = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _refreshFailedAtMs = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _snapshotFailedAtMs = new(StringComparer.Ordinal);
 
     /// <summary>Accounts whose tokens a live client (the CLI credentials file or
     /// the desktop app) is managing right now. We re-read their tokens from that
@@ -80,8 +130,13 @@ public sealed class ClaudeLimitsService : IDisposable
     public string AccountStorePath { get; init; } = Path.Combine(AppPaths.DataDirectory, "accounts.json");
 
     /// <summary>Current limits for every known account, the signed-in one first.
-    /// Empty when no account has ever been seen (no Claude Code sign-in).</summary>
-    public async Task<IReadOnlyList<ClaudeAccountLimits>> FetchAllAsync(CancellationToken cancellationToken = default)
+    /// Empty when no account has ever been seen (no Claude Code sign-in).
+    /// <paramref name="activeAccountBusy"/> says local Claude Code activity was
+    /// seen in the last few minutes — proof the signed-in account's 5-hour
+    /// window is already running, which licenses the header-probe fallback.</summary>
+    public async Task<IReadOnlyList<ClaudeAccountLimits>> FetchAllAsync(
+        bool activeAccountBusy = false,
+        CancellationToken cancellationToken = default)
     {
         LoadStore();
         _externallyManaged.Clear();
@@ -114,7 +169,12 @@ public sealed class ClaudeLimitsService : IDisposable
         {
             try
             {
-                await UpdateAccountAsync(account, nowMs, cancellationToken)
+                await UpdateAccountAsync(
+                        account,
+                        account.Id == activeId,
+                        activeAccountBusy,
+                        nowMs,
+                        cancellationToken)
                     .ConfigureAwait(false);
             }
             catch
@@ -129,6 +189,59 @@ public sealed class ClaudeLimitsService : IDisposable
             .ThenBy(account => account.Email, StringComparer.OrdinalIgnoreCase)
             .Select(account => ToResult(account, account.Id == activeId, nowMs))
             .ToList();
+    }
+
+    /// <summary>
+    /// Refreshes one account's limits from the Claude desktop app's claude.ai
+    /// session instead of the OAuth usage endpoint — the manual fallback for when
+    /// that endpoint is throttled. It returns the full limit set, model-scoped
+    /// weekly rows included, so on success it counts as a full snapshot and
+    /// clears any cooldown. User-invoked only; the caller passes the account
+    /// currently shown so the numbers land on the right one.
+    /// </summary>
+    public async Task<string> RefreshFromSessionAsync(
+        string accountId,
+        CancellationToken cancellationToken = default)
+    {
+        LoadStore();
+        var result = await new ClaudeSessionUsage().FetchAsync(cancellationToken).ConfigureAwait(false);
+        if (!result.Success || result.Json is null)
+        {
+            return result.Status;
+        }
+
+        List<StoredLimit>? limits;
+        try
+        {
+            using var document = JsonDocument.Parse(result.Json);
+            limits = ParseLimits(document.RootElement);
+        }
+        catch (JsonException)
+        {
+            return "claude.ai sent an unexpected response.";
+        }
+
+        if (limits is null)
+        {
+            return "claude.ai returned no limits for this account.";
+        }
+
+        // Prefer the account whose org matches the session; fall back to the one
+        // the caller is showing so a match failure still updates something sane.
+        var target = _accounts.TryGetValue(accountId, out var shown) ? shown : null;
+        target ??= _accounts.Values.FirstOrDefault();
+        if (target is null)
+        {
+            return "No known account to update.";
+        }
+
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        target.Limits = limits;
+        target.LastFetchedMs = target.LastSnapshotMs = nowMs;
+        target.CooldownUntilMs = 0;
+        target.Consecutive429s = 0;
+        SaveStore();
+        return result.Status;
     }
 
     /// <summary>Extends the sign-in timeline used to attribute local usage to
@@ -317,9 +430,35 @@ public sealed class ClaudeLimitsService : IDisposable
     /// <summary>Keeps one account's token alive and pulls its current limits.</summary>
     private async Task UpdateAccountAsync(
         StoredAccount account,
+        bool isActive,
+        bool activeAccountBusy,
         long nowMs,
         CancellationToken cancellationToken)
     {
+        // The usage endpoint is the only source of the model-scoped weekly
+        // rows, but its quota is easy to trip and every rejected retry keeps
+        // the window closed — so full snapshots run on a gentle cadence and
+        // never while a 429 cooldown is open. In between, the signed-in
+        // account keeps its 5h and weekly numbers live from the rate-limit
+        // headers that ride on an ordinary API call — but only while local
+        // activity shows its 5-hour window is already running, so the
+        // tracker never starts an idle window itself.
+        var snapshotDue = nowMs >= account.CooldownUntilMs &&
+                          account.LastSnapshotMs <= nowMs - UsageFetchIntervalMs &&
+                          !(_snapshotFailedAtMs.TryGetValue(account.Id, out var failedAtMs) &&
+                            nowMs - failedAtMs < SnapshotRetryMs);
+        if (!snapshotDue)
+        {
+            if (isActive && activeAccountBusy &&
+                account.LastFetchedMs <= nowMs - ProbeIntervalMs &&
+                nowMs < account.ExpiresAtMs - 120_000)
+            {
+                await ProbeLimitsFromHeadersAsync(account, cancellationToken).ConfigureAwait(false);
+            }
+
+            return;
+        }
+
         // Accounts adopted before tiers were tracked backfill theirs once.
         if (account.RateLimitTier is null && !string.IsNullOrEmpty(account.AccessToken) &&
             nowMs < account.ExpiresAtMs - 120_000)
@@ -359,11 +498,30 @@ public sealed class ClaudeLimitsService : IDisposable
             _refreshFailedAtMs.Remove(account.Id);
         }
 
-        var limits = await FetchLimitsAsync(account.AccessToken, cancellationToken).ConfigureAwait(false);
+        var (limits, retryAfter) = await FetchLimitsAsync(account.AccessToken, cancellationToken).ConfigureAwait(false);
+        if (retryAfter is { } wait)
+        {
+            // Sit out the server's stated window plus jitter — and double it
+            // for every consecutive rejection, because the stated window has
+            // been observed to renew itself forever when retries land hourly.
+            account.Consecutive429s = Math.Min(account.Consecutive429s + 1, 6);
+            var stated = Math.Clamp((long)wait.TotalMilliseconds, MinCooldownMs, MaxCooldownMs);
+            var escalated = Math.Min(stated << (account.Consecutive429s - 1), MaxEscalatedCooldownMs);
+            account.CooldownUntilMs = nowMs + escalated + Random.Shared.Next(15_000, 60_000);
+            return;
+        }
+
         if (limits is not null)
         {
             account.Limits = limits;
-            account.LastFetchedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            account.LastFetchedMs = account.LastSnapshotMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            account.CooldownUntilMs = 0;
+            account.Consecutive429s = 0;
+            _snapshotFailedAtMs.Remove(account.Id);
+        }
+        else
+        {
+            _snapshotFailedAtMs[account.Id] = nowMs;
         }
     }
 
@@ -384,6 +542,15 @@ public sealed class ClaudeLimitsService : IDisposable
             using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
+                // A throttled token endpoint gets the same hands-off treatment
+                // as a throttled usage endpoint.
+                if (response.StatusCode == HttpStatusCode.TooManyRequests &&
+                    response.Headers.RetryAfter is { Delta: { } delta })
+                {
+                    account.CooldownUntilMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() +
+                        Math.Clamp((long)delta.TotalMilliseconds, MinCooldownMs, MaxCooldownMs);
+                }
+
                 return false;
             }
 
@@ -407,6 +574,12 @@ public sealed class ClaudeLimitsService : IDisposable
                                   expiresIn.ValueKind == JsonValueKind.Number
                 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + expiresIn.GetInt64() * 1000
                 : account.ExpiresAtMs;
+
+            // The refresh grant just rotated this account's refresh token
+            // server-side; persist it now. Losing it to a mid-poll shutdown
+            // (the rebuild script kills the process) invalidates the account
+            // until its next sign-in.
+            SaveStore();
             return true;
         }
         catch (Exception exception) when (exception is HttpRequestException or JsonException or TaskCanceledException)
@@ -458,26 +631,122 @@ public sealed class ClaudeLimitsService : IDisposable
     private static bool BoolOf(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
 
-    private async Task<List<StoredLimit>?> FetchLimitsAsync(string token, CancellationToken cancellationToken)
+    private async Task<(List<StoredLimit>? Limits, TimeSpan? RetryAfter)> FetchLimitsAsync(
+        string token,
+        CancellationToken cancellationToken)
     {
         try
         {
             using var request = AuthorizedGet(UsageEndpoint, token);
             using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var retryAfter = response.Headers.RetryAfter switch
+                {
+                    { Delta: { } delta } => delta,
+                    { Date: { } date } => date - DateTimeOffset.UtcNow,
+                    _ => TimeSpan.FromMilliseconds(UsageFetchIntervalMs)
+                };
+                return (null, retryAfter);
+            }
+
             if (!response.IsSuccessStatusCode)
             {
-                return null;
+                return (null, null);
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             using var document = await JsonDocument.ParseAsync(stream, default, cancellationToken).ConfigureAwait(false);
-            return ParseLimits(document.RootElement);
+            return (ParseLimits(document.RootElement), null);
         }
         catch (Exception exception) when (exception is HttpRequestException or JsonException or TaskCanceledException)
         {
-            return null;
+            return (null, null);
         }
     }
+
+    /// <summary>
+    /// Keeps the headline numbers live between full snapshots (and through
+    /// usage-endpoint cooldowns): every /v1/messages response carries
+    /// anthropic-ratelimit-unified-* headers with the account's live 5-hour
+    /// and weekly utilization, so a minimal one-token request reads the two
+    /// headline limits at negligible cost. Model-scoped weekly limits are not
+    /// in the headers; those keep their last full snapshot.
+    /// </summary>
+    private async Task ProbeLimitsFromHeadersAsync(StoredAccount account, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, MessagesEndpoint);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", account.AccessToken);
+            request.Headers.Add("anthropic-beta", "oauth-2025-04-20");
+            request.Headers.Add("anthropic-version", "2023-06-01");
+            request.Content = new StringContent(
+                """{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"."}]}""",
+                Encoding.UTF8,
+                "application/json");
+            using var response = await _http
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return;
+            }
+
+            var updated = ApplyHeaderLimit(account, response, "5h", "5h", insertAt: 0);
+            updated |= ApplyHeaderLimit(account, response, "7d", "Week", insertAt: 1);
+            if (updated)
+            {
+                account.LastFetchedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        {
+        }
+    }
+
+    /// <summary>Folds one unified rate-limit header pair (utilization + reset)
+    /// into the account's stored limits; true when the header was present.</summary>
+    private static bool ApplyHeaderLimit(
+        StoredAccount account,
+        HttpResponseMessage response,
+        string headerWindow,
+        string label,
+        int insertAt)
+    {
+        var utilization = HeaderOf(response, $"anthropic-ratelimit-unified-{headerWindow}-utilization");
+        if (utilization is null ||
+            !double.TryParse(utilization, NumberStyles.Float, CultureInfo.InvariantCulture, out var fraction))
+        {
+            return false;
+        }
+
+        var status = HeaderOf(response, $"anthropic-ratelimit-unified-{headerWindow}-status") ?? "";
+        string? resetsAt = null;
+        if (long.TryParse(
+                HeaderOf(response, $"anthropic-ratelimit-unified-{headerWindow}-reset"),
+                out var resetEpochSeconds))
+        {
+            resetsAt = DateTimeOffset.FromUnixTimeSeconds(resetEpochSeconds).ToString("O");
+        }
+
+        var limit = account.Limits.FirstOrDefault(entry => entry.Label == label);
+        if (limit is null)
+        {
+            limit = new StoredLimit { Label = label };
+            account.Limits.Insert(Math.Min(insertAt, account.Limits.Count), limit);
+        }
+
+        limit.Percent = fraction * 100;
+        limit.ResetsAt = resetsAt;
+        limit.Severity = status.Contains("reject") ? "critical"
+            : status.Contains("warn") ? "warning"
+            : "normal";
+        return true;
+    }
+
+    private static string? HeaderOf(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
 
     private static HttpRequestMessage AuthorizedGet(Uri endpoint, string token)
     {
@@ -537,8 +806,10 @@ public sealed class ClaudeLimitsService : IDisposable
         account.Plan,
         account.RateLimitTier,
         isActive,
-        account.LastFetchedMs < nowMs - StaleAfterMs,
+        account.LastFetchedMs < nowMs - (isActive ? ActiveStaleMs : BackgroundStaleMs),
         account.LastFetchedMs > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(account.LastFetchedMs) : null,
+        account.LastSnapshotMs > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(account.LastSnapshotMs) : null,
+        account.CooldownUntilMs > nowMs ? DateTimeOffset.FromUnixTimeMilliseconds(account.CooldownUntilMs) : null,
         account.Limits
             .Select(limit => RollForward(limit, DateTimeOffset.FromUnixTimeMilliseconds(nowMs)))
             .ToList());
@@ -662,7 +933,20 @@ internal sealed class StoredAccount
     public string? RefreshToken { get; set; }
     public long ExpiresAtMs { get; set; }
     public long LastSeenActiveMs { get; set; }
+
+    /// <summary>Last successful update from any source (headers or snapshot).</summary>
     public long LastFetchedMs { get; set; }
+
+    /// <summary>Last successful full usage-endpoint snapshot — the only source
+    /// of the model-scoped weekly rows, so it paces that endpoint.</summary>
+    public long LastSnapshotMs { get; set; }
+
+    /// <summary>Until when the usage endpoint told us to stop asking (429).</summary>
+    public long CooldownUntilMs { get; set; }
+
+    /// <summary>Unbroken run of 429s from the usage endpoint; drives the
+    /// escalating cooldown and resets on the first successful snapshot.</summary>
+    public int Consecutive429s { get; set; }
     public List<StoredLimit> Limits { get; set; } = [];
 }
 

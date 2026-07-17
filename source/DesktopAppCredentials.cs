@@ -123,8 +123,9 @@ public static class DesktopAppCredentials
     }
 
     /// <summary>The 32-byte AES key Chromium/Electron uses for "v10" values,
-    /// stored DPAPI-wrapped (with a "DPAPI" prefix) in the app's Local State.</summary>
-    private static byte[]? ReadOsCryptKey(string localStatePath)
+    /// stored DPAPI-wrapped (with a "DPAPI" prefix) in the app's Local State.
+    /// Internal so the cookie-session reader can reuse the same key.</summary>
+    internal static byte[]? ReadOsCryptKey(string localStatePath)
     {
         using var document = JsonDocument.Parse(File.ReadAllText(localStatePath));
         if (!document.RootElement.TryGetProperty("os_crypt", out var osCrypt) ||
@@ -166,6 +167,57 @@ public static class DesktopAppCredentials
         using var aes = new AesGcm(key, tagLength);
         aes.Decrypt(nonce, cipher, tag, plaintext);
         return Encoding.UTF8.GetString(plaintext);
+    }
+
+    /// <summary>Decrypts a Chromium cookie <c>encrypted_value</c> BLOB (the same
+    /// "v10"/"v11" AES-256-GCM scheme as os_crypt, but raw bytes rather than
+    /// base64). Newer Chromium prepends a 32-byte SHA-256 of the cookie's domain
+    /// to the plaintext; that is stripped when present. Null for legacy DPAPI
+    /// values or anything that won't decrypt.</summary>
+    internal static string? DecryptCookieValue(byte[] raw, byte[] key)
+    {
+        const int prefixLength = 3;   // "v10" / "v11"
+        const int nonceLength = 12;
+        const int tagLength = 16;
+        if (raw.Length < prefixLength + nonceLength + tagLength)
+        {
+            return null;
+        }
+
+        var scheme = Encoding.ASCII.GetString(raw, 0, prefixLength);
+        if (scheme is not ("v10" or "v11"))
+        {
+            return null;
+        }
+
+        var nonce = raw[prefixLength..(prefixLength + nonceLength)];
+        var cipher = raw[(prefixLength + nonceLength)..^tagLength];
+        var tag = raw[^tagLength..];
+        var plaintext = new byte[cipher.Length];
+        using var aes = new AesGcm(key, tagLength);
+        aes.Decrypt(nonce, cipher, tag, plaintext);
+
+        // A leading non-printable run means the 32-byte domain hash is present.
+        if (plaintext.Length >= 32 && !StartsPrintable(plaintext))
+        {
+            return Encoding.UTF8.GetString(plaintext, 32, plaintext.Length - 32);
+        }
+
+        return Encoding.UTF8.GetString(plaintext);
+    }
+
+    private static bool StartsPrintable(byte[] bytes)
+    {
+        var count = Math.Min(4, bytes.Length);
+        for (var i = 0; i < count; i++)
+        {
+            if (bytes[i] is < 0x20 or > 0x7e)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string? StringOf(JsonElement element, string name) =>

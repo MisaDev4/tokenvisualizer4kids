@@ -34,7 +34,7 @@ Ultra real time: every response drops into the cup as a block within about a sec
 
 Your Claude plan rate limits — the same numbers Claude Code shows under `/usage`: the 5-hour session window, the weekly all-models window, and per-model weekly windows, each with a severity-colored usage bar, a reset countdown, and a thin companion bar showing how far through the window you are. Each account card also names its exact plan tier (Max 5x · $100/mo vs Max 20x · $200/mo), which `/usage` doesn't show. If several Claude accounts sign into Claude Code on this machine, each one gets its own card and keeps updating in the background between sign-ins; an account that can no longer be fetched never shows stale numbers — once a window's reset time passes, its bar rolls forward to zero. Each card also shows how much local usage is attributed to that account over the last 7 days: transcripts carry no account identity, so the app records which account is signed in as it polls and attributes events by when they landed — accurate whenever the tracker was running, unknowable for periods it wasn't. A compact copy of the signed-in account's meters lives in the status strip on every tab; click it to jump here.
 
-Above the account cards, a **Daily activity** grid maps a year of local usage GitHub-style — one cell per day, all clients combined, colored on a log-scaled blue-to-red ramp anchored to your biggest day, so only that day burns deep red. **Year** shows all twelve months at a glance; **Detail** enlarges recent months and prints each day's total on its cell. Both views switch between tokens and cost, and hovering any cell breaks the day down.
+Below the account cards, a **Daily activity** grid maps a year of local usage GitHub-style — one cell per day, all clients combined, colored on a log-scaled blue-to-red ramp anchored to your biggest day, so only that day burns deep red. **Year** shows all twelve months at a glance; **Detail** enlarges recent months and prints each day's total on its cell. Both views switch between tokens and cost, and hovering any cell breaks the day down.
 
 ## Data sources
 
@@ -45,6 +45,10 @@ The app reads local logs only:
 - AI-bench trial streams (Claude Code against AWS Bedrock inside Docker sandboxes) from `Desktop\master\production\bench-results`, shown under the `bedrock` provider
 
 A background watcher picks up new events within about a second, and a periodic reconcile catches anything the watcher missed. **Full rescan / repair** in Settings rebuilds the index from scratch.
+
+## Local API
+
+While the app runs it serves everything it knows — dashboard aggregates, the live event feed, per-day totals, plan limits, terminal states — as read-only JSON at `http://localhost:5299/api`, so your own scripts and apps can build on the same data. Loopback only, GET only, toggleable in Settings. Endpoints, response shapes, and client examples are documented in [docs/local-api.md](docs/local-api.md).
 
 ## What gets stored, and where
 

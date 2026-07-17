@@ -160,6 +160,11 @@
               <CheckBox x:Name="PrivacyCheckBox" Content="Hide personal data" Margin="0,10,0,0"
                         ToolTip="Swap account emails, project names and folder paths for placeholders wherever they appear — for screenshots and screen shares. Display only; nothing stored changes."
                         Checked="PrivacyCheckBox_Changed" Unchecked="PrivacyCheckBox_Changed" />
+              <CheckBox x:Name="ApiCheckBox" Content="Local API for other apps" Margin="0,10,0,0"
+                        ToolTip="Serve this app's data as read-only JSON at http://localhost:5299/api so other programs on this PC can use it. Loopback only — nothing is reachable from the network. See docs/local-api.md."
+                        Checked="ApiCheckBox_Changed" Unchecked="ApiCheckBox_Changed" />
+              <TextBlock x:Name="ApiStatusText" FontSize="11" Foreground="{StaticResource MutedBrush}"
+                         TextWrapping="Wrap" Margin="0,4,0,0" />
               <Button x:Name="FullRescanButton" Content="Full rescan / repair" Margin="0,16,0,0"
                       HorizontalAlignment="Stretch"
                       ToolTip="Re-read every available log and repair the local index."
@@ -600,22 +605,102 @@
       </Border>
     </Grid>
 
-    <!-- ═══ Limits page: one big card per plan limit ═══ -->
+    <!-- ═══ Limits page: a compact card per account, then the activity heatmap ═══ -->
     <Grid x:Name="LimitsRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
       <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
                     Focusable="False" BorderThickness="0" Padding="0">
         <StackPanel MaxWidth="860" HorizontalAlignment="Center">
           <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
-            <StackPanel>
-              <TextBlock Text="Claude usage limits" FontSize="18" FontWeight="SemiBold"
-                         Foreground="{StaticResource InkBrush}" />
-              <TextBlock x:Name="LimitsPageSubtitle" FontSize="12"
-                         Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
-                         Text="The same numbers Claude Code shows under /usage." />
-            </StackPanel>
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="0">
+                <TextBlock Text="Claude usage limits" FontSize="18" FontWeight="SemiBold"
+                           Foreground="{StaticResource InkBrush}" />
+                <TextBlock x:Name="LimitsPageSubtitle" FontSize="12"
+                           Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
+                           Text="The same numbers Claude Code shows under /usage." />
+                <TextBlock x:Name="SessionRefreshStatus" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"
+                           Visibility="Collapsed" />
+              </StackPanel>
+              <Button x:Name="SessionRefreshButton" Grid.Column="1" Content="Refresh from Claude app"
+                      VerticalAlignment="Top" Margin="16,2,0,0" Padding="12,6"
+                      Click="SessionRefreshButton_Click"
+                      ToolTip="Fetch limits through the Claude desktop app's claude.ai session — a separate rate limit that keeps working (and uniquely reports the per-model weekly rows) when the usage endpoint is throttled. Quit the Claude desktop app first; it locks its cookie store while running. Reads the session locally, once." />
+            </Grid>
           </Border>
+          <ItemsControl x:Name="LimitsDetailList" Grid.IsSharedSizeScope="True">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <!-- One compact card per Claude account: a one-line header, then one line per limit. -->
+                <Border Style="{StaticResource Card}" Padding="24,12" Margin="0,0,0,10">
+                  <StackPanel>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Email}" FontSize="14" FontWeight="SemiBold"
+                                 Foreground="{StaticResource InkBrush}" VerticalAlignment="Center" />
+                      <TextBlock Grid.Column="1" Text="{Binding StatusText}" FontSize="11"
+                                 Foreground="{Binding StatusBrush}" Margin="10,1,0,0"
+                                 VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Grid.Column="2" Text="{Binding PlanText}" FontSize="12"
+                                 FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
+                                 VerticalAlignment="Center" Margin="16,0,0,0" />
+                    </Grid>
+                    <TextBlock Text="{Binding UsageText}" FontSize="11"
+                               Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                               TextTrimming="CharacterEllipsis"
+                               ToolTip="Estimated from local logs: usage that landed while this account was the one signed into Claude Code. Attribution is only as complete as the time the tracker has been running." />
+                    <ItemsControl ItemsSource="{Binding Limits}" Margin="0,2,0,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <Grid Margin="0,7,0,0">
+                            <Grid.ColumnDefinitions>
+                              <ColumnDefinition Width="Auto" SharedSizeGroup="LimitTitle" />
+                              <ColumnDefinition Width="*" />
+                              <ColumnDefinition Width="250" />
+                              <ColumnDefinition Width="Auto" SharedSizeGroup="LimitPercent" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding Title}" FontSize="12" FontWeight="SemiBold"
+                                       Foreground="{StaticResource InkBrush}" VerticalAlignment="Center" />
+                            <TextBlock Grid.Column="1" Text="{Binding ResetText}" FontSize="11"
+                                       Foreground="{StaticResource MutedBrush}" Margin="12,1,12,0"
+                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                       ToolTip="{Binding ResetText}" />
+                            <StackPanel Grid.Column="2" VerticalAlignment="Center">
+                              <ProgressBar Style="{StaticResource ShareBar}" Height="6"
+                                           Value="{Binding Share, Mode=OneWay}" Foreground="{Binding BarBrush}" />
+                              <!-- Thin companion bar: progress through the window, i.e. how close the reset is. -->
+                              <ProgressBar Style="{StaticResource ShareBar}" Height="2"
+                                           Value="{Binding ResetShare, Mode=OneWay}"
+                                           Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                                           Visibility="{Binding ResetVisibility}"
+                                           ToolTip="{Binding ResetTooltip}" />
+                            </StackPanel>
+                            <TextBlock Grid.Column="3" Text="{Binding PercentText}" FontSize="13"
+                                       FontWeight="SemiBold" Foreground="{Binding PercentBrush}"
+                                       VerticalAlignment="Center" Margin="12,0,0,0"
+                                       MinWidth="38" TextAlignment="Right" />
+                          </Grid>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock x:Name="LimitsPageEmpty" FontSize="13" Foreground="{StaticResource MutedBrush}"
+                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,12,0,26" Visibility="Collapsed"
+                     Text="No limit data yet. Sign in to Claude Code on this machine and the limits will appear here within a minute." />
           <!-- Daily activity: a GitHub-style year of local usage, one cell per day. -->
-          <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+          <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,4,0,14">
             <StackPanel>
               <Grid>
                 <Grid.ColumnDefinitions>
@@ -657,71 +742,6 @@
               <Canvas x:Name="HeatmapCanvas" Margin="0,16,0,0" HorizontalAlignment="Left" />
             </StackPanel>
           </Border>
-          <ItemsControl x:Name="LimitsDetailList">
-            <ItemsControl.ItemTemplate>
-              <DataTemplate>
-                <!-- One card per Claude account, its limits stacked inside. -->
-                <Border Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
-                  <StackPanel>
-                    <Grid>
-                      <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                      </Grid.ColumnDefinitions>
-                      <StackPanel>
-                        <TextBlock Text="{Binding Email}" FontSize="15" FontWeight="SemiBold"
-                                   Foreground="{StaticResource InkBrush}" />
-                        <TextBlock Text="{Binding StatusText}" FontSize="12"
-                                   Foreground="{Binding StatusBrush}" Margin="0,3,0,0" />
-                        <TextBlock Text="{Binding UsageText}" FontSize="11"
-                                   Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
-                                   TextWrapping="Wrap"
-                                   ToolTip="Estimated from local logs: usage that landed while this account was the one signed into Claude Code. Attribution is only as complete as the time the tracker has been running." />
-                      </StackPanel>
-                      <TextBlock Grid.Column="1" Text="{Binding PlanText}" FontSize="12"
-                                 FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"
-                                 VerticalAlignment="Top" Margin="16,2,0,0" />
-                    </Grid>
-                    <ItemsControl ItemsSource="{Binding Limits}" Margin="0,4,0,0">
-                      <ItemsControl.ItemTemplate>
-                        <DataTemplate>
-                          <StackPanel Margin="0,14,0,0">
-                            <Grid>
-                              <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                              </Grid.ColumnDefinitions>
-                              <StackPanel VerticalAlignment="Center">
-                                <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
-                                           Foreground="{StaticResource InkBrush}" />
-                                <TextBlock Text="{Binding ResetText}" FontSize="11"
-                                           Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0" />
-                              </StackPanel>
-                              <TextBlock Grid.Column="1" Text="{Binding PercentText}" FontSize="20"
-                                         FontWeight="SemiBold" Foreground="{Binding PercentBrush}"
-                                         VerticalAlignment="Center" Margin="16,0,0,0" />
-                            </Grid>
-                            <ProgressBar Style="{StaticResource ShareBar}" Height="8"
-                                         Value="{Binding Share, Mode=OneWay}" Foreground="{Binding BarBrush}"
-                                         Margin="0,8,0,0" />
-                            <!-- Thin companion bar: progress through the window, i.e. how close the reset is. -->
-                            <ProgressBar Style="{StaticResource ShareBar}" Height="2"
-                                         Value="{Binding ResetShare, Mode=OneWay}"
-                                         Foreground="{StaticResource MutedBrush}" Margin="0,3,0,0"
-                                         Visibility="{Binding ResetVisibility}"
-                                         ToolTip="{Binding ResetTooltip}" />
-                          </StackPanel>
-                        </DataTemplate>
-                      </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                  </StackPanel>
-                </Border>
-              </DataTemplate>
-            </ItemsControl.ItemTemplate>
-          </ItemsControl>
-          <TextBlock x:Name="LimitsPageEmpty" FontSize="13" Foreground="{StaticResource MutedBrush}"
-                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,26,0,0" Visibility="Collapsed"
-                     Text="No limit data yet. Sign in to Claude Code on this machine and the limits will appear here within a minute." />
         </StackPanel>
       </ScrollViewer>
     </Grid>
