@@ -951,6 +951,13 @@ public partial class MainWindow : Window
         ApplyHeroLimitVisibility();
     }
 
+    /// <summary>Vertical gap between two stacked hero meters.</summary>
+    private const double HeroLimitGap = 9;
+
+    /// <summary>The column's laid-out width, read once from XAML — the scale
+    /// below divides by it, so it must be the pre-scale value.</summary>
+    private double? _heroLimitsWidth;
+
     /// <summary>Shows only the meters picked in Settings. The gap between blocks
     /// rides on the block itself so whichever one lands on top sits flush, and
     /// the column plus its divider disappear when nothing is selected.</summary>
@@ -972,13 +979,49 @@ public partial class MainWindow : Window
                 continue;
             }
 
-            block.Margin = new Thickness(0, isFirstVisible ? 0 : 9, 0, 0);
+            block.Margin = new Thickness(0, isFirstVisible ? 0 : HeroLimitGap, 0, 0);
             isFirstVisible = false;
         }
 
         var anyVisible = blocks.Any(entry => entry.Show);
         HeroLimits.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
         HeroLimitsDivider.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
+        FitHeroLimits(blocks.Count(entry => entry.Show));
+    }
+
+    /// <summary>
+    /// Keeps the hero row the height two meters made it. This column is the
+    /// tallest thing in the row, so a third meter would push the chart, the
+    /// live feed and everything below it down the page. Instead the column
+    /// scales to the two-meter budget: same layout, smaller type. The blocks
+    /// are identical, so the natural measurement of three yields the height of
+    /// one, and from that the height two would have taken.
+    /// </summary>
+    private void FitHeroLimits(int visible)
+    {
+        _heroLimitsWidth ??= HeroLimits.Width;
+        var width = _heroLimitsWidth.Value;
+        HeroLimits.LayoutTransform = Transform.Identity;
+        HeroLimits.Width = width;
+        if (visible < 3)
+        {
+            return;
+        }
+
+        HeroLimits.Measure(new Size(width, double.PositiveInfinity));
+        var natural = HeroLimits.DesiredSize.Height;
+        var block = (natural - (visible - 1) * HeroLimitGap) / visible;
+        var budget = 2 * block + HeroLimitGap;
+        if (natural <= budget || budget <= 0)
+        {
+            return;
+        }
+
+        // Scaling shrinks the column sideways too, so widen the unscaled
+        // content by the same factor to land back on the original width.
+        var scale = budget / natural;
+        HeroLimits.Width = width / scale;
+        HeroLimits.LayoutTransform = new ScaleTransform(scale, scale);
     }
 
     private void UpdateHeroLimit(
