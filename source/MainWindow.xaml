@@ -175,8 +175,10 @@
               <CheckBox x:Name="HeroWeeklyCheckBox" Content="Weekly · all models" Margin="0,6,0,0"
                         ToolTip="The weekly allowance across every model."
                         Checked="HeroLimitCheckBox_Changed" Unchecked="HeroLimitCheckBox_Changed" />
-              <CheckBox x:Name="HeroScopedCheckBox" Content="Weekly · top model" Margin="0,6,0,0"
-                        ToolTip="The per-model weekly row (Fable when present, otherwise whichever scoped row is fullest)."
+              <!-- Content is replaced at runtime with the window's real name
+                   ("Weekly · Fable") once limits arrive. -->
+              <CheckBox x:Name="HeroScopedCheckBox" Content="Weekly · per-model" Margin="0,6,0,0"
+                        ToolTip="The per-model weekly window Anthropic reports for this account. Unchecking hides it whatever its usage."
                         Checked="HeroLimitCheckBox_Changed" Unchecked="HeroLimitCheckBox_Changed" />
               <CheckBox x:Name="StartupCheckBox" Content="Start with Windows" Margin="0,14,0,0"
                         Checked="StartupCheckBox_Changed" Unchecked="StartupCheckBox_Changed" />

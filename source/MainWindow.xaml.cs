@@ -926,25 +926,28 @@ public partial class MainWindow : Window
     }
 
     /// <summary>The dashboard hero mirrors the signed-in account's three
-    /// work-stopping limits: the 5-hour session window, the all-model weekly
-    /// allowance, and the scoped weekly row (Fable on this machine; the fullest
-    /// scoped row when there is no Fable-named one). The scoped row can sit at
-    /// 100% while the overall week still has room, so both weeklies are shown.</summary>
+    /// work-stopping limits, exactly as Anthropic reports them: the 5-hour
+    /// session window, the all-model weekly allowance, and the per-model weekly
+    /// window (Fable today). The per-model row can sit at 100% while the overall
+    /// week still has room, so both weeklies are shown.</summary>
     private void UpdateHeroLimits(ClaudeAccountLimits account)
     {
         var session = account.Limits.FirstOrDefault(limit => limit.Label == "5h");
         var weekly = account.Limits.FirstOrDefault(limit => limit.Label == "Week");
-        var scoped = account.Limits.FirstOrDefault(limit =>
-                limit.Label.Contains("Fable", StringComparison.OrdinalIgnoreCase)) ??
-            account.Limits
-                .Where(limit => limit.Label is not ("5h" or "Week"))
-                .OrderByDescending(limit => limit.Percent)
-                .FirstOrDefault();
+
+        // The third meter is whatever per-model weekly window Anthropic reports
+        // for this account — "Fable" today — taken in the order the API lists
+        // them. Deliberately not "the fullest scoped row": which window this is
+        // must not change under you just because usage shifted.
+        var scoped = account.Limits.FirstOrDefault(limit => limit.Label is not ("5h" or "Week"));
 
         UpdateHeroLimit(session, HeroSessionLimitText, HeroSessionLimitReset, HeroSessionLimitBar, HeroSessionResetBar);
         UpdateHeroLimit(weekly, HeroWeeklyLimitText, HeroWeeklyLimitReset, HeroWeeklyLimitBar, HeroWeeklyResetBar);
-        HeroScopedLimitLabel.Text = scoped is null ? "Fable limit" : $"{scoped.Label} limit";
+        HeroScopedLimitLabel.Text = scoped is null ? "Per-model limit" : $"{scoped.Label} limit";
         UpdateHeroLimit(scoped, HeroScopedLimitText, HeroScopedLimitReset, HeroScopedLimitBar, HeroScopedResetBar);
+        // The checkbox names the same window, so Settings reads "Weekly · Fable"
+        // rather than describing a rule the user has to decode.
+        HeroScopedCheckBox.Content = scoped is null ? "Weekly · per-model" : $"Weekly · {scoped.Label}";
         ApplyHeroLimitVisibility();
     }
 
