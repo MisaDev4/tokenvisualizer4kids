@@ -27,13 +27,20 @@ public static class AppPaths
         ".claude",
         "transcripts");
 
-    // Docker bench trials run Claude Code against Bedrock inside containers;
-    // the host runner streams each trial's stream-json events here.
-    public static string BenchResultsPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-        "master",
-        "production",
-        "bench-results");
-
     public static void EnsureDataDirectory() => Directory.CreateDirectory(DataDirectory);
+
+    /// <summary>Expands the leading <c>~</c>, <c>%VAR%</c> and environment
+    /// variables in a user-supplied extra scan root so settings.json can stay
+    /// portable between machines.</summary>
+    public static string ExpandUserPath(string path)
+    {
+        var expanded = Environment.ExpandEnvironmentVariables(path.Trim());
+        if (expanded.StartsWith('~'))
+        {
+            expanded = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) +
+                       expanded[1..];
+        }
+
+        return expanded;
+    }
 }

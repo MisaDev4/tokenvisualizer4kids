@@ -67,6 +67,7 @@
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
@@ -113,6 +114,9 @@
                   VerticalAlignment="Center" SizeChanged="ResponsiveHeader_SizeChanged">
         <Border x:Name="RangeGroupBorder" Style="{StaticResource SegmentGroup}">
           <StackPanel Orientation="Horizontal">
+            <RadioButton x:Name="RangeSession" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="Session" Tag="session" Checked="RangeButton_Checked"
+                         ToolTip="Your current work session: everything since your last long break. What counts as a break (default 4 h of quiet) is set in Settings." />
             <RadioButton x:Name="RangeLast1" Style="{StaticResource SegmentButton}" GroupName="range"
                          Content="1 h" Tag="last1" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeLast4" Style="{StaticResource SegmentButton}" GroupName="range"
@@ -129,6 +133,10 @@
                          Content="Today" Tag="today" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeLast7" Style="{StaticResource SegmentButton}" GroupName="range"
                          Content="7 d" Tag="last7" ToolTip="Last 7 days" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast10" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="10 d" Tag="last10" ToolTip="Last 10 days" Checked="RangeButton_Checked" />
+            <RadioButton x:Name="RangeLast15" Style="{StaticResource SegmentButton}" GroupName="range"
+                         Content="15 d" Tag="last15" ToolTip="Last 15 days" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeLast30" Style="{StaticResource SegmentButton}" GroupName="range"
                          Content="30 d" Tag="last30" ToolTip="Last 30 days" Checked="RangeButton_Checked" />
             <RadioButton x:Name="RangeMonth" Style="{StaticResource SegmentButton}" GroupName="range"
@@ -155,10 +163,25 @@
                          Foreground="{StaticResource InkBrush}" />
               <TextBlock Text="Background safety check" Style="{StaticResource TileLabel}" Margin="0,14,0,6" />
               <ComboBox x:Name="IntervalComboBox" SelectionChanged="IntervalComboBox_SelectionChanged" />
+              <TextBlock Text="Session break" Style="{StaticResource TileLabel}" Margin="0,14,0,6"
+                         ToolTip="Used by the Session time range: a quiet stretch at least this long ends one work session and starts the next." />
+              <ComboBox x:Name="SessionGapComboBox" SelectionChanged="SessionGapComboBox_SelectionChanged"
+                        ToolTip="Used by the Session time range: a quiet stretch at least this long ends one work session and starts the next." />
+              <TextBlock Text="Limits on the dashboard" Style="{StaticResource TileLabel}" Margin="0,14,0,2"
+                         ToolTip="Which limit meters appear in the top-left of the Dashboard. The Limits page always shows every one." />
+              <CheckBox x:Name="HeroSessionCheckBox" Content="5-hour session" Margin="0,6,0,0"
+                        ToolTip="The rolling 5-hour session window."
+                        Checked="HeroLimitCheckBox_Changed" Unchecked="HeroLimitCheckBox_Changed" />
+              <CheckBox x:Name="HeroWeeklyCheckBox" Content="Weekly · all models" Margin="0,6,0,0"
+                        ToolTip="The weekly allowance across every model."
+                        Checked="HeroLimitCheckBox_Changed" Unchecked="HeroLimitCheckBox_Changed" />
+              <CheckBox x:Name="HeroScopedCheckBox" Content="Weekly · top model" Margin="0,6,0,0"
+                        ToolTip="The per-model weekly row (Fable when present, otherwise whichever scoped row is fullest)."
+                        Checked="HeroLimitCheckBox_Changed" Unchecked="HeroLimitCheckBox_Changed" />
               <CheckBox x:Name="StartupCheckBox" Content="Start with Windows" Margin="0,14,0,0"
                         Checked="StartupCheckBox_Changed" Unchecked="StartupCheckBox_Changed" />
               <CheckBox x:Name="PrivacyCheckBox" Content="Hide personal data" Margin="0,10,0,0"
-                        ToolTip="Swap account emails, project names and folder paths for placeholders wherever they appear — for screenshots and screen shares. Display only; nothing stored changes."
+                        ToolTip="Swap account emails, project names and folder paths for placeholders (acc1, project-1, ~\…) wherever they appear, and hide session titles — for screenshots and screen shares. Display only; nothing stored changes."
                         Checked="PrivacyCheckBox_Changed" Unchecked="PrivacyCheckBox_Changed" />
               <CheckBox x:Name="ApiCheckBox" Content="Local API for other apps" Margin="0,10,0,0"
                         ToolTip="Serve this app's data as read-only JSON at http://localhost:5299/api so other programs on this PC can use it. Loopback only — nothing is reachable from the network. See docs/local-api.md."
@@ -182,55 +205,160 @@
       </StackPanel>
     </Grid>
 
+    <!-- ═══ Context warning strip: shown on every tab once any session passes
+         the soft line; colors shift from amber to red at the alarm line.
+         Click jumps to the offending terminal (or the live feed). ═══ -->
     <!-- ═══ Hero cost + KPI tiles ═══ -->
-    <Border x:Name="DashboardHero" Grid.Row="1" Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
+    <Border x:Name="DashboardHero" Grid.Row="2" Style="{StaticResource Card}" Padding="24,18" Margin="0,0,0,14">
       <Grid>
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
-        <StackPanel Grid.Column="0" VerticalAlignment="Center" MinWidth="210">
+        <StackPanel Grid.Column="0" VerticalAlignment="Center">
           <TextBlock x:Name="CostLabel" Text="Estimated cost" Style="{StaticResource TileLabel}" />
           <TextBlock x:Name="CostText" Text="—" FontSize="44" FontWeight="SemiBold"
                      Foreground="{StaticResource InkBrush}" Margin="0,2,0,0" />
-          <TextBlock x:Name="CostDeltaText" Text="" FontSize="12"
-                     Foreground="{StaticResource MutedBrush}" Margin="2,2,0,0" />
         </StackPanel>
-        <Border Grid.Column="1" Width="1" Background="{StaticResource GridlineBrush}"
+        <Border x:Name="HeroLimitsDivider" Grid.Column="1" Width="1"
+                Background="{StaticResource GridlineBrush}" Margin="24,4" />
+        <!-- The three limits that actually stop work: the 5-hour session window,
+             the all-model weekly allowance, and the scoped weekly (Fable) row,
+             mirrored from the Limits page. Each block collapses on its own so
+             Settings can pare the hero down to just the ones you watch; the
+             whole column (and its divider) goes when none are picked.
+             Click jumps to the Limits page. -->
+        <StackPanel x:Name="HeroLimits" Grid.Column="2" VerticalAlignment="Center" Width="176"
+                    Background="Transparent" Cursor="Hand" MouseLeftButtonUp="LimitsBar_Clicked"
+                    ToolTip="Click for the full limits page.">
+          <StackPanel x:Name="HeroSessionBlock">
+            <TextBlock Text="5h limit" Style="{StaticResource TileLabel}" />
+            <StackPanel Orientation="Horizontal" Margin="0,1,0,0">
+              <TextBlock x:Name="HeroSessionLimitText" Text="—" FontSize="22" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="HeroSessionLimitReset" FontSize="11"
+                         Foreground="{StaticResource MutedBrush}" Margin="8,0,0,4"
+                         VerticalAlignment="Bottom" />
+            </StackPanel>
+            <ProgressBar x:Name="HeroSessionLimitBar" Style="{StaticResource ShareBar}"
+                         Height="5" Margin="0,3,0,0" />
+            <!-- Thin companion bar: progress through the window, i.e. how close the reset is. -->
+            <ProgressBar x:Name="HeroSessionResetBar" Style="{StaticResource ShareBar}" Height="2"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                         Visibility="Collapsed" />
+          </StackPanel>
+          <StackPanel x:Name="HeroWeeklyBlock">
+            <TextBlock Text="Weekly limit" Style="{StaticResource TileLabel}" />
+            <StackPanel Orientation="Horizontal" Margin="0,1,0,0">
+              <TextBlock x:Name="HeroWeeklyLimitText" Text="—" FontSize="22" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="HeroWeeklyLimitReset" FontSize="11"
+                         Foreground="{StaticResource MutedBrush}" Margin="8,0,0,4"
+                         VerticalAlignment="Bottom" />
+            </StackPanel>
+            <ProgressBar x:Name="HeroWeeklyLimitBar" Style="{StaticResource ShareBar}"
+                         Height="5" Margin="0,3,0,0" />
+            <ProgressBar x:Name="HeroWeeklyResetBar" Style="{StaticResource ShareBar}" Height="2"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                         Visibility="Collapsed" />
+          </StackPanel>
+          <StackPanel x:Name="HeroScopedBlock">
+            <TextBlock x:Name="HeroScopedLimitLabel" Text="Fable limit"
+                       Style="{StaticResource TileLabel}" />
+            <StackPanel Orientation="Horizontal" Margin="0,1,0,0">
+              <TextBlock x:Name="HeroScopedLimitText" Text="—" FontSize="22" FontWeight="SemiBold"
+                         Foreground="{StaticResource InkBrush}" />
+              <TextBlock x:Name="HeroScopedLimitReset" FontSize="11"
+                         Foreground="{StaticResource MutedBrush}" Margin="8,0,0,4"
+                         VerticalAlignment="Bottom" />
+            </StackPanel>
+            <ProgressBar x:Name="HeroScopedLimitBar" Style="{StaticResource ShareBar}"
+                         Height="5" Margin="0,3,0,0" />
+            <ProgressBar x:Name="HeroScopedResetBar" Style="{StaticResource ShareBar}" Height="2"
+                         Foreground="{StaticResource MutedBrush}" Margin="0,2,0,0"
+                         Visibility="Collapsed" />
+          </StackPanel>
+        </StackPanel>
+        <Border Grid.Column="3" Width="1" Background="{StaticResource GridlineBrush}"
                 Margin="24,4" />
-        <UniformGrid Grid.Column="2" Columns="6" VerticalAlignment="Center">
-          <StackPanel Margin="6,0">
+        <Grid Grid.Column="4" VerticalAlignment="Center">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" MinWidth="190" />
+          </Grid.ColumnDefinitions>
+          <StackPanel Grid.Column="0" VerticalAlignment="Center">
             <TextBlock Text="Total tokens" Style="{StaticResource TileLabel}" />
-            <TextBlock x:Name="TotalTokensText" Text="—" Style="{StaticResource TileValue}" />
+            <TextBlock x:Name="TotalTokensText" Text="—" FontSize="30" FontWeight="SemiBold"
+                       Foreground="{StaticResource InkBrush}" Margin="0,2,0,0" />
+            <TextBlock x:Name="TokenSplitText" FontSize="11"
+                       Foreground="{StaticResource MutedBrush}" Margin="1,3,0,0" />
           </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Input" Style="{StaticResource TileLabel}" />
-            <TextBlock x:Name="InputTokensText" Text="—" Style="{StaticResource TileValue}" />
+          <Border Grid.Column="1" Width="1" Background="{StaticResource GridlineBrush}"
+                  Margin="24,4" />
+          <StackPanel Grid.Column="2" VerticalAlignment="Center">
+            <TextBlock Text="Priciest reply · 30 m" Style="{StaticResource TileLabel}"
+                       ToolTip="The most expensive single response in the last 30 minutes — an expensive reply usually means a huge context went in with it." />
+            <TextBlock x:Name="TopReplyCostText" Text="—" FontSize="30" FontWeight="SemiBold"
+                       Foreground="{StaticResource InkBrush}" Margin="0,2,0,0" />
+            <TextBlock x:Name="TopReplyDetailText" FontSize="11"
+                       Foreground="{StaticResource MutedBrush}" Margin="1,3,0,0"
+                       TextTrimming="CharacterEllipsis" MaxWidth="190"
+                       HorizontalAlignment="Left" />
           </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Output" Style="{StaticResource TileLabel}" />
-            <TextBlock x:Name="OutputTokensText" Text="—" Style="{StaticResource TileValue}" />
+          <Border Grid.Column="3" Width="1" Background="{StaticResource GridlineBrush}"
+                  Margin="24,4" />
+          <!-- The sessions carrying the most context right now: a big context
+               makes every following reply cost more, so how close each one is
+               to the warning tiers is the thing to surface. Bars fill toward
+               the 300K alarm line; click focuses that terminal. -->
+          <StackPanel Grid.Column="4" VerticalAlignment="Center">
+            <TextBlock Text="Session context" Style="{StaticResource TileLabel}"
+                       ToolTip="Prompt-side tokens each live session carries into its next reply. Amber from 100K, red from 150K; the bar fills toward the 300K alarm." />
+            <ItemsControl x:Name="HeroContextList" Margin="0,6,0,0">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <!-- One session, chip-styled like the live feed's context
+                       chips: the tint deepens amber → red as the context
+                       grows, and an over-limit session says so in words. -->
+                  <Border Background="{Binding Fill}" BorderBrush="{Binding Outline}"
+                          BorderThickness="1" CornerRadius="7" Padding="9,5,9,6"
+                          Margin="0,0,0,5" ToolTip="{Binding Tooltip}"
+                          Cursor="{Binding Cursor}" MouseLeftButtonUp="HeroContext_Clicked">
+                    <StackPanel>
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="SemiBold"
+                                   Foreground="{StaticResource InkBrush}"
+                                   TextTrimming="CharacterEllipsis" Margin="0,0,10,0" />
+                        <TextBlock Grid.Column="1" Text="{Binding Tokens}" FontSize="11"
+                                   FontWeight="SemiBold" Foreground="{Binding Accent}" />
+                      </Grid>
+                      <ProgressBar Style="{StaticResource ShareBar}" Height="3" Margin="0,3,0,0"
+                                   Value="{Binding Share, Mode=OneWay}"
+                                   Foreground="{Binding BarBrush}" />
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <TextBlock x:Name="HeroContextEmpty" Text="no live sessions" FontSize="11"
+                       Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0" />
           </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Reasoning" Style="{StaticResource TileLabel}"
-                       ToolTip="Included in output tokens." />
-            <TextBlock x:Name="ReasoningTokensText" Text="—" Style="{StaticResource TileValue}" />
-          </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Cache read" Style="{StaticResource TileLabel}" />
-            <TextBlock x:Name="CacheReadTokensText" Text="—" Style="{StaticResource TileValue}" />
-          </StackPanel>
-          <StackPanel Margin="6,0">
-            <TextBlock Text="Cache write" Style="{StaticResource TileLabel}" />
-            <TextBlock x:Name="CacheWriteTokensText" Text="—" Style="{StaticResource TileValue}" />
-          </StackPanel>
-        </UniformGrid>
+        </Grid>
       </Grid>
     </Border>
 
     <!-- ═══ Chart + model breakdown ═══ -->
-    <Grid x:Name="DashboardContent" Grid.Row="2">
+    <Grid x:Name="DashboardContent" Grid.Row="3">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="3*" />
         <ColumnDefinition Width="14" />
@@ -271,6 +399,8 @@
                 <StackPanel Orientation="Horizontal">
                   <RadioButton x:Name="BarsAuto" Style="{StaticResource SegmentButton}" GroupName="bars"
                                Content="Auto" Tag="auto" IsChecked="True" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsS75" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="7.5s" Tag="s75" Checked="BarsButton_Checked" />
                   <RadioButton x:Name="BarsS15" Style="{StaticResource SegmentButton}" GroupName="bars"
                                Content="15s" Tag="s15" Checked="BarsButton_Checked" />
                   <RadioButton x:Name="BarsS30" Style="{StaticResource SegmentButton}" GroupName="bars"
@@ -285,6 +415,10 @@
                                Content="30m" Tag="m30" Checked="BarsButton_Checked" />
                   <RadioButton x:Name="BarsH1" Style="{StaticResource SegmentButton}" GroupName="bars"
                                Content="1h" Tag="h1" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsH4" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="4h" Tag="h4" Checked="BarsButton_Checked" />
+                  <RadioButton x:Name="BarsH12" Style="{StaticResource SegmentButton}" GroupName="bars"
+                               Content="12h" Tag="h12" Checked="BarsButton_Checked" />
                   <RadioButton x:Name="BarsD1" Style="{StaticResource SegmentButton}" GroupName="bars"
                                Content="1d" Tag="d1" Checked="BarsButton_Checked" />
                 </StackPanel>
@@ -440,7 +574,7 @@
     </Grid>
 
     <!-- ═══ Ultra real time: live event river ═══ -->
-    <Grid x:Name="LiveRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
+    <Grid x:Name="LiveRoot" Grid.Row="2" Grid.RowSpan="2" Visibility="Collapsed">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto" />
         <RowDefinition Height="*" />
@@ -515,6 +649,7 @@
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
           </Grid.RowDefinitions>
           <Grid x:Name="LiveFeedHeaderGrid" Grid.Row="0" Margin="0,0,0,4"
@@ -568,7 +703,30 @@
               </Border>
             </WrapPanel>
           </Grid>
-          <ItemsControl x:Name="LiveLegend" Grid.Row="1" Margin="2,4,0,2">
+          <!-- Recent session contexts, largest first: one chip per session, so a
+               context update replaces its chip instead of adding another. -->
+          <ItemsControl x:Name="ContextChipsList" Grid.Row="1" Margin="2,6,0,0">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <WrapPanel Orientation="Horizontal" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border Background="{Binding Fill}" BorderBrush="{Binding Outline}" BorderThickness="1"
+                        CornerRadius="7" Padding="9,4" Margin="0,0,8,6" ToolTip="{Binding Tooltip}"
+                        Cursor="{Binding Cursor}" MouseLeftButtonUp="ContextChip_Clicked">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="SemiBold"
+                               Foreground="{StaticResource Ink2Brush}" />
+                    <TextBlock Text="{Binding Tokens}" FontSize="11" FontWeight="SemiBold"
+                               Foreground="{Binding Accent}" Margin="7,0,0,0" />
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <ItemsControl x:Name="LiveLegend" Grid.Row="2" Margin="2,4,0,2">
             <ItemsControl.ItemsPanel>
               <ItemsPanelTemplate>
                 <WrapPanel Orientation="Horizontal" />
@@ -585,7 +743,7 @@
               </DataTemplate>
             </ItemsControl.ItemTemplate>
           </ItemsControl>
-          <Grid Grid.Row="2" Margin="0,6,0,0" SizeChanged="LiveCanvas_SizeChanged">
+          <Grid Grid.Row="3" Margin="0,6,0,0" SizeChanged="LiveCanvas_SizeChanged">
             <!-- Round timer as the cup's rim: fills over the round, warms near the end. -->
             <ProgressBar x:Name="RoundProgress" Style="{StaticResource ShareBar}" Height="4"
                          VerticalAlignment="Top" Margin="8,0,8,0" Panel.ZIndex="2"
@@ -606,7 +764,7 @@
     </Grid>
 
     <!-- ═══ Limits page: a compact card per account, then the activity heatmap ═══ -->
-    <Grid x:Name="LimitsRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
+    <Grid x:Name="LimitsRoot" Grid.Row="2" Grid.RowSpan="2" Visibility="Collapsed">
       <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
                     Focusable="False" BorderThickness="0" Padding="0">
         <StackPanel MaxWidth="860" HorizontalAlignment="Center">
@@ -629,7 +787,7 @@
               <Button x:Name="SessionRefreshButton" Grid.Column="1" Content="Refresh from Claude app"
                       VerticalAlignment="Top" Margin="16,2,0,0" Padding="12,6"
                       Click="SessionRefreshButton_Click"
-                      ToolTip="Fetch limits through the Claude desktop app's claude.ai session — a separate rate limit that keeps working (and uniquely reports the per-model weekly rows) when the usage endpoint is throttled. Quit the Claude desktop app first; it locks its cookie store while running. Reads the session locally, once." />
+                      ToolTip="Fetch limits through the Claude desktop app's claude.ai session — a separate rate limit that keeps working (and uniquely reports the per-model weekly rows) when the usage endpoint is throttled. Updates the account the Claude app is signed into, which may not be the one shown here. Quit the Claude desktop app first; it locks its cookie store while running. Reads the session locally, once." />
             </Grid>
           </Border>
           <ItemsControl x:Name="LimitsDetailList" Grid.IsSharedSizeScope="True">
@@ -747,7 +905,7 @@
     </Grid>
 
     <!-- ═══ Insights page: where the money goes, and how to spend less ═══ -->
-    <Grid x:Name="InsightsRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
+    <Grid x:Name="InsightsRoot" Grid.Row="2" Grid.RowSpan="2" Visibility="Collapsed">
       <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
                     Focusable="False" BorderThickness="0" Padding="0">
         <StackPanel MaxWidth="880" HorizontalAlignment="Center">
@@ -901,7 +1059,7 @@
     </Grid>
 
     <!-- ═══ Terminals page: one tile per Claude Code session ═══ -->
-    <Grid x:Name="TerminalsRoot" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
+    <Grid x:Name="TerminalsRoot" Grid.Row="2" Grid.RowSpan="2" Visibility="Collapsed">
       <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
                     Focusable="False" BorderThickness="0" Padding="0">
         <StackPanel>
@@ -924,7 +1082,8 @@
               <DataTemplate>
                 <Border Style="{StaticResource Card}" Width="272" Padding="18,14" Margin="0,0,14,14"
                         BorderBrush="{Binding EdgeBrush}" BorderThickness="1"
-                        ToolTip="{Binding Tooltip}">
+                        ToolTip="{Binding Tooltip}"
+                        Cursor="{Binding Cursor}" MouseLeftButtonUp="TerminalTile_Clicked">
                   <StackPanel>
                     <Grid>
                       <Grid.ColumnDefinitions>
@@ -959,7 +1118,7 @@
     </Grid>
 
     <!-- ═══ Status strip ═══ -->
-    <Grid Grid.Row="3" Margin="2,12,2,0">
+    <Grid Grid.Row="4" Margin="2,12,2,0">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
         <ColumnDefinition Width="Auto" />

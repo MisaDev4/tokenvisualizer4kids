@@ -76,6 +76,7 @@ public sealed record ModelUsageRow(
 /// <summary>Granularity of one timeline bucket.</summary>
 public enum BucketUnit
 {
+    Second7_5,
     Second15,
     Second30,
     Minute1,
@@ -83,6 +84,8 @@ public enum BucketUnit
     Minute15,
     Minute30,
     Hour,
+    Hour4,
+    Hour12,
     Day,
     Month
 }
@@ -147,11 +150,7 @@ public sealed record DashboardData(
     IReadOnlyList<ModelUsageRow> Models,
     IReadOnlyList<UsageBucket> Buckets,
     BucketUnit Unit,
-    long LastUpdatedMs)
-{
-    /// <summary>Estimated cost of the equivalent preceding window; null when not comparable (e.g. all time).</summary>
-    public double? PreviousCost { get; init; }
-}
+    long LastUpdatedMs);
 
 public sealed record CollectorProgress(
     string Activity,

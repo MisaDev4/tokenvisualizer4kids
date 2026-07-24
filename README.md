@@ -4,13 +4,13 @@ A native Windows dashboard for local AI token usage. Every Claude Code and Codex
 
 Double-click **`TokenTracker.exe`**. There is nothing to install. Closing the window leaves it running in the notification area; use the tray icon's **Exit** to stop it completely.
 
-A **Hide personal data** toggle in Settings swaps account emails, project names and folder paths for placeholders wherever they appear — for screenshots and screen shares (every screenshot below was taken with it on). Display only; nothing stored changes.
+A **Hide personal data** toggle in Settings replaces project names, folder paths and account emails with placeholders — `project-1`, `acc1`, `~\…` — and hides session titles, which are drawn from your own prompts. Each real value keeps the same placeholder while the app runs, so several accounts still read as several accounts. For screenshots and screen shares; every screenshot below was taken with it on. Display only; nothing stored changes.
 
 ## Dashboard
 
 ![Dashboard](docs/dashboard.png)
 
-The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), a stacked per-model timeline, and a by-model breakdown. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — down to 15-second bars over the last hour or minute bars across a half day, whatever combination fits; **Auto** chooses sensibly, and the selector only offers sizes that make sense for the current range (no 1-day bars on a 1-hour view). The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text. A header toggle swaps the right panel between the **By model** breakdown and the **live cup** — the same cup as the Live tab, same state, still interactive — so the totals and the real-time view share one page.
+The classic view: estimated cost with a comparison against the prior period, token totals (input, output, reasoning, cache), a stacked per-model timeline, and a by-model breakdown. Beside the cost sit the limit meters that actually stop work — the 5-hour session window, the weekly all-models allowance, and the weekly per-model row — each with a reset time and a thin bar showing how far through the window you are; the scoped row can be pinned at 100% while the overall week still has room, so they are worth reading together. Settings has a checkbox per meter, so you can keep all three, watch only the 5-hour window, or hide the block entirely. Range presets (1 h up to All time) scope everything, and the bar size is yours to pick — down to 15-second bars over the last hour or minute bars across a half day, whatever combination fits; **Auto** chooses sensibly, and the selector only offers sizes that make sense for the current range (no 1-day bars on a 1-hour view). The chart flips between cost, token composition, and messages, every column has a full-breakdown tooltip, and a **Table** toggle shows the same numbers as text. A header toggle swaps the right panel between the **By model** breakdown and the **live cup** — the same cup as the Live tab, same state, still interactive — so the totals and the real-time view share one page.
 
 ## Insights
 
@@ -26,13 +26,13 @@ A page with one tile per **open** terminal — Claude Code and Codex, each weari
 
 ![Live](docs/live.png)
 
-Ultra real time: every response drops into the cup as a block within about a second of being logged, sized by cost or token count with the value printed on it. Rounds are timed — the rim above the cup fills as the countdown runs (amber near the end, red just before), then the pile settles into a sediment layer, the floor rises, and the next round stacks on top. Scroll down through the layers to wander back in time; the small bars in the header score your recent rounds against your best. The feed header also shows your working pace — cost per minute and tokens per second averaged over the last 5 minutes, steadier than the 60-second tiles above the cup — and it rides along when the feed is docked into the dashboard. Round lengths run from 60 seconds to an hour, plus **∞ endless mode**, where nothing ever settles and the tower just keeps growing. Changing the round length re-partitions history instead of discarding it, and the live state keeps running in the background whatever tab is showing.
+Ultra real time: every response drops into the cup as a block within about a second of being logged, sized by cost or token count with the value printed on it. Hover a block and it names the chat it came from — the session's opening prompt, its terminal's folder, and the latest prompt when the conversation has moved on — above the cost and the full token split, so an expensive block is traceable to the conversation that produced it. Rounds are timed — the rim above the cup fills as the countdown runs (amber near the end, red just before), then the pile settles into a sediment layer, the floor rises, and the next round stacks on top. Scroll down through the layers to wander back in time; the small bars in the header score your recent rounds against your best. The feed header also shows your working pace — cost per minute and tokens per second averaged over the last 5 minutes, steadier than the 60-second tiles above the cup — and it rides along when the feed is docked into the dashboard. Round lengths run from 60 seconds to an hour, plus **∞ endless mode**, where nothing ever settles and the tower just keeps growing. Changing the round length re-partitions history instead of discarding it, and the live state keeps running in the background whatever tab is showing.
 
 ## Limits
 
 ![Limits](docs/limits.png)
 
-Your Claude plan rate limits — the same numbers Claude Code shows under `/usage`: the 5-hour session window, the weekly all-models window, and per-model weekly windows, each with a severity-colored usage bar, a reset countdown, and a thin companion bar showing how far through the window you are. Each account card also names its exact plan tier (Max 5x · $100/mo vs Max 20x · $200/mo), which `/usage` doesn't show. If several Claude accounts sign into Claude Code on this machine, each one gets its own card and keeps updating in the background between sign-ins; an account that can no longer be fetched never shows stale numbers — once a window's reset time passes, its bar rolls forward to zero. Each card also shows how much local usage is attributed to that account over the last 7 days: transcripts carry no account identity, so the app records which account is signed in as it polls and attributes events by when they landed — accurate whenever the tracker was running, unknowable for periods it wasn't. A compact copy of the signed-in account's meters lives in the status strip on every tab; click it to jump here.
+Your Claude plan rate limits — the same numbers Claude Code shows under `/usage`: the 5-hour session window, the weekly all-models window, and per-model weekly windows, each with a severity-colored usage bar, a reset countdown, and a thin companion bar showing how far through the window you are. This page always lists every window, whatever the dashboard is set to show. Each account card also names its exact plan tier (Max 5x · $100/mo vs Max 20x · $200/mo), which `/usage` doesn't show. If several Claude accounts sign into Claude Code on this machine, each one gets its own card and keeps updating in the background between sign-ins; an account that can no longer be fetched never shows stale numbers — once a window's reset time passes, its bar rolls forward to zero. Each card also shows how much local usage is attributed to that account over the last 7 days: transcripts carry no account identity, so the app records which account is signed in as it polls and attributes events by when they landed — accurate whenever the tracker was running, unknowable for periods it wasn't. A compact copy of the signed-in account's meters lives in the status strip on every tab; click it to jump here.
 
 Below the account cards, a **Daily activity** grid maps a year of local usage GitHub-style — one cell per day, all clients combined, colored on a log-scaled blue-to-red ramp anchored to your biggest day, so only that day burns deep red. **Year** shows all twelve months at a glance; **Detail** enlarges recent months and prints each day's total on its cell. Both views switch between tokens and cost, and hovering any cell breaks the day down.
 
@@ -42,7 +42,17 @@ The app reads local logs only:
 
 - Codex sessions from `%USERPROFILE%\.codex`
 - Claude Code projects and transcripts from `%USERPROFILE%\.claude`
-- AI-bench trial streams (Claude Code against AWS Bedrock inside Docker sandboxes) from `Desktop\master\production\bench-results`, shown under the `bedrock` provider
+
+Some setups write Claude- or Codex-shaped JSONL somewhere else entirely — a container runner streaming `stream-json` to a results folder, an agent pinned to its own `CLAUDE_CONFIG_DIR`, a bridge running with session persistence off that keeps its own usage log. Add those folders to `ExtraSourceRoots` in `settings.json` and they are indexed alongside the standard locations:
+
+```json
+"ExtraSourceRoots": [
+  { "Path": "~\\projects\\agent-runs",     "Client": "claude" },
+  { "Path": "%APPDATA%\\my-agent\\logs",   "Client": "codex" }
+]
+```
+
+`~` and `%VAR%` are expanded, `Client` defaults to `claude`, and folders that don't exist are skipped — a stale entry is harmless.
 
 A background watcher picks up new events within about a second, and a periodic reconcile catches anything the watcher missed. **Full rescan / repair** in Settings rebuilds the index from scratch.
 
@@ -55,7 +65,7 @@ While the app runs it serves everything it knows — dashboard aggregates, the l
 Token metadata only — never prompt or response text — in `%LOCALAPPDATA%\TokenTracker`:
 
 - `usage.db` — the local usage index (SQLite)
-- `settings.json` — UI preferences
+- `settings.json` — UI preferences and any extra scan folders
 - `pricing-litellm.json` — cached pricing catalog
 - `accounts.json` — per-account limit snapshots, including the OAuth tokens Claude Code already keeps in plaintext on this machine; they are only ever sent to the Anthropic API
 

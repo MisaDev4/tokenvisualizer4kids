@@ -3,6 +3,15 @@ using Microsoft.Win32;
 
 namespace TokenTracker;
 
+/// <summary>One user-configured scan folder. <c>Client</c> is the label rows get
+/// filed under ("claude" or "codex").</summary>
+public sealed class ExtraSourceRoot
+{
+    public string Path { get; set; } = string.Empty;
+
+    public string Client { get; set; } = "claude";
+}
+
 public sealed class AppSettings
 {
     public int ReconcileSeconds { get; set; } = 60;
@@ -28,6 +37,24 @@ public sealed class AppSettings
     public string InsightsRange { get; set; } = "last30";
 
     public bool HidePersonalData { get; set; }
+
+    /// <summary>Which limit meters the dashboard hero shows. The Limits page
+    /// always lists every row regardless of these.</summary>
+    public bool ShowHeroSessionLimit { get; set; } = true;
+
+    public bool ShowHeroWeeklyLimit { get; set; } = true;
+
+    public bool ShowHeroScopedLimit { get; set; } = true;
+
+    /// <summary>A quiet stretch at least this long separates two work sessions
+    /// for the dashboard's Session range.</summary>
+    public double SessionGapHours { get; set; } = 4;
+
+    /// <summary>Extra folders to scan for Claude/Codex-shaped JSONL beyond the
+    /// standard <c>~/.claude</c> and <c>~/.codex</c> locations. Edit
+    /// settings.json by hand; <c>~</c> and <c>%VAR%</c> are expanded, missing
+    /// folders are skipped, and <c>Client</c> defaults to "claude".</summary>
+    public List<ExtraSourceRoot> ExtraSourceRoots { get; set; } = [];
 
     public bool ApiServerEnabled { get; set; } = true;
 

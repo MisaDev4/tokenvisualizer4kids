@@ -18,13 +18,19 @@ public enum TerminalState
     Ready
 }
 
+/// <summary>Pid is the claude process from the session registry, or 0 when the
+/// terminal was found by transcript fallback and no process is pinned to it.
+/// TranscriptPath lets SessionTitleService head-scan the conversation without
+/// re-deriving where it lives; empty when unknown.</summary>
 public sealed record TerminalStatus(
     string SessionId,
     string ProjectName,
     string ProjectPath,
     TerminalState State,
     DateTimeOffset LastActivity,
-    TerminalApp App);
+    TerminalApp App,
+    int Pid = 0,
+    string TranscriptPath = "");
 
 public enum TerminalApp
 {
@@ -197,7 +203,9 @@ public sealed class TerminalStatusService
             cwd,
             state,
             lastActivity,
-            TerminalApp.ClaudeCode);
+            TerminalApp.ClaudeCode,
+            pid,
+            Path.Combine(projectDir, sessionId + ".jsonl"));
     }
 
     private static bool IsLiveClaudeProcess(int pid, DateTimeOffset? startedAt)
@@ -261,7 +269,7 @@ public sealed class TerminalStatusService
 
     /// <summary>Claude Code stores each project's transcripts in a folder named
     /// after the working directory with every non-alphanumeric character
-    /// dashed: C:\Users\kir → C--Users-kir.</summary>
+    /// dashed: C:\Users\alex\code → C--Users-alex-code.</summary>
     private static string FlattenProjectPath(string cwd)
     {
         var trimmed = cwd.TrimEnd('\\', '/');
@@ -525,7 +533,8 @@ public sealed class TerminalStatusService
             projectPath ?? "",
             state.Value,
             lastActivity,
-            TerminalApp.Codex);
+            TerminalApp.Codex,
+            TranscriptPath: file.FullName);
     }
 
     /// <summary>Extracts payload.cwd from the session_meta line without
@@ -753,7 +762,8 @@ public sealed class TerminalStatusService
             projectPath ?? "",
             state.Value,
             lastActivity,
-            TerminalApp.ClaudeCode);
+            TerminalApp.ClaudeCode,
+            TranscriptPath: file.FullName);
     }
 
     private static string UserEntryText(JsonElement root)

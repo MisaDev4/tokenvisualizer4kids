@@ -30,7 +30,7 @@ public sealed class UsageCollector : IDisposable
         _database = database;
         _settings = settings;
         _parser = parser ?? new UsageParser();
-        _roots = (roots ?? DefaultRoots()).ToList();
+        _roots = (roots ?? DefaultRoots().Concat(ConfiguredRoots(settings))).ToList();
     }
 
     public event Action<CollectorProgress>? ProgressChanged;
@@ -376,8 +376,20 @@ public sealed class UsageCollector : IDisposable
         yield return new SourceRoot(AppPaths.CodexSessionsPath, "codex");
         yield return new SourceRoot(AppPaths.ClaudeProjectsPath, "claude");
         yield return new SourceRoot(AppPaths.ClaudeTranscriptsPath, "claude");
-        yield return new SourceRoot(AppPaths.BenchResultsPath, "claude");
     }
+
+    /// <summary>Extra folders from settings.json, for harnesses that write
+    /// Claude- or Codex-shaped JSONL somewhere other than the standard
+    /// locations — a container runner streaming stream-json to a results
+    /// folder, an agent pinned to its own CLAUDE_CONFIG_DIR, a bridge that
+    /// runs with session persistence off and keeps its own usage log.
+    /// Roots that don't exist are skipped, so a stale entry is harmless.</summary>
+    private static IEnumerable<SourceRoot> ConfiguredRoots(AppSettings settings) =>
+        (settings.ExtraSourceRoots ?? [])
+            .Where(root => !string.IsNullOrWhiteSpace(root.Path))
+            .Select(root => new SourceRoot(
+                AppPaths.ExpandUserPath(root.Path),
+                string.IsNullOrWhiteSpace(root.Client) ? "claude" : root.Client.Trim()));
 
     public void Dispose()
     {

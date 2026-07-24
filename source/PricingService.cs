@@ -137,8 +137,56 @@ public sealed class PricingService
             return new PricingResolution(pricing);
         }
 
-        return new PricingResolution(null);
+        return new PricingResolution(MatchClaudeFamily(provider, model));
     }
+
+    /// <summary>
+    /// Last resort for Anthropic models nobody has published a price for yet — a brand new
+    /// Claude lands in the logs long before LiteLLM adds it, and the built-in table is only as
+    /// current as the last release. Charging the family's going rate keeps those rows in the
+    /// cost totals instead of silently reporting $0.
+    /// </summary>
+    private static ModelPricing? MatchClaudeFamily(string provider, string model)
+    {
+        if (!NormalizeProvider(provider).Equals("anthropic", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        // Order matters: the priciest families first, so a hypothetical "fable-opus" style
+        // name is never billed at the cheaper tier.
+        if (model.Contains("fable", StringComparison.Ordinal) ||
+            model.Contains("mythos", StringComparison.Ordinal))
+        {
+            return FamilyPricing(10, 50, 1, 12.5);
+        }
+
+        if (model.Contains("opus", StringComparison.Ordinal))
+        {
+            return FamilyPricing(5, 25, 0.5, 6.25);
+        }
+
+        if (model.Contains("sonnet", StringComparison.Ordinal))
+        {
+            return FamilyPricing(3, 15, 0.3, 3.75);
+        }
+
+        return model.Contains("haiku", StringComparison.Ordinal)
+            ? FamilyPricing(1, 5, 0.1, 1.25)
+            : null;
+    }
+
+    private static ModelPricing FamilyPricing(
+        double inputPerMillion,
+        double outputPerMillion,
+        double cacheReadPerMillion,
+        double cacheWritePerMillion) =>
+        new(
+            "anthropic",
+            inputPerMillion / 1_000_000d,
+            outputPerMillion / 1_000_000d,
+            cacheReadPerMillion / 1_000_000d,
+            cacheWritePerMillion / 1_000_000d);
 
     private static bool TryFind(
         IReadOnlyDictionary<string, ModelPricing> catalog,
@@ -292,12 +340,18 @@ public sealed class PricingService
         Add(pricing, "openai", 2.5, 15, 0.25, 0, "gpt-5.4");
         Add(pricing, "openai", 1.75, 14, 0.175, 0, "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2");
         Add(pricing, "openai", 1.25, 10, 0.125, 0, "gpt-5.1-codex", "gpt-5-codex", "gpt-5");
-        Add(pricing, "anthropic", 5, 25, 0.5, 6.25, "claude-opus-4-8", "claude-opus-4-6");
-        Add(pricing, "anthropic", 10, 50, 1, 12.5, "claude-fable-5");
+        Add(pricing, "anthropic", 5, 25, 0.5, 6.25,
+            "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+            "claude-opus-4-5", "opus");
+        Add(pricing, "anthropic", 10, 50, 1, 12.5,
+            "claude-fable-5", "claude-mythos-5", "claude-mythos-preview");
         Add(pricing, "anthropic", 3, 15, 0.3, 3.75,
-            "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6");
+            "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4",
+            "sonnet");
         Add(pricing, "anthropic", 15, 75, 1.5, 18.75,
             "claude-opus-4", "claude-opus-4-1");
+        Add(pricing, "anthropic", 1, 5, 0.1, 1.25,
+            "claude-haiku-4-5", "haiku");
         Add(pricing, "anthropic", 0.8, 4, 0.08, 1,
             "claude-3-5-haiku", "claude-haiku-3-5");
 

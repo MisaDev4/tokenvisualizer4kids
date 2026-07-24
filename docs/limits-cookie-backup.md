@@ -5,6 +5,14 @@ Status: **BUILT** (2026-07-16). Shipped as `ClaudeSessionUsage.cs` plus a
 validation hit turned out to be surmountable — see "Resolution" at the bottom.
 The rest of this note is the original design, kept for context.
 
+> **Update 2026-07-22:** the header probe and the scoped-weekly estimator this
+> note references were removed. Following the approach proven by community
+> trackers (usage-monitor-for-claude and friends), the tracker now simply polls
+> the OAuth usage endpoint every ~3 minutes (gently while the user is away),
+> honors a 429's Retry-After bounded to 3–15 minutes, and shows only the
+> server's own numbers. The cookie backup below remains as the manual fallback
+> for a genuinely stuck endpoint.
+
 ## The problem it would solve
 
 The Limits page reads plan usage from the Anthropic **OAuth usage endpoint**
@@ -67,7 +75,7 @@ OAuth usage endpoint is throttled.
   being installed**, not on a browser.
 - The account's org UUID (needed for the claude.ai usage URL) is already known
   from the profile we fetch (`oauthAccount.organizationUuid`, e.g.
-  `0a8fd519-8bd9-4eca-bce0-c1a5b9d6218b`).
+  `00000000-1111-2222-3333-444444444444`).
 
 ## Implementation sketch
 
@@ -91,8 +99,12 @@ OAuth usage endpoint is throttled.
    including `weekly_scoped`.
 5. **Map into `StoredLimit`.** Reuse `ParseLimits`' kind→label mapping so the
    scoped weekly (`weekly_scoped` → model display name) lands identically to the
-   OAuth path. Merge into the active account's `Limits`, stamp `LastFetchedMs`,
-   render.
+   OAuth path. Merge into the `Limits` of the account whose stored org UUID
+   matches the session's `lastActiveOrg` cookie — **not** the account currently
+   shown: the desktop app may be signed into a different account, and writing
+   the session's numbers onto the shown card poisons it until the next full
+   snapshot (seen in the wild 2026-07-17). If no tracked account matches the
+   session's org, refuse and say so. Stamp `LastFetchedMs`, render.
 6. **UI.** A single explicit button on the Limits page — e.g. "Limits look stuck?
    Fetch from the Claude app session" — with a one-line explanation that it reads
    the desktop app's claude.ai session locally, one time. Show success/failure

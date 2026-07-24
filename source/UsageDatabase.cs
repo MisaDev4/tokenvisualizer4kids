@@ -251,10 +251,19 @@ public sealed class UsageDatabase
         string rangeKey,
         PricingService? pricing = null,
         BucketUnit? unitOverride = null,
+        long sessionGapMs = 4 * 3_600_000L,
         CancellationToken cancellationToken = default)
     {
         var (startMs, endMs) = ResolveRange(rangeKey);
         await using var connection = await OpenConnectionAsync(cancellationToken);
+
+        if (rangeKey == "session")
+        {
+            // The current work session: everything since the last quiet
+            // stretch of at least sessionGapMs. No end — it runs to now.
+            startMs = await ResolveSessionStartAsync(connection, sessionGapMs, cancellationToken);
+            endMs = null;
+        }
 
         var where = BuildWhere(startMs, endMs);
         var totalsCommand = connection.CreateCommand();
@@ -354,7 +363,6 @@ public sealed class UsageDatabase
             }
         }
 
-        double? previousCost = null;
         if (pricing is not null)
         {
             (totals, models, bucketRows) = await ApplyCostsAsync(
@@ -368,19 +376,10 @@ public sealed class UsageDatabase
                 pricing,
                 unit,
                 cancellationToken);
-
-            if (ResolvePreviousRange(rangeKey) is { } previousRange)
-            {
-                previousCost = await ComputeCostAsync(
-                    connection, previousRange.StartMs, previousRange.EndMs, pricing, cancellationToken);
-            }
         }
 
         var buckets = FillBuckets(bucketRows, unit, startMs ?? firstEventMs, endMs);
-        return new DashboardData(totals, models, buckets, unit, lastUpdated)
-        {
-            PreviousCost = previousCost
-        };
+        return new DashboardData(totals, models, buckets, unit, lastUpdated);
     }
 
     private static async Task<(UsageTotals Totals, List<ModelUsageRow> Models, Dictionary<string, UsageBucket> Buckets)>
@@ -710,39 +709,6 @@ public sealed class UsageDatabase
         return days.Select(pair => new DailyUsageRow(pair.Key, pair.Value.Tokens, pair.Value.Cost)).ToList();
     }
 
-    private static async Task<double> ComputeCostAsync(
-        SqliteConnection connection,
-        long startMs,
-        long endMs,
-        PricingService pricing,
-        CancellationToken cancellationToken)
-    {
-        var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT provider, model, input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens, reasoning_tokens
-            FROM usage_events
-            WHERE timestamp_ms >= $start AND timestamp_ms < $end;
-            """;
-        command.Parameters.AddWithValue("$start", startMs);
-        command.Parameters.AddWithValue("$end", endMs);
-
-        var cost = 0d;
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            var tokens = new TokenBreakdown(
-                reader.GetInt64(2),
-                reader.GetInt64(3),
-                reader.GetInt64(4),
-                reader.GetInt64(5),
-                reader.GetInt64(6));
-            cost += pricing.Calculate(reader.GetString(0), reader.GetString(1), tokens).Cost;
-        }
-
-        return cost;
-    }
-
     /// <summary>
     /// Expands sparse bucket rows into an unbroken ascending series covering the whole
     /// range, so quiet hours/days render as true zeros instead of disappearing.
@@ -843,6 +809,7 @@ public sealed class UsageDatabase
     /// <summary>Typical bucket width, used only to estimate series length.</summary>
     private static double ApproximateUnitMs(BucketUnit unit) => unit switch
     {
+        BucketUnit.Second7_5 => 7_500,
         BucketUnit.Second15 => 15_000,
         BucketUnit.Second30 => 30_000,
         BucketUnit.Minute1 => 60_000,
@@ -850,12 +817,30 @@ public sealed class UsageDatabase
         BucketUnit.Minute15 => 900_000,
         BucketUnit.Minute30 => 1_800_000,
         BucketUnit.Hour => 3_600_000,
+        BucketUnit.Hour4 => 14_400_000,
+        BucketUnit.Hour12 => 43_200_000,
         BucketUnit.Day => 86_400_000,
         _ => 2_592_000_000
     };
 
     private static BucketUnit ResolveBucketUnit(string rangeKey, long startMs, long? endMs, long lastEventMs)
     {
+        if (rangeKey is "session")
+        {
+            // A session has no fixed length, so Auto picks by its actual span.
+            var sessionEnd = Math.Min(
+                endMs ?? long.MaxValue,
+                DateTimeOffset.Now.ToUnixTimeMilliseconds());
+            var spanHours = startMs > 0 && sessionEnd > startMs ? (sessionEnd - startMs) / 3_600_000d : 0;
+            return spanHours switch
+            {
+                <= 2 => BucketUnit.Minute1,
+                <= 8 => BucketUnit.Minute15,
+                <= 48 => BucketUnit.Hour,
+                _ => BucketUnit.Day
+            };
+        }
+
         if (rangeKey is "last1")
         {
             return BucketUnit.Minute1;
@@ -884,6 +869,7 @@ public sealed class UsageDatabase
     /// <summary>Fixed bucket duration for epoch-aligned units; 0 for calendar units.</summary>
     private static long UnitDurationMs(BucketUnit unit) => unit switch
     {
+        BucketUnit.Second7_5 => 7_500,
         BucketUnit.Second15 => 15_000,
         BucketUnit.Second30 => 30_000,
         BucketUnit.Minute1 => 60_000,
@@ -906,6 +892,14 @@ public sealed class UsageDatabase
         return unit switch
         {
             BucketUnit.Hour => "strftime('%Y-%m-%d %H:00', timestamp_ms / 1000, 'unixepoch', 'localtime')",
+            // Multi-hour buckets are calendar-aligned so they start at local
+            // midnight, unlike the epoch-aligned sub-hour units.
+            BucketUnit.Hour4 =>
+                "strftime('%Y-%m-%d ', timestamp_ms / 1000, 'unixepoch', 'localtime') || " +
+                "printf('%02d:00', (CAST(strftime('%H', timestamp_ms / 1000, 'unixepoch', 'localtime') AS INTEGER) / 4) * 4)",
+            BucketUnit.Hour12 =>
+                "strftime('%Y-%m-%d ', timestamp_ms / 1000, 'unixepoch', 'localtime') || " +
+                "printf('%02d:00', (CAST(strftime('%H', timestamp_ms / 1000, 'unixepoch', 'localtime') AS INTEGER) / 12) * 12)",
             BucketUnit.Month => "strftime('%Y-%m', timestamp_ms / 1000, 'unixepoch', 'localtime')",
             _ => "strftime('%Y-%m-%d', timestamp_ms / 1000, 'unixepoch', 'localtime')"
         };
@@ -913,7 +907,7 @@ public sealed class UsageDatabase
 
     private static string BucketKeyFormat(BucketUnit unit) => unit switch
     {
-        BucketUnit.Hour => "yyyy-MM-dd HH:00",
+        BucketUnit.Hour or BucketUnit.Hour4 or BucketUnit.Hour12 => "yyyy-MM-dd HH:00",
         BucketUnit.Month => "yyyy-MM",
         _ => "yyyy-MM-dd"
     };
@@ -921,6 +915,8 @@ public sealed class UsageDatabase
     private static DateTime FloorToUnit(DateTime value, BucketUnit unit) => unit switch
     {
         BucketUnit.Hour => new DateTime(value.Year, value.Month, value.Day, value.Hour, 0, 0),
+        BucketUnit.Hour4 => new DateTime(value.Year, value.Month, value.Day, value.Hour / 4 * 4, 0, 0),
+        BucketUnit.Hour12 => new DateTime(value.Year, value.Month, value.Day, value.Hour / 12 * 12, 0, 0),
         BucketUnit.Month => new DateTime(value.Year, value.Month, 1),
         _ => value.Date
     };
@@ -928,6 +924,8 @@ public sealed class UsageDatabase
     private static DateTime Advance(DateTime value, BucketUnit unit) => unit switch
     {
         BucketUnit.Hour => value.AddHours(1),
+        BucketUnit.Hour4 => value.AddHours(4),
+        BucketUnit.Hour12 => value.AddHours(12),
         BucketUnit.Month => value.AddMonths(1),
         _ => value.AddDays(1)
     };
@@ -943,6 +941,44 @@ public sealed class UsageDatabase
         pragma.CommandText = "PRAGMA busy_timeout = 5000;";
         await pragma.ExecuteNonQueryAsync(cancellationToken);
         return connection;
+    }
+
+    /// <summary>First event of the current work session: the newest event that
+    /// follows a gap of at least gapMs. When the recent history has no such
+    /// gap, the whole lookback is one session. Null only when there are no
+    /// events at all, which renders as an honest empty dashboard.</summary>
+    private static async Task<long?> ResolveSessionStartAsync(
+        SqliteConnection connection,
+        long gapMs,
+        CancellationToken cancellationToken)
+    {
+        // Sessions live in recent history; a bounded scan keeps the window
+        // query off the multi-year tail of the table.
+        var lookbackMs = DateTimeOffset.Now.AddDays(-30).ToUnixTimeMilliseconds();
+
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT timestamp_ms FROM (
+                SELECT timestamp_ms,
+                       timestamp_ms - LAG(timestamp_ms) OVER (ORDER BY timestamp_ms) AS gap
+                FROM usage_events
+                WHERE timestamp_ms >= $lookback
+            )
+            WHERE gap >= $gap
+            ORDER BY timestamp_ms DESC
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$lookback", lookbackMs);
+        command.Parameters.AddWithValue("$gap", gapMs);
+        if (await command.ExecuteScalarAsync(cancellationToken) is long start)
+        {
+            return start;
+        }
+
+        var earliest = connection.CreateCommand();
+        earliest.CommandText = "SELECT MIN(timestamp_ms) FROM usage_events WHERE timestamp_ms >= $lookback;";
+        earliest.Parameters.AddWithValue("$lookback", lookbackMs);
+        return await earliest.ExecuteScalarAsync(cancellationToken) is long first ? first : null;
     }
 
     private static (long? StartMs, long? EndMs) ResolveRange(string key)
@@ -961,34 +997,15 @@ public sealed class UsageDatabase
             "today" => (today.ToUnixTimeMilliseconds(), today.AddDays(1).ToUnixTimeMilliseconds()),
             "last24" => (now.AddHours(-24).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "last7" => (now.AddDays(-7).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
+            "last10" => (now.AddDays(-10).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
+            "last15" => (now.AddDays(-15).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "last30" => (now.AddDays(-30).ToUnixTimeMilliseconds(), now.ToUnixTimeMilliseconds()),
             "previousMonth" => (month.AddMonths(-1).ToUnixTimeMilliseconds(), month.ToUnixTimeMilliseconds()),
+            // Session is resolved against the data, not the clock; the caller
+            // overwrites this after asking ResolveSessionStartAsync.
+            "session" => (null, null),
             "all" => (null, null),
             _ => (month.ToUnixTimeMilliseconds(), month.AddMonths(1).ToUnixTimeMilliseconds())
-        };
-    }
-
-    /// <summary>The equivalent preceding window (same length, ending where the current one starts).</summary>
-    private static (long StartMs, long EndMs)? ResolvePreviousRange(string key)
-    {
-        var now = DateTimeOffset.Now;
-        var today = new DateTimeOffset(now.Year, now.Month, now.Day, 0, 0, 0, now.Offset);
-        var month = new DateTimeOffset(now.Year, now.Month, 1, 0, 0, 0, now.Offset);
-
-        return key switch
-        {
-            "last1" => (now.AddHours(-2).ToUnixTimeMilliseconds(), now.AddHours(-1).ToUnixTimeMilliseconds()),
-            "last4" => (now.AddHours(-8).ToUnixTimeMilliseconds(), now.AddHours(-4).ToUnixTimeMilliseconds()),
-            "last8" => (now.AddHours(-16).ToUnixTimeMilliseconds(), now.AddHours(-8).ToUnixTimeMilliseconds()),
-            "last12" => (now.AddHours(-24).ToUnixTimeMilliseconds(), now.AddHours(-12).ToUnixTimeMilliseconds()),
-            "last18" => (now.AddHours(-36).ToUnixTimeMilliseconds(), now.AddHours(-18).ToUnixTimeMilliseconds()),
-            "today" => (today.AddDays(-1).ToUnixTimeMilliseconds(), now.AddDays(-1).ToUnixTimeMilliseconds()),
-            "last24" => (now.AddHours(-48).ToUnixTimeMilliseconds(), now.AddHours(-24).ToUnixTimeMilliseconds()),
-            "last7" => (now.AddDays(-14).ToUnixTimeMilliseconds(), now.AddDays(-7).ToUnixTimeMilliseconds()),
-            "last30" => (now.AddDays(-60).ToUnixTimeMilliseconds(), now.AddDays(-30).ToUnixTimeMilliseconds()),
-            "currentMonth" => (month.AddMonths(-1).ToUnixTimeMilliseconds(), now.AddMonths(-1).ToUnixTimeMilliseconds()),
-            "previousMonth" => (month.AddMonths(-2).ToUnixTimeMilliseconds(), month.AddMonths(-1).ToUnixTimeMilliseconds()),
-            _ => null
         };
     }
 

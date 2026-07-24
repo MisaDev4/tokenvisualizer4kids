@@ -24,6 +24,7 @@ public partial class MainWindow : Window
     private readonly UsageCollector _collector;
     private readonly ClaudeLimitsService _limitsService = new();
     private readonly TerminalStatusService _terminalsService = new();
+    private readonly SessionTitleService _sessionTitles = new();
     private readonly LocalApiServer _apiServer;
     private readonly SemaphoreSlim _dashboardLock = new(1, 1);
     private bool _terminalsScanning;
@@ -37,14 +38,10 @@ public partial class MainWindow : Window
     private bool _limitsRefreshing;
     private bool _sessionRefreshing;
 
-    /// <summary>Id of the account shown in the compact bar — the one the manual
-    /// "refresh from Claude app session" button updates.</summary>
+    /// <summary>Id of the account shown in the compact bar. The manual session
+    /// refresh routes by org id, so this only detects when its numbers landed
+    /// on a different account than the one on screen.</summary>
     private string? _currentAccountId;
-
-    /// <summary>Newest activity seen in any local Claude Code terminal — the
-    /// limits service's proof that the signed-in account's 5-hour window is
-    /// already open before it uses the header-probe fallback.</summary>
-    private DateTimeOffset _lastClaudeActivityUtc = DateTimeOffset.MinValue;
     private bool _heatmapRefreshing;
     private string _heatmapViewKey = "year";
     private string _heatmapMetricKey = "tokens";
@@ -88,6 +85,31 @@ public partial class MainWindow : Window
     // Arrival cursor for the live pull: a longer round must not re-ingest
     // events that already settled into layers.
     private long _cupLastSeenMs;
+
+    // Recent-context chips: a session's context is the prompt side of its
+    // newest response (input + cache read + cache write). Thresholds are on the
+    // way to the typical 200k window — amber at half, red at three quarters.
+    private const long ContextLookbackMs = 30 * 60_000;
+    private const long ContextWarnTokens = 100_000;
+    private const long ContextHighTokens = 150_000;
+    private const int MaxContextChips = 8;
+
+    // Over-limit tier: from here single replies can run into dollars. Shown
+    // loudly wherever the session appears — no popups or toasts, the dashboard
+    // itself is the alert surface.
+    private const long ContextCriticalTokens = 300_000;
+
+    // Chip garbage collection: a session whose terminal has closed no longer
+    // holds that context in memory, so its chip drops after this short grace
+    // instead of lingering for the whole lookback. Sessions that never map to
+    // an open terminal (bench trials, the desktop app) get the same leash —
+    // while they keep producing responses they stay fresh and keep their chip.
+    private const long ContextClosedGraceMs = 3 * 60_000;
+    private Dictionary<string, TerminalStatus> _terminalsBySession = new(StringComparer.OrdinalIgnoreCase);
+
+    // The chip list only re-renders when a session's context actually moves;
+    // rebuilding every 250 ms tick would close any open chip tooltip.
+    private string _contextChipsSignature = "";
 
     /// <summary>One settled round: its blocks stay packed below the active floor.</summary>
     private sealed class CupLayer
@@ -142,6 +164,26 @@ public partial class MainWindow : Window
         new(300, "Every 5 minutes"),
         new(900, "Every 15 minutes")
     ];
+
+    private sealed record SessionGapChoice(double Hours, string Label)
+    {
+        public override string ToString() => Label;
+    }
+
+    private static readonly SessionGapChoice[] SessionGaps =
+    [
+        new(1, "1 hour of quiet"),
+        new(2, "2 hours of quiet"),
+        new(3, "3 hours of quiet"),
+        new(4, "4 hours of quiet"),
+        new(6, "6 hours of quiet"),
+        new(8, "8 hours of quiet"),
+        new(12, "12 hours of quiet")
+    ];
+
+    /// <summary>Span of the current session per the latest dashboard fetch;
+    /// null before the first Session-range fetch (or when there is no data).</summary>
+    private long? _sessionSpanMs;
 
     public MainWindow()
     {
@@ -204,6 +246,10 @@ public partial class MainWindow : Window
         IntervalComboBox.SelectedItem = Intervals
             .OrderBy(interval => Math.Abs(interval.Seconds - _settings.ReconcileSeconds))
             .First();
+        SessionGapComboBox.ItemsSource = SessionGaps;
+        SessionGapComboBox.SelectedItem = SessionGaps
+            .OrderBy(choice => Math.Abs(choice.Hours - _settings.SessionGapHours))
+            .First();
         try
         {
             StartupCheckBox.IsChecked = StartupRegistration.IsEnabled();
@@ -214,6 +260,10 @@ public partial class MainWindow : Window
         }
 
         PrivacyCheckBox.IsChecked = _settings.HidePersonalData;
+        HeroSessionCheckBox.IsChecked = _settings.ShowHeroSessionLimit;
+        HeroWeeklyCheckBox.IsChecked = _settings.ShowHeroWeeklyLimit;
+        HeroScopedCheckBox.IsChecked = _settings.ShowHeroScopedLimit;
+        ApplyHeroLimitVisibility();
         ApiCheckBox.IsChecked = _settings.ApiServerEnabled;
         if (_settings.ApiServerEnabled)
         {
@@ -275,21 +325,31 @@ public partial class MainWindow : Window
         {
             var terminals = await _terminalsService.ScanAsync(TimeSpan.FromHours(6));
             _apiServer.UpdateTerminals(terminals);
+            await Task.Run(() => _sessionTitles.Refresh(terminals));
+
+            // Session → terminal, so the live context chips can say which
+            // project a session belongs to instead of a bare session id.
+            var bySession = new Dictionary<string, TerminalStatus>(StringComparer.OrdinalIgnoreCase);
             foreach (var terminal in terminals)
             {
-                if (terminal.App != TerminalApp.Codex && terminal.LastActivity > _lastClaudeActivityUtc)
-                {
-                    _lastClaudeActivityUtc = terminal.LastActivity;
-                }
+                bySession[terminal.SessionId] = terminal;
             }
 
+            _terminalsBySession = bySession;
             if (_disposed)
             {
                 return;
             }
 
-            var duplicateNames = terminals
-                .GroupBy(status => status.ProjectName, StringComparer.OrdinalIgnoreCase)
+            // A terminal is named by what its chat is about (the session's
+            // first prompt); the folder name is the fallback. Two identical
+            // names still get a session stub so the tiles stay tellable apart.
+            var nameBySession = terminals.ToDictionary(
+                status => status.SessionId,
+                status => SessionTopic(status.SessionId) ?? DisplayProject(status.ProjectName),
+                StringComparer.OrdinalIgnoreCase);
+            var duplicateNames = nameBySession.Values
+                .GroupBy(name => name, StringComparer.OrdinalIgnoreCase)
                 .Where(group => group.Count() > 1)
                 .Select(group => group.Key)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -312,9 +372,10 @@ public partial class MainWindow : Window
                         "Mid-turn: the model is generating or running tools.")
                 };
                 var displayName = DisplayProject(status.ProjectName);
-                var name = duplicateNames.Contains(status.ProjectName)
-                    ? $"{displayName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
-                    : displayName;
+                var baseName = nameBySession[status.SessionId];
+                var name = duplicateNames.Contains(baseName)
+                    ? $"{baseName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
+                    : baseName;
                 var displayPath = HidePersonal
                     ? $@"~\…\{displayName}"
                     : status.ProjectPath;
@@ -330,7 +391,10 @@ public partial class MainWindow : Window
                     iconGeometry,
                     iconBrush,
                     displayPath,
-                    $"{appName} · {displayPath}\n{meaning}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}");
+                    $"{appName} · {displayPath}\n{meaning}{SessionPromptLines(status.SessionId)}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}" +
+                        (status.Pid > 0 ? "\n\nClick to bring this terminal to the front." : ""),
+                    status.Pid,
+                    status.Pid > 0 ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow);
             }).ToList();
 
             var ready = terminals.Count(status => status.State == TerminalState.Ready);
@@ -374,7 +438,9 @@ public partial class MainWindow : Window
         Geometry IconGeometry,
         Brush IconBrush,
         string PathText,
-        string Tooltip);
+        string Tooltip,
+        int Pid,
+        System.Windows.Input.Cursor Cursor);
 
     /// <summary>One line of truth about how live an account's numbers are —
     /// being signed in no longer hides a feed that can't actually update.</summary>
@@ -392,11 +458,10 @@ public partial class MainWindow : Window
                     : "stale — waiting for its next sign-in"
                 : "tracked in the background";
 
-        // An open cooldown always shows, even while header probes keep the
-        // headline numbers fresh — it is the reason the model-scoped rows
-        // are frozen, and hiding it made the feed look silently broken.
+        // An open 429 cooldown always shows — it is the reason the numbers
+        // are paused, and hiding it made the feed look silently broken.
         return account.CooldownUntil is { } cooldown
-            ? $"{status} · rate limited by Anthropic — full refresh {cooldown.LocalDateTime:h:mm tt}"
+            ? $"{status} · rate limited by Anthropic — retries {cooldown.LocalDateTime:h:mm tt}"
             : status;
     }
 
@@ -419,8 +484,7 @@ public partial class MainWindow : Window
                 // Keep the last drawn grid; the next tick retries.
             }
 
-            var accounts = await _limitsService.FetchAllAsync(
-                _lastClaudeActivityUtc > DateTimeOffset.UtcNow.AddMinutes(-10));
+            var accounts = await _limitsService.FetchAllAsync();
             _apiServer.UpdateLimits(accounts);
             if (_disposed)
             {
@@ -455,15 +519,6 @@ public partial class MainWindow : Window
                     : " · awaiting first fetch"
                 : "";
 
-            // The model-scoped rows only update on full usage snapshots; while
-            // header probes keep the headline rows fresher, say when the
-            // scoped numbers were actually taken instead of implying they are
-            // as live as the rest.
-            var scopedAgeNote = current.SnapshotAt is { } snapshot &&
-                                current.FetchedAt is { } freshest &&
-                                freshest - snapshot > TimeSpan.FromMinutes(20)
-                ? $" · data from {snapshot.LocalDateTime:h:mm tt}"
-                : dataAgeNote;
             LimitsPanel.ItemsSource = current.Limits.Select(limit =>
             {
                 var elevated = limit.Severity is "critical" or "warning" || limit.Percent >= 70;
@@ -479,10 +534,10 @@ public partial class MainWindow : Window
                     elevated ? barBrush : (Brush)FindResource("InkBrush"),
                     resets,
                     $"{currentEmail} · {LimitTitle(limit.Label)} — {limit.Percent:0}% used" +
-                    (resets.Length > 0 ? $" · {resets}" : "") +
-                    (limit.Label is "5h" or "Week" ? dataAgeNote : scopedAgeNote));
+                    (resets.Length > 0 ? $" · {resets}" : "") + dataAgeNote);
             }).ToList();
             LimitsStrip.Visibility = Visibility.Visible;
+            UpdateHeroLimits(current);
 
             // Local usage attributed per account: events that landed while the
             // account was the signed-in one (the transcripts themselves carry
@@ -534,9 +589,9 @@ public partial class MainWindow : Window
                     return new LimitDetailVm(
                         LimitTitle(limit.Label),
                         limit.ResetsAt is { } at ? FormatResetDetail(at)
-                        : limit is { Label: "5h", Percent: 0 }
-                            ? "idle — a new 5-hour window starts with the next message"
-                            : "reset time unknown",
+                            : limit is { Label: "5h", Percent: 0 }
+                                ? "idle — a new 5-hour window starts with the next message"
+                                : "reset time unknown",
                         $"{limit.Percent:0}%",
                         LimitBarBrush(limit),
                         Math.Clamp(limit.Percent / 100.0, 0, 1),
@@ -870,6 +925,107 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>The dashboard hero mirrors the signed-in account's three
+    /// work-stopping limits: the 5-hour session window, the all-model weekly
+    /// allowance, and the scoped weekly row (Fable on this machine; the fullest
+    /// scoped row when there is no Fable-named one). The scoped row can sit at
+    /// 100% while the overall week still has room, so both weeklies are shown.</summary>
+    private void UpdateHeroLimits(ClaudeAccountLimits account)
+    {
+        var session = account.Limits.FirstOrDefault(limit => limit.Label == "5h");
+        var weekly = account.Limits.FirstOrDefault(limit => limit.Label == "Week");
+        var scoped = account.Limits.FirstOrDefault(limit =>
+                limit.Label.Contains("Fable", StringComparison.OrdinalIgnoreCase)) ??
+            account.Limits
+                .Where(limit => limit.Label is not ("5h" or "Week"))
+                .OrderByDescending(limit => limit.Percent)
+                .FirstOrDefault();
+
+        UpdateHeroLimit(session, HeroSessionLimitText, HeroSessionLimitReset, HeroSessionLimitBar, HeroSessionResetBar);
+        UpdateHeroLimit(weekly, HeroWeeklyLimitText, HeroWeeklyLimitReset, HeroWeeklyLimitBar, HeroWeeklyResetBar);
+        HeroScopedLimitLabel.Text = scoped is null ? "Fable limit" : $"{scoped.Label} limit";
+        UpdateHeroLimit(scoped, HeroScopedLimitText, HeroScopedLimitReset, HeroScopedLimitBar, HeroScopedResetBar);
+        ApplyHeroLimitVisibility();
+    }
+
+    /// <summary>Shows only the meters picked in Settings. The gap between blocks
+    /// rides on the block itself so whichever one lands on top sits flush, and
+    /// the column plus its divider disappear when nothing is selected.</summary>
+    private void ApplyHeroLimitVisibility()
+    {
+        var blocks = new (StackPanel Block, bool Show)[]
+        {
+            (HeroSessionBlock, _settings.ShowHeroSessionLimit),
+            (HeroWeeklyBlock, _settings.ShowHeroWeeklyLimit),
+            (HeroScopedBlock, _settings.ShowHeroScopedLimit)
+        };
+
+        var isFirstVisible = true;
+        foreach (var (block, show) in blocks)
+        {
+            block.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            if (!show)
+            {
+                continue;
+            }
+
+            block.Margin = new Thickness(0, isFirstVisible ? 0 : 9, 0, 0);
+            isFirstVisible = false;
+        }
+
+        var anyVisible = blocks.Any(entry => entry.Show);
+        HeroLimits.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
+        HeroLimitsDivider.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void UpdateHeroLimit(
+        ClaudeLimit? limit,
+        TextBlock value,
+        TextBlock reset,
+        System.Windows.Controls.ProgressBar bar,
+        System.Windows.Controls.ProgressBar resetBar)
+    {
+        if (limit is null)
+        {
+            value.Text = "—";
+            value.Foreground = (Brush)FindResource("InkBrush");
+            reset.Text = "";
+            bar.Value = 0;
+            resetBar.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var brush = LimitBarBrush(limit);
+        var elevated = limit.Severity is "critical" or "warning" || limit.Percent >= 70;
+        value.Text = $"{limit.Percent:0}%";
+        value.Foreground = elevated ? brush : (Brush)FindResource("InkBrush");
+        value.ToolTip = $"{LimitTitle(limit.Label)} — {limit.Percent:0}% used";
+        reset.Text = limit.ResetsAt is { } at ? $"resets {FormatResetTime(at.ToLocalTime())}"
+            : limit is { Label: "5h", Percent: 0 } ? "idle"
+            : "";
+        bar.Foreground = brush;
+        bar.Value = Math.Clamp(limit.Percent / 100.0, 0, 1);
+
+        // The thin bar under the usage bar: how far through the limit window
+        // we are, i.e. how close the reset is — same as the limits page.
+        if (limit.ResetsAt is { } resetsAtDue)
+        {
+            var period = limit.Label == "5h" ? TimeSpan.FromHours(5) : TimeSpan.FromDays(7);
+            var resetShare = Math.Clamp(
+                1 - (resetsAtDue - DateTimeOffset.Now).TotalMilliseconds / period.TotalMilliseconds,
+                0,
+                1);
+            resetBar.Value = resetShare;
+            resetBar.ToolTip = $"{resetShare * 100:0}% of the way through this " +
+                               $"{(limit.Label == "5h" ? "5-hour window" : "week")}";
+            resetBar.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            resetBar.Visibility = Visibility.Collapsed;
+        }
+    }
+
     private Brush LimitBarBrush(ClaudeLimit limit) => limit.Severity switch
     {
         "critical" => LimitCriticalBrush,
@@ -931,10 +1087,12 @@ public partial class MainWindow : Window
 
     private readonly Dictionary<string, string> _maskedEmails = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _maskedProjects = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly string[] MaskAccountNames = ["sam", "alex", "kai", "riley", "jordan", "casey"];
 
     private bool HidePersonal => _settings.HidePersonalData;
 
+    /// <summary>"acc1", "acc2", … — nothing of the real address survives, and
+    /// each account keeps its number for the run so several cards still read as
+    /// distinct accounts.</summary>
     private string DisplayEmail(string email)
     {
         if (!HidePersonal || string.IsNullOrEmpty(email))
@@ -944,7 +1102,7 @@ public partial class MainWindow : Window
 
         if (!_maskedEmails.TryGetValue(email, out var masked))
         {
-            masked = $"{MaskAccountNames[_maskedEmails.Count % MaskAccountNames.Length]}@example.com";
+            masked = $"acc{_maskedEmails.Count + 1}";
             _maskedEmails[email] = masked;
         }
 
@@ -981,6 +1139,20 @@ public partial class MainWindow : Window
             : path;
     }
 
+    private void HeroLimitCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _settings.ShowHeroSessionLimit = HeroSessionCheckBox.IsChecked == true;
+        _settings.ShowHeroWeeklyLimit = HeroWeeklyCheckBox.IsChecked == true;
+        _settings.ShowHeroScopedLimit = HeroScopedCheckBox.IsChecked == true;
+        _settings.Save();
+        ApplyHeroLimitVisibility();
+    }
+
     private void PrivacyCheckBox_Changed(object sender, RoutedEventArgs e)
     {
         if (!_loaded)
@@ -1009,7 +1181,7 @@ public partial class MainWindow : Window
         SessionRefreshStatus.Text = "Reading the Claude app session…";
         try
         {
-            var status = await _limitsService.RefreshFromSessionAsync(_currentAccountId ?? "");
+            var result = await _limitsService.RefreshFromSessionAsync();
             if (_disposed)
             {
                 return;
@@ -1019,10 +1191,14 @@ public partial class MainWindow : Window
             // the fresh limits, and FetchAllAsync returns them without touching
             // the throttled usage endpoint.
             await RefreshLimitsAsync();
-            SessionRefreshStatus.Foreground = status.StartsWith("Updated", StringComparison.Ordinal)
+            SessionRefreshStatus.Foreground = result.UpdatedAccountId is not null
                 ? (Brush)FindResource("InkBrush")
                 : (Brush)FindResource("MutedBrush");
-            SessionRefreshStatus.Text = status;
+            SessionRefreshStatus.Text =
+                result is { UpdatedAccountId: { } updatedId, UpdatedEmail: { } updatedEmail } &&
+                updatedId != _currentAccountId
+                    ? $"Updated {DisplayEmail(updatedEmail)} — the account the Claude app is signed into."
+                    : result.Status;
         }
         catch
         {
@@ -1256,11 +1432,12 @@ public partial class MainWindow : Window
     /// </summary>
     private void UpdateBarsAvailability()
     {
-        var spanMs = RangeSpanMs(_rangeKey);
+        var spanMs = _rangeKey == "session" ? _sessionSpanMs : RangeSpanMs(_rangeKey);
         foreach (var (radio, key) in new[]
                  {
-                     (BarsS15, "s15"), (BarsS30, "s30"), (BarsM1, "m1"), (BarsM5, "m5"),
-                     (BarsM15, "m15"), (BarsM30, "m30"), (BarsH1, "h1"), (BarsD1, "d1")
+                     (BarsS75, "s75"), (BarsS15, "s15"), (BarsS30, "s30"), (BarsM1, "m1"), (BarsM5, "m5"),
+                     (BarsM15, "m15"), (BarsM30, "m30"), (BarsH1, "h1"), (BarsH4, "h4"), (BarsH12, "h12"),
+                     (BarsD1, "d1")
                  })
         {
             var unitMs = BarsUnitMs(key);
@@ -1295,6 +1472,8 @@ public partial class MainWindow : Window
             "last18" => 18 * 3_600_000L,
             "last24" => 24 * 3_600_000L,
             "last7" => 7 * 86_400_000L,
+            "last10" => 10 * 86_400_000L,
+            "last15" => 15 * 86_400_000L,
             "last30" => 30 * 86_400_000L,
             "today" => Math.Max(3_600_000L, now.ToUnixTimeMilliseconds() -
                 new DateTimeOffset(now.Year, now.Month, now.Day, 0, 0, 0, now.Offset).ToUnixTimeMilliseconds()),
@@ -1306,6 +1485,7 @@ public partial class MainWindow : Window
 
     private static long BarsUnitMs(string key) => key switch
     {
+        "s75" => 7_500,
         "s15" => 15_000,
         "s30" => 30_000,
         "m1" => 60_000,
@@ -1313,12 +1493,15 @@ public partial class MainWindow : Window
         "m15" => 900_000,
         "m30" => 1_800_000,
         "h1" => 3_600_000,
+        "h4" => 14_400_000,
+        "h12" => 43_200_000,
         "d1" => 86_400_000,
         _ => 0
     };
 
     private static BucketUnit? BarsUnitFor(string key) => key switch
     {
+        "s75" => BucketUnit.Second7_5,
         "s15" => BucketUnit.Second15,
         "s30" => BucketUnit.Second30,
         "m1" => BucketUnit.Minute1,
@@ -1326,6 +1509,8 @@ public partial class MainWindow : Window
         "m15" => BucketUnit.Minute15,
         "m30" => BucketUnit.Minute30,
         "h1" => BucketUnit.Hour,
+        "h4" => BucketUnit.Hour4,
+        "h12" => BucketUnit.Hour12,
         "d1" => BucketUnit.Day,
         _ => null
     };
@@ -1736,7 +1921,6 @@ public partial class MainWindow : Window
         {
             existing.Event = row;
             existing.Cost = estimate.Cost;
-            existing.Visual.ToolTip = BuildLiveTooltip(row, estimate);
             if (!existing.Frozen)
             {
                 _cupLayoutDirty = true;
@@ -1784,7 +1968,6 @@ public partial class MainWindow : Window
     private FrameworkElement CreateCupVisual(LiveBubble bubble)
     {
         var row = bubble.Event;
-        var estimate = new PricingEstimate(bubble.Cost, bubble.Cost > 0);
         var fill = new SolidColorBrush(LiveModelColor(row.Model)) { Opacity = 0.85 };
         fill.Freeze();
         var label = new TextBlock
@@ -1797,15 +1980,23 @@ public partial class MainWindow : Window
             TextTrimming = TextTrimming.CharacterEllipsis
         };
         bubble.Label = label;
-        return new Border
+        var visual = new Border
         {
             Background = fill,
             BorderBrush = LiveStrokeBrush(),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(5),
             Child = label,
-            ToolTip = BuildLiveTooltip(row, estimate)
+            ToolTip = BuildLiveTooltip(row)
         };
+        ToolTipService.SetInitialShowDelay(visual, 150);
+        ToolTipService.SetShowDuration(visual, 60000);
+
+        // The session's name, its terminal and its prompts all land after the
+        // block does — and the block keeps growing while output streams — so
+        // rebuild the text on every hover instead of freezing it at spawn.
+        visual.ToolTipOpening += (_, _) => visual.ToolTip = BuildLiveTooltip(bubble.Event);
+        return visual;
     }
 
     /// <summary>Round bookkeeping and counters, every 250 ms; the cup keeps
@@ -1827,8 +2018,19 @@ public partial class MainWindow : Window
 
         double costWindow = 0, cost60 = 0, cost5m = 0;
         long tokensWindow = 0, tokens60 = 0, tokens5m = 0, messagesWindow = 0;
+        var latestBySession = new Dictionary<string, LiveEventRow>(StringComparer.Ordinal);
         foreach (var bubble in _cupBubbles.Values)
         {
+            // Sessions active in the lookback, each represented by its newest
+            // response — the one whose prompt side is the session's context now.
+            var row = bubble.Event;
+            if (nowMs - row.TimestampMs <= ContextLookbackMs &&
+                (!latestBySession.TryGetValue(row.SessionId, out var newest) ||
+                 row.TimestampMs > newest.TimestampMs))
+            {
+                latestBySession[row.SessionId] = row;
+            }
+
             // Frozen (settled) blocks are out of the current round but still
             // count toward the rolling 5-minute pace.
             if (nowMs - bubble.FirstSeenMs <= 300_000)
@@ -1861,6 +2063,263 @@ public partial class MainWindow : Window
         LiveFeedRateText.Text = cost5m > 0 || tokens5m > 0
             ? $"{FormatMoney(cost5m / 5)}/min · {FormatCompact((long)(tokens5m / 300.0))} tok/s · 5 m avg"
             : "";
+
+        UpdateContextChips(latestBySession);
+    }
+
+    /// <summary>Recent session contexts, largest first: one chip per session in
+    /// the live feed card, amber then red as a session grows — with a red card
+    /// border and a dashboard badge once the biggest one runs high.</summary>
+    private void UpdateContextChips(Dictionary<string, LiveEventRow> latestBySession)
+    {
+        var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        var eligible = latestBySession.Values
+            .Where(row => _terminalsBySession.ContainsKey(row.SessionId) ||
+                          nowMs - row.TimestampMs <= ContextClosedGraceMs)
+            .Select(row => (Row: row, Context: row.Tokens.Input + row.Tokens.CacheRead + row.Tokens.CacheWrite))
+            .OrderByDescending(item => item.Context)
+            .ToList();
+        var sessions = eligible.Take(MaxContextChips).ToList();
+
+        var topContext = sessions.Count > 0 ? sessions[0].Context : 0;
+        if (topContext >= ContextHighTokens)
+        {
+            LiveFeedCard.BorderBrush = LimitCriticalBrush;
+            LiveFeedCard.BorderThickness = new Thickness(1.5);
+        }
+        else
+        {
+            // Back to the Card style's hairline once no session is running high.
+            LiveFeedCard.ClearValue(Border.BorderBrushProperty);
+            LiveFeedCard.ClearValue(Border.BorderThicknessProperty);
+        }
+
+        var signature = string.Join("|", sessions.Select(item => $"{item.Row.SessionId}:{item.Context}"));
+        if (signature == _contextChipsSignature)
+        {
+            return;
+        }
+
+        _contextChipsSignature = signature;
+
+        // Two terminals in the same project would otherwise be identical chips.
+        var duplicateNames = sessions
+            .GroupBy(item => ContextSessionName(item.Row), StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() > 1)
+            .Select(group => group.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        ContextChipsList.ItemsSource = sessions.Select(item =>
+        {
+            var name = ContextSessionName(item.Row);
+            if (duplicateNames.Contains(name))
+            {
+                name = $"{name} · {item.Row.SessionId[..Math.Min(4, item.Row.SessionId.Length)]}";
+            }
+
+            if (item.Context >= ContextCriticalTokens)
+            {
+                name = $"⚠ {name}";
+            }
+
+            var accent = item.Context >= ContextHighTokens ? LimitCriticalBrush
+                : item.Context >= ContextWarnTokens ? LimitWarningBrush
+                : (Brush)FindResource("InkBrush");
+            var outline = item.Context >= ContextCriticalTokens ? ContextCriticalOutline
+                : item.Context >= ContextHighTokens ? ContextHighOutline
+                : item.Context >= ContextWarnTokens ? ContextWarnOutline
+                : (Brush)FindResource("HairlineBrush");
+            var fill = item.Context >= ContextCriticalTokens ? ContextCriticalFill
+                : item.Context >= ContextHighTokens ? ContextHighFill
+                : item.Context >= ContextWarnTokens ? ContextWarnFill
+                : ContextChipFill;
+            var pid = SessionPid(item.Row.SessionId);
+            return new ContextChipVm(
+                name,
+                FormatCompact(item.Context),
+                accent,
+                fill,
+                outline,
+                ContextTooltip(item.Row, item.Context) +
+                    (pid > 0 ? "\n\nClick to bring this terminal to the front." : ""),
+                pid,
+                pid > 0 ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow);
+        }).ToList();
+
+        // The dashboard hero mirrors the top few: name, size, and a bar
+        // filling toward the alarm line so "how close to trouble" reads at
+        // a glance without opening the live feed.
+        var heroSessions = sessions.Take(3).ToList();
+        HeroContextEmpty.Visibility = heroSessions.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        HeroContextList.ItemsSource = heroSessions.Select(item =>
+        {
+            var overLimit = item.Context >= ContextCriticalTokens;
+            var tier = item.Context >= ContextHighTokens ? LimitCriticalBrush
+                : item.Context >= ContextWarnTokens ? LimitWarningBrush
+                : null;
+            var fill = overLimit ? ContextCriticalFill
+                : item.Context >= ContextHighTokens ? ContextHighFill
+                : item.Context >= ContextWarnTokens ? ContextWarnFill
+                : ContextChipFill;
+            var outline = overLimit ? ContextCriticalOutline
+                : item.Context >= ContextHighTokens ? ContextHighOutline
+                : item.Context >= ContextWarnTokens ? ContextWarnOutline
+                : (Brush)FindResource("HairlineBrush");
+            var pid = SessionPid(item.Row.SessionId);
+            return new HeroContextVm(
+                (overLimit ? "⚠ " : "") + ContextSessionName(item.Row),
+                overLimit ? $"{FormatCompact(item.Context)} · over limit" : FormatCompact(item.Context),
+                tier ?? (Brush)FindResource("InkBrush"),
+                tier ?? (Brush)FindResource("AccentBrush"),
+                fill,
+                outline,
+                Math.Clamp(item.Context / (double)ContextCriticalTokens, 0, 1),
+                ContextTooltip(item.Row, item.Context) +
+                    (pid > 0 ? "\n\nClick to bring this terminal to the front." : ""),
+                pid,
+                pid > 0 ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow);
+        }).ToList();
+    }
+
+    private sealed record HeroContextVm(
+        string Name,
+        string Tokens,
+        Brush Accent,
+        Brush BarBrush,
+        Brush Fill,
+        Brush Outline,
+        double Share,
+        string Tooltip,
+        int Pid,
+        System.Windows.Input.Cursor Cursor);
+
+    private void HeroContext_Clicked(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: HeroContextVm { Pid: > 0 } vm })
+        {
+            TerminalFocusService.TryFocus(vm.Pid);
+        }
+    }
+
+    private void ContextChip_Clicked(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: ContextChipVm { Pid: > 0 } vm })
+        {
+            TerminalFocusService.TryFocus(vm.Pid);
+        }
+    }
+
+    private void TerminalTile_Clicked(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: TerminalTileVm { Pid: > 0 } vm })
+        {
+            TerminalFocusService.TryFocus(vm.Pid);
+        }
+    }
+
+    private int SessionPid(string sessionId) =>
+        _terminalsBySession.TryGetValue(sessionId, out var terminal) ? terminal.Pid : 0;
+
+    /// <summary>Which chat a session is: its first prompt when one is known
+    /// (works even after the terminal closed — history remembers), then the
+    /// project name while the terminal is open, then the client plus a stub.</summary>
+    private string ContextSessionName(LiveEventRow row)
+    {
+        if (SessionTopic(row.SessionId) is { } topic)
+        {
+            return $"“{topic}”";
+        }
+
+        if (_terminalsBySession.TryGetValue(row.SessionId, out var terminal))
+        {
+            return DisplayProject(terminal.ProjectName);
+        }
+
+        var stub = row.SessionId.Length > 6 ? row.SessionId[..6] : row.SessionId;
+        return $"{row.Client} · {stub}";
+    }
+
+    /// <summary>What the session's chat is about, fit for a title: the first
+    /// prompt, trimmed. Null when unknown — or when personal data is hidden,
+    /// since prompts are exactly the kind of text that setting exists for.</summary>
+    private string? SessionTopic(string sessionId)
+    {
+        if (HidePersonal)
+        {
+            return null;
+        }
+
+        return _sessionTitles.TitleFor(sessionId) is { } title
+            ? TrimTopic(title.First, 48)
+            : null;
+    }
+
+    /// <summary>Tooltip lines with the full story: the opening prompt plus the
+    /// latest one when they differ. Empty when unknown or personal data is hidden.</summary>
+    private string SessionPromptLines(string sessionId)
+    {
+        if (HidePersonal || _sessionTitles.TitleFor(sessionId) is not { } title)
+        {
+            return "";
+        }
+
+        var lines = $"\nfirst prompt: “{TrimTopic(title.First, 160)}”";
+        if (!string.Equals(title.Latest, title.First, StringComparison.Ordinal))
+        {
+            lines += $"\nlatest prompt: “{TrimTopic(title.Latest, 160)}”";
+        }
+
+        return lines;
+    }
+
+    private static string TrimTopic(string text, int max) =>
+        text.Length <= max ? text : text[..(max - 1)].TrimEnd() + "…";
+
+    /// <summary>Where a session lives: its terminal's working directory (the
+    /// project name when personal data is hidden), or an honest "no match".</summary>
+    private string ContextPlace(string sessionId) =>
+        _terminalsBySession.TryGetValue(sessionId, out var terminal)
+            ? (HidePersonal ? DisplayProject(terminal.ProjectName) : terminal.ProjectPath)
+            : "no open terminal matched";
+
+    private string ContextTooltip(LiveEventRow row, long context)
+    {
+        var tokens = row.Tokens;
+        var time = DateTimeOffset.FromUnixTimeMilliseconds(row.TimestampMs).ToLocalTime();
+        var place = ContextPlace(row.SessionId);
+        return $"{ContextSessionName(row)}\n{row.Model} · last response {time:h:mm:ss tt}\n{place}" +
+               $"{SessionPromptLines(row.SessionId)}\n\n" +
+               $"Context now: {context:N0} tokens\n" +
+               $"(input {tokens.Input:N0} + cache read {tokens.CacheRead:N0} + cache write {tokens.CacheWrite:N0})\n" +
+               $"Session {row.SessionId}\n\n" +
+               $"Amber from {FormatCompact(ContextWarnTokens)}, red from {FormatCompact(ContextHighTokens)}, " +
+               $"over limit from {FormatCompact(ContextCriticalTokens)}: " +
+               "a big context makes every following response cost more.";
+    }
+
+    private sealed record ContextChipVm(
+        string Name,
+        string Tokens,
+        Brush Accent,
+        Brush Fill,
+        Brush Outline,
+        string Tooltip,
+        int Pid,
+        System.Windows.Input.Cursor Cursor);
+
+    private static readonly Brush ContextChipFill = Frozen(Color.FromRgb(0x14, 0x14, 0x13));
+    private static readonly Brush ContextWarnFill = Frozen(Color.FromArgb(0x22, 0xE0, 0xA4, 0x58));
+    private static readonly Brush ContextHighFill = Frozen(Color.FromArgb(0x26, 0xE5, 0x53, 0x4B));
+    private static readonly Brush ContextWarnOutline = Frozen(Color.FromArgb(0x66, 0xE0, 0xA4, 0x58));
+    private static readonly Brush ContextHighOutline = Frozen(Color.FromArgb(0x8C, 0xE5, 0x53, 0x4B));
+    private static readonly Brush ContextCriticalFill = Frozen(Color.FromArgb(0x40, 0xE5, 0x53, 0x4B));
+    private static readonly Brush ContextCriticalOutline = Frozen(Color.FromArgb(0xE0, 0xE5, 0x53, 0x4B));
+
+    private static SolidColorBrush Frozen(Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
     }
 
     /// <summary>Cup round lifecycle: countdown → the pile settles into a layer → fresh round on top.</summary>
@@ -2388,16 +2847,24 @@ public partial class MainWindow : Window
             .ToList();
     }
 
-    private static string BuildLiveTooltip(LiveEventRow row, PricingEstimate estimate)
+    /// <summary>What a block in the cup is. Leads with which chat it came from —
+    /// the same name, folder and prompts the context chips show — because
+    /// "where did that $2 reply come from?" is the question a pricey block
+    /// raises; the token split follows underneath.</summary>
+    private string BuildLiveTooltip(LiveEventRow row)
     {
+        var estimate = _pricing.Calculate(row.Provider, row.Model, row.Tokens);
         var tokens = row.Tokens;
         var time = DateTimeOffset.FromUnixTimeMilliseconds(row.TimestampMs).ToLocalTime();
-        var session = row.SessionId.Length > 12 ? row.SessionId[..12] + "…" : row.SessionId;
-        return $"{row.Model}\n{row.Client} · {row.Provider} · {time:h:mm:ss tt}\n\n" +
+        return $"{ContextSessionName(row)}\n" +
+               $"{row.Model} · {row.Client} · {time:h:mm:ss tt}\n" +
+               $"{ContextPlace(row.SessionId)}" +
+               $"{SessionPromptLines(row.SessionId)}\n\n" +
                $"Cost: {(estimate.IsPriced ? estimate.Cost.ToString("C4", Usd) : "no pricing match")}\n" +
                $"Input: {tokens.Input:N0} · Output: {tokens.Output:N0}\n" +
                $"Cache read: {tokens.CacheRead:N0} · write: {tokens.CacheWrite:N0}\n" +
-               $"Reasoning: {tokens.Reasoning:N0} · Session: {session}";
+               $"Reasoning: {tokens.Reasoning:N0}\n" +
+               $"Session {row.SessionId}";
     }
 
     private RadioButton TabRadioFor(string key) => key switch
@@ -2471,6 +2938,22 @@ public partial class MainWindow : Window
         StatusText.Text = $"Safety check set to {selected.Label.ToLowerInvariant()}";
     }
 
+    private async void SessionGapComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_loaded || SessionGapComboBox.SelectedItem is not SessionGapChoice selected)
+        {
+            return;
+        }
+
+        _settings.SessionGapHours = selected.Hours;
+        _settings.Save();
+        StatusText.Text = $"A session now ends after {selected.Label.ToLowerInvariant()}";
+        if (_rangeKey == "session")
+        {
+            await RefreshDashboardAsync();
+        }
+    }
+
     private void StartupCheckBox_Changed(object sender, RoutedEventArgs e)
     {
         if (!_loaded)
@@ -2500,8 +2983,26 @@ public partial class MainWindow : Window
 
         try
         {
-            var data = await _database.GetDashboardAsync(_rangeKey, _pricing, BarsUnitFor(_barsKey));
+            var data = await _database.GetDashboardAsync(
+                _rangeKey,
+                _pricing,
+                BarsUnitFor(_barsKey),
+                (long)(_settings.SessionGapHours * 3_600_000));
             _latestData = data;
+
+            // A session's length only becomes known once the data is in; the
+            // offered bar sizes follow it (a 9-hour session outgrows 15 s bars).
+            if (_rangeKey == "session")
+            {
+                var span = data.Buckets.Count > 0
+                    ? DateTimeOffset.Now.ToUnixTimeMilliseconds() - data.Buckets[0].StartMs
+                    : (long?)null;
+                if (span != _sessionSpanMs)
+                {
+                    _sessionSpanMs = span;
+                    UpdateBarsAvailability();
+                }
+            }
             AssignModelSlots(data);
             var totals = data.Totals;
 
@@ -2510,20 +3011,46 @@ public partial class MainWindow : Window
                 ? $"{totals.EstimatedCost.ToString("C2", Usd)} at current API list prices."
                 : $"{totals.EstimatedCost.ToString("C2", Usd)} at current API list prices. " +
                   $"Excludes {totals.UnpricedEvents:N0} records with no pricing match.";
-            CostDeltaText.Text = FormatCostDelta(totals.EstimatedCost, data.PreviousCost);
 
-            TotalTokensText.Text = FormatCompact(totals.Total);
-            TotalTokensText.ToolTip = totals.Total.ToString("N0");
-            InputTokensText.Text = FormatCompact(totals.Input);
-            InputTokensText.ToolTip = totals.Input.ToString("N0");
-            OutputTokensText.Text = FormatCompact(totals.Output);
-            OutputTokensText.ToolTip = totals.Output.ToString("N0");
-            ReasoningTokensText.Text = FormatCompact(totals.Reasoning);
-            ReasoningTokensText.ToolTip = $"{totals.Reasoning:N0} — included in output tokens";
-            CacheReadTokensText.Text = FormatCompact(totals.CacheRead);
-            CacheReadTokensText.ToolTip = totals.CacheRead.ToString("N0");
-            CacheWriteTokensText.Text = FormatCompact(totals.CacheWrite);
-            CacheWriteTokensText.ToolTip = totals.CacheWrite.ToString("N0");
+            TotalTokensText.Text = totals.Total.ToString("N0");
+            TotalTokensText.ToolTip = $"{FormatCompact(totals.Total)} tokens in this range.";
+            TokenSplitText.Text = $"in {FormatCompact(totals.Input)} · out {FormatCompact(totals.Output)}";
+            TokenSplitText.ToolTip =
+                $"Input {totals.Input:N0} · output {totals.Output:N0} " +
+                $"(reasoning {totals.Reasoning:N0} included)";
+
+            // The single most expensive reply of the last half hour: the
+            // clearest early sign that some session's context has gotten big
+            // enough for every response to cost real money.
+            var nowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            LiveEventRow? priciest = null;
+            var priciestCost = 0d;
+            foreach (var row in await _database.GetEventsInRangeAsync(nowUtcMs - 1_800_000, nowUtcMs + 60_000))
+            {
+                var rowCost = _pricing.Calculate(row.Provider, row.Model, row.Tokens).Cost;
+                if (rowCost > priciestCost)
+                {
+                    priciestCost = rowCost;
+                    priciest = row;
+                }
+            }
+
+            if (priciest is null)
+            {
+                TopReplyCostText.Text = "—";
+                TopReplyCostText.ToolTip = "No replies in the last 30 minutes.";
+                TopReplyDetailText.Text = "";
+            }
+            else
+            {
+                var at = DateTimeOffset.FromUnixTimeMilliseconds(priciest.TimestampMs).ToLocalTime();
+                TopReplyCostText.Text = FormatMoney(priciestCost);
+                TopReplyCostText.ToolTip =
+                    $"{ContextSessionName(priciest)}\n{priciest.Model} · {at:h:mm:ss tt}\n" +
+                    $"{priciest.Tokens.Total:N0} tokens — an expensive single reply usually " +
+                    "means a huge context went in with it.";
+                TopReplyDetailText.Text = $"{priciest.Model} · {at:h:mm tt}";
+            }
 
             UpdateModels(data);
             UpdateChart();
@@ -2603,6 +3130,7 @@ public partial class MainWindow : Window
 
         var unitWord = data.Unit switch
         {
+            BucketUnit.Second7_5 => "7.5 s",
             BucketUnit.Second15 => "15 s",
             BucketUnit.Second30 => "30 s",
             BucketUnit.Minute1 => "minute",
@@ -2610,6 +3138,8 @@ public partial class MainWindow : Window
             BucketUnit.Minute15 => "15 min",
             BucketUnit.Minute30 => "30 min",
             BucketUnit.Hour => "hour",
+            BucketUnit.Hour4 => "4 h",
+            BucketUnit.Hour12 => "12 h",
             BucketUnit.Month => "month",
             _ => "day"
         };
@@ -3050,16 +3580,18 @@ public partial class MainWindow : Window
 
     private static string FormatAxisLabel(DateTime start, BucketUnit unit, bool markMidnight) => unit switch
     {
-        BucketUnit.Second15 or BucketUnit.Second30 => start.ToString("h:mm:ss"),
+        BucketUnit.Second7_5 or BucketUnit.Second15 or BucketUnit.Second30 => start.ToString("h:mm:ss"),
         BucketUnit.Minute1 or BucketUnit.Minute5 or BucketUnit.Minute15 or BucketUnit.Minute30 =>
             start.ToString("h:mm tt"),
-        BucketUnit.Hour => markMidnight ? start.ToString("ddd") : start.ToString("h tt"),
+        BucketUnit.Hour or BucketUnit.Hour4 or BucketUnit.Hour12 =>
+            markMidnight ? start.ToString("ddd") : start.ToString("h tt"),
         BucketUnit.Month => start.ToString("MMM yyyy"),
         _ => start.ToString("MMM d")
     };
 
     private static string FormatPeriod(DateTime start, BucketUnit unit) => unit switch
     {
+        BucketUnit.Second7_5 => $"{start:ddd, MMM d} · {start:h:mm:ss.f}–{start.AddSeconds(7.5):h:mm:ss.f tt}",
         BucketUnit.Second15 => $"{start:ddd, MMM d} · {start:h:mm:ss}–{start.AddSeconds(15):h:mm:ss tt}",
         BucketUnit.Second30 => $"{start:ddd, MMM d} · {start:h:mm:ss}–{start.AddSeconds(30):h:mm:ss tt}",
         BucketUnit.Minute1 => $"{start:ddd, MMM d} · {start:h:mm}–{start.AddMinutes(1):h:mm tt}",
@@ -3067,40 +3599,11 @@ public partial class MainWindow : Window
         BucketUnit.Minute15 => $"{start:ddd, MMM d} · {start:h:mm}–{start.AddMinutes(15):h:mm tt}",
         BucketUnit.Minute30 => $"{start:ddd, MMM d} · {start:h:mm}–{start.AddMinutes(30):h:mm tt}",
         BucketUnit.Hour => $"{start:ddd, MMM d} · {start:h tt}–{start.AddHours(1):h tt}",
+        BucketUnit.Hour4 => $"{start:ddd, MMM d} · {start:h tt}–{start.AddHours(4):h tt}",
+        BucketUnit.Hour12 => $"{start:ddd, MMM d} · {start:h tt}–{start.AddHours(12):h tt}",
         BucketUnit.Month => start.ToString("MMMM yyyy"),
         _ => start.ToString("ddd, MMM d")
     };
-
-    private string FormatCostDelta(double current, double? previous)
-    {
-        var periodName = _rangeKey switch
-        {
-            "today" => "yesterday",
-            "last1" => "the prior hour",
-            "last4" => "the prior 4 h",
-            "last8" => "the prior 8 h",
-            "last12" => "the prior 12 h",
-            "last18" => "the prior 18 h",
-            "last24" => "the prior 24 h",
-            "last7" => "the prior 7 days",
-            "last30" => "the prior 30 days",
-            "currentMonth" => "last month to date",
-            _ => null
-        };
-        if (periodName is null || previous is not { } prior)
-        {
-            return string.Empty;
-        }
-
-        if (prior <= 0)
-        {
-            return current > 0 ? $"nothing spent {periodName}" : string.Empty;
-        }
-
-        var change = (current - prior) / prior;
-        var arrow = change >= 0 ? "▲" : "▼";
-        return $"{arrow} {Math.Abs(change):P0} vs {periodName} ({FormatMoney(prior)})";
-    }
 
     private static double NiceStep(double rough)
     {
@@ -3338,6 +3841,7 @@ public partial class MainWindow : Window
 
     private RadioButton RangeRadioFor(string key) => key switch
     {
+        "session" => RangeSession,
         "last1" => RangeLast1,
         "last4" => RangeLast4,
         "last8" => RangeLast8,
@@ -3345,6 +3849,8 @@ public partial class MainWindow : Window
         "last18" => RangeLast18,
         "last24" => RangeLast24,
         "today" => RangeToday,
+        "last10" => RangeLast10,
+        "last15" => RangeLast15,
         "last30" => RangeLast30,
         "currentMonth" => RangeMonth,
         "all" => RangeAll,
@@ -3354,13 +3860,14 @@ public partial class MainWindow : Window
     private static string NormalizeRangeKey(string key) => key switch
     {
         "previousMonth" => "currentMonth",
-        "last1" or "last4" or "last8" or "last12" or "last18" or "last24" or "today"
-            or "last7" or "last30" or "currentMonth" or "all" => key,
+        "session" or "last1" or "last4" or "last8" or "last12" or "last18" or "last24" or "today"
+            or "last7" or "last10" or "last15" or "last30" or "currentMonth" or "all" => key,
         _ => "last7"
     };
 
     private RadioButton BarsRadioFor(string key) => key switch
     {
+        "s75" => BarsS75,
         "s15" => BarsS15,
         "s30" => BarsS30,
         "m1" => BarsM1,
@@ -3368,13 +3875,15 @@ public partial class MainWindow : Window
         "m15" => BarsM15,
         "m30" => BarsM30,
         "h1" => BarsH1,
+        "h4" => BarsH4,
+        "h12" => BarsH12,
         "d1" => BarsD1,
         _ => BarsAuto
     };
 
     private static string NormalizeBarsKey(string key) => key switch
     {
-        "s15" or "s30" or "m1" or "m5" or "m15" or "m30" or "h1" or "d1" => key,
+        "s75" or "s15" or "s30" or "m1" or "m5" or "m15" or "m30" or "h1" or "h4" or "h12" or "d1" => key,
         _ => "auto"
     };
 
