@@ -19,9 +19,128 @@ public sealed class UsageParser
         CancellationToken cancellationToken = default)
     {
         var fallbackTimestamp = new DateTimeOffset(File.GetLastWriteTimeUtc(path)).ToUnixTimeMilliseconds();
+        if (client.Equals(CodexTraces.Client, StringComparison.OrdinalIgnoreCase))
+        {
+            return await ParseCodexTraceAsync(path, startOffset, parserStateJson, fallbackTimestamp, cancellationToken);
+        }
+
         return client.Equals("codex", StringComparison.OrdinalIgnoreCase)
             ? await ParseCodexAsync(path, startOffset, parserStateJson, fallbackTimestamp, cancellationToken)
             : await ParseClaudeAsync(path, startOffset, fallbackTimestamp, cancellationToken);
+    }
+
+    /// <summary>A Codex rollout trace's trace.jsonl (see <see cref="CodexTraces"/>).
+    /// Each inference_completed line points at a response payload holding that
+    /// call's token_usage; calls are billed only for threads Codex wrote no
+    /// session log for, since the rollout parser already counts the rest.</summary>
+    private static async Task<ParseResult> ParseCodexTraceAsync(
+        string path,
+        long startOffset,
+        string? parserStateJson,
+        long fallbackTimestamp,
+        CancellationToken cancellationToken)
+    {
+        var state = DeserializeState<CodexTraceState>(parserStateJson) ?? new CodexTraceState();
+        var bundle = Path.GetDirectoryName(path)!;
+        var events = new List<UsageEvent>();
+
+        var offset = await JsonlReader.ReadCompleteLinesAsync(
+            path,
+            startOffset,
+            line =>
+            {
+                ParseCodexTraceLine(line, path, bundle, fallbackTimestamp, state, events);
+                return ValueTask.CompletedTask;
+            },
+            cancellationToken);
+
+        return new ParseResult(events, offset, JsonSerializer.Serialize(state, StateJsonOptions));
+    }
+
+    private static void ParseCodexTraceLine(
+        ReadOnlyMemory<byte> line,
+        string path,
+        string bundle,
+        long fallbackTimestamp,
+        CodexTraceState state,
+        List<UsageEvent> events)
+    {
+        if (line.IsEmpty)
+        {
+            return;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (!TryGetObject(root, "payload", out var payload))
+            {
+                return;
+            }
+
+            var threadId = FirstNonEmpty(GetString(root, "thread_id"), GetString(payload, "thread_id"));
+            switch (GetString(payload, "type"))
+            {
+                case "thread_started" when threadId is not null:
+                    state.Unlogged[threadId] = !CodexTraces.IsLogged(bundle, payload);
+                    return;
+
+                case "inference_started" when GetString(payload, "inference_call_id") is { } callId:
+                    state.Models[callId] = FirstNonEmpty(GetString(payload, "model"), "unknown")!;
+                    state.Provider = FirstNonEmpty(GetString(payload, "provider_name")?.ToLowerInvariant(), state.Provider);
+                    return;
+
+                case "inference_completed":
+                    break;
+
+                default:
+                    return;
+            }
+
+            var inferenceCallId = GetString(payload, "inference_call_id");
+            var model = "unknown";
+            if (inferenceCallId is not null && state.Models.Remove(inferenceCallId, out var startedModel))
+            {
+                model = startedModel;
+            }
+
+            if (threadId is null || !state.Unlogged.TryGetValue(threadId, out var unlogged) || !unlogged ||
+                !TryGetObject(payload, "response_payload", out var reference) ||
+                GetString(reference, "path") is not { } relativePath)
+            {
+                return;
+            }
+
+            using var response = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(bundle, relativePath)));
+            if (!TryGetObject(response.RootElement, "token_usage", out var usage))
+            {
+                return;
+            }
+
+            // Same split as a rollout's token_count, so both paths bill alike.
+            var tokens = CodexTotals.FromJson(usage).ToBreakdown();
+            if (tokens.IsEmpty)
+            {
+                return;
+            }
+
+            var timestamp = root.TryGetProperty("wall_time_unix_ms", out var wallTime) &&
+                            wallTime.TryGetInt64(out var wallTimeMs)
+                ? wallTimeMs
+                : fallbackTimestamp;
+            var responseId = FirstNonEmpty(GetString(payload, "response_id"), GetString(response.RootElement, "response_id"));
+            var identity = responseId is not null
+                ? $"codex:response:{responseId}"
+                : $"codex:trace:{threadId}:{inferenceCallId}:{timestamp}";
+
+            events.Add(new UsageEvent(
+                Hash(identity), path, "codex", FirstNonEmpty(state.Provider, "openai")!, model, threadId, timestamp, tokens));
+        }
+        catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
+        {
+            // A payload pruned or still being written costs that one call, not the file.
+        }
     }
 
     private static async Task<ParseResult> ParseCodexAsync(
@@ -259,7 +378,7 @@ public sealed class UsageParser
             }
 
             var model = FirstNonEmpty(GetString(message, "model"), GetString(root, "model"));
-            if (model is null)
+            if (model is null || SourceDiscovery.IsJunkModel(model))
             {
                 return null;
             }
@@ -274,12 +393,38 @@ public sealed class UsageParser
                 InferProvider(model))!;
             var sessionId = FirstNonEmpty(GetString(root, "sessionId"), GetString(root, "session_id"), fallbackSessionId)!;
             var timestamp = ParseTimestamp(root, fallbackTimestamp);
+            // Fast mode bills every rate at 2x standard, and the transcript records which speed
+            // actually served the request. Marking it on the model name is what keeps the two
+            // apart: every aggregate in the database groups by model.
+            if (string.Equals(
+                    FirstNonEmpty(GetString(usage, "speed"), GetString(message, "speed"), GetString(root, "speed")),
+                    "fast",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                model = $"{model} (fast)";
+            }
+
+            // cache_creation_input_tokens is the flat total; the cache_creation sub-object
+            // splits it by TTL. Anthropic bills a 1-hour write at 2x base input against
+            // 1.25x for a 5-minute one, so the split has to survive into the database.
+            var ephemeral1h = 0L;
+            var ephemeral5m = 0L;
+            if (TryGetObject(usage, "cache_creation", out var cacheCreation))
+            {
+                ephemeral1h = GetLong(cacheCreation, "ephemeral_1h_input_tokens");
+                ephemeral5m = GetLong(cacheCreation, "ephemeral_5m_input_tokens");
+            }
+
+            var cacheWrite = Math.Max(
+                GetLong(usage, "cache_creation_input_tokens"),
+                ephemeral1h + ephemeral5m);
             var tokens = new TokenBreakdown(
                 GetLong(usage, "input_tokens"),
                 GetLong(usage, "output_tokens"),
                 GetLong(usage, "cache_read_input_tokens"),
-                GetLong(usage, "cache_creation_input_tokens"),
-                GetLong(usage, "reasoning_output_tokens"));
+                cacheWrite,
+                GetLong(usage, "reasoning_output_tokens"),
+                Math.Min(ephemeral1h, cacheWrite));
             if (tokens.IsEmpty)
             {
                 return null;
@@ -309,7 +454,8 @@ public sealed class UsageParser
                 Math.Max(left.Tokens.Output, right.Tokens.Output),
                 Math.Max(left.Tokens.CacheRead, right.Tokens.CacheRead),
                 Math.Max(left.Tokens.CacheWrite, right.Tokens.CacheWrite),
-                Math.Max(left.Tokens.Reasoning, right.Tokens.Reasoning))
+                Math.Max(left.Tokens.Reasoning, right.Tokens.Reasoning),
+                Math.Max(left.Tokens.CacheWrite1h, right.Tokens.CacheWrite1h))
         };
 
     private static T? DeserializeState<T>(string? json) where T : class
@@ -414,6 +560,17 @@ public sealed class UsageParser
         public CodexTotals? PreviousTotals { get; set; }
         public string? SessionId { get; set; }
         public string? ForkedFromId { get; set; }
+        public string? Provider { get; set; }
+    }
+
+    private sealed class CodexTraceState
+    {
+        /// <summary>Thread id → true when Codex wrote no session log for it.</summary>
+        public Dictionary<string, bool> Unlogged { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>Model per inference still in flight, keyed by inference_call_id.</summary>
+        public Dictionary<string, string> Models { get; set; } = new(StringComparer.Ordinal);
+
         public string? Provider { get; set; }
     }
 

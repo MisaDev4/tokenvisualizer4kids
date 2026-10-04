@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lmshot</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0D0D0D; overflow: hidden; }
+  canvas { display: block; }
+  #cap { position: fixed; left: 0; right: 0; bottom: 0; font: 15px/1.5 system-ui, sans-serif;
+         color: #E8E2D4; background: rgba(12,12,12,.72); padding: 8px 14px; letter-spacing: .02em; }
+  #err { position: fixed; left: 0; right: 0; top: 0; font: 13px/1.4 monospace;
+         color: #FFB4A0; background: rgba(60,10,10,.9); padding: 8px 14px; white-space: pre-wrap; display: none; }
+</style>
+<div id="err"></div>
+<div id="cap"></div>
+<script type="module" src="./harness.js"></script>

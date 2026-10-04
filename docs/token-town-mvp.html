@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Token Town — MVP</title>
+<style>
+  :root{
+    --page:#0D0D0D; --card:#1A1A19; --raised:#242423;
+    --hairline:rgba(255,255,255,.10); --ink:#FFFFFF; --ink2:#C3C2B7;
+    --muted:#898781; --accent:#3987E5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--page); color:var(--ink2);
+    font:14px/1.55 "Segoe UI", system-ui, sans-serif; padding:30px 24px 46px}
+  .wrap{max-width:1240px; margin:0 auto}
+  h1{color:var(--ink); font-size:22px; font-weight:600; margin:0 0 6px}
+  .intro{max-width:80ch; margin:0 0 14px}
+  .intro em{color:var(--muted); font-style:normal}
+  .bar{display:flex; flex-wrap:wrap; align-items:center; gap:14px; margin-bottom:12px}
+  .tabs{display:flex; background:var(--raised); border:1px solid var(--hairline);
+    border-radius:9px; padding:3px; gap:2px}
+  .tabs button{border:0; background:transparent; color:var(--muted); border-radius:7px;
+    padding:6px 14px; font:600 12.5px "Segoe UI",system-ui,sans-serif; cursor:pointer}
+  .tabs button.on{background:#3A3A38; color:var(--ink)}
+  .legend{display:flex; gap:12px; flex-wrap:wrap}
+  .chip{display:flex; align-items:center; gap:6px; font-size:12px}
+  .chip i{width:9px; height:9px; border-radius:3px; display:inline-block}
+  .actions{display:flex; gap:8px; margin-left:auto}
+  .actions button{background:var(--raised); color:var(--ink); border:1px solid var(--hairline);
+    border-radius:8px; padding:6px 13px; font:600 12.5px "Segoe UI",system-ui,sans-serif; cursor:pointer}
+  .actions button:hover{border-color:rgba(255,255,255,.25)}
+  .meta{font-size:12px; color:var(--muted)}
+  .meta b{color:var(--ink2); font-variant-numeric:tabular-nums}
+  .stage{background:var(--card); border:1px solid var(--hairline); border-radius:14px; padding:14px 14px 8px}
+  canvas{display:block; width:100%; height:480px; cursor:crosshair}
+  .stats{display:flex; flex-wrap:wrap; gap:16px; align-items:center; font-size:12.5px;
+    color:var(--muted); padding:10px 4px 4px}
+  .stats b{color:var(--ink); font-weight:600}
+  .desc{font-size:12.5px; color:var(--muted); margin:14px 2px 0; max-width:104ch}
+  .desc b{color:var(--ink2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Token Town — every 5 minutes, a house</h1>
+  <p class="intro">
+    The session is a town. Every 5-minute interval, whatever you build is <b>that interval's house</b> —
+    it ranks up live (tent → shack → cabin → cottage → house → villa → manor → keep) while you work,
+    then <b>solidifies</b> when the interval ends and construction moves to the next plot. Houses keep their
+    model's color, breaks become trees, and the sky is synced to <b>your actual local time and sunrise/sunset</b>.
+    <em>This page opened mid-session: everything already standing was backfilled from “earlier” data —
+    exactly what the app would do from its usage database.</em>
+  </p>
+  <div class="bar">
+    <div class="tabs" id="speedTabs">
+      <button data-s="50" class="on">Demo ×50</button>
+      <button data-s="1">Real time</button>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="actions">
+      <button id="burst">⚡ Burst</button>
+      <button id="geo" title="Refine sunrise/sunset with your location">📍 Sync location</button>
+    </div>
+    <div class="meta">☀ <b id="sunTxt">—</b> &nbsp;·&nbsp; clock <b id="clock">—</b></div>
+  </div>
+  <div class="stage">
+    <canvas id="cv"></canvas>
+    <div class="stats" id="stats"></div>
+  </div>
+  <p class="desc">
+    <b>How it maps to the app:</b> intervals are 5-minute buckets over the same per-response rows the Live tab
+    reads, one house per model per bucket, so opening the tab after five hours of work <b>replays instantly into
+    this exact town</b>. Sky uses the Windows clock plus sunrise/sunset from your location (here: browser clock,
+    solar approximation, optional geolocation). Hover any building for its receipt — which five minutes built it,
+    with which model, and how many tokens. “Demo ×50” compresses time so you can watch a full evening;
+    real time is the actual product behavior.
+  </p>
+</div>
+
+<script>
+'use strict';
+/* ═══ vocabulary ════════════════════════════════════════════════ */
+const MODELS = [
+  {id:'fable',  label:'Fable',  color:'#3987E5', w:.50},
+  {id:'sonnet', label:'Sonnet', color:'#9085E9', w:.22},
+  {id:'opus',   label:'Opus',   color:'#E5484D', w:.16},
+  {id:'haiku',  label:'Haiku',  color:'#199E70', w:.12},
+];
+const MIDX={fable:0,sonnet:1,opus:2,haiku:3};
+const INT_MS = 5*60*1000;               // one lot = 5 minutes
+const MIN_HOUSE_TOK = 900;              // less than this: not even a tent
+const TIERS = [
+  {tok:0,      name:'Tent'},
+  {tok:6000,   name:'Shack'},
+  {tok:18000,  name:'Cabin'},
+  {tok:45000,  name:'Cottage'},
+  {tok:90000,  name:'House'},
+  {tok:160000, name:'Villa'},
+  {tok:260000, name:'Manor'},
+  {tok:400000, name:'Keep'},
+];
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,k)=>a+(b-a)*k;
+const easeOutBack=k=>{const c1=1.70158,c3=c1+1;return 1+c3*Math.pow(k-1,3)+c1*Math.pow(k-1,2);};
+const rand=(a,b)=>a+Math.random()*(b-a);
+function hexRGB(h){return [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];}
+function mixc(a,b,k){const A=hexRGB(a),B=hexRGB(b);return `rgb(${A.map((v,i)=>Math.round(lerp(v,B[i],k))).join(',')})`;}
+const fmtTok=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1000?Math.round(n/1000)+'k':''+n;
+const tierOf=tok=>{let t=0;for(let i=0;i<TIERS.length;i++)if(tok>=TIERS[i].tok)t=i;return t;};
+function pickModel(){let r=Math.random();for(const m of MODELS){if((r-=m.w)<=0)return m;}return MODELS[0];}
+const seededR=s=>{const x=Math.sin(s*127.1+311.7)*43758.5453;return x-Math.floor(x);};
+
+document.getElementById('legend').innerHTML = MODELS.map(m=>
+  `<span class="chip"><i style="background:${m.color}"></i>${m.label}</span>`).join('')
+  +`<span class="chip"><i style="background:#55684A;border-radius:50%"></i>break</span>`;
+
+/* ═══ canvas ════════════════════════════════════════════════════ */
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+let W=0, H=480;
+function resize(){
+  const r=cv.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+  cv.width=Math.max(1,Math.round(r.width*dpr)); cv.height=Math.round(480*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  W=r.width; H=480;
+  makeStars(); layoutRows();
+}
+let stars=[];
+function makeStars(){ stars=Array.from({length:120},()=>({x:Math.random(),y:Math.random()*.5,p:rand(0,9)})); }
+
+/* ═══ real clock + solar sky ════════════════════════════════════ */
+let lat=50, sunSr=6, sunSs=20;
+function computeSun(){
+  const d=new Date(), start=new Date(d.getFullYear(),0,0);
+  const doy=Math.floor((d-start)/864e5);
+  const decl=-23.44*Math.cos(2*Math.PI*(doy+10)/365)*Math.PI/180;
+  const cosH=clamp(-Math.tan(lat*Math.PI/180)*Math.tan(decl),-1,1);
+  const half=Math.acos(cosH)/(2*Math.PI)*24;
+  sunSr=12-half; sunSs=12+half;
+  const f=h=>`${String(Math.floor(h)).padStart(2,'0')}:${String(Math.floor(h%1*60)).padStart(2,'0')}`;
+  document.getElementById('sunTxt').textContent=`${f(sunSr)} → ${f(sunSs)}`;
+}
+computeSun();
+document.getElementById('geo').onclick=()=>{
+  if(!navigator.geolocation){ document.getElementById('geo').textContent='📍 unavailable'; return; }
+  navigator.geolocation.getCurrentPosition(
+    p=>{ lat=p.coords.latitude; computeSun(); document.getElementById('geo').textContent='📍 synced'; },
+    ()=>{ document.getElementById('geo').textContent='📍 blocked (using 50°N)'; });
+};
+function skyAmount(h){
+  if(h<sunSr-1.2||h>sunSs+1.2) return 0;
+  if(h>sunSr+.9&&h<sunSs-.9) return 1;
+  return h<12 ? (h-(sunSr-1.2))/2.1 : ((sunSs+1.2)-h)/2.1;
+}
+let horizonY=190;
+function drawSky(hcur, now){
+  const day=skyAmount(hcur), night=1-day;
+  const g=ctx.createLinearGradient(0,0,0,horizonY);
+  g.addColorStop(0, mixc('#050509','#14273F',day));
+  g.addColorStop(1, mixc('#0B0B0A','#22374D',day));
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,horizonY);
+  const glow=Math.max(0, 1-Math.abs(hcur-sunSr)/1.4, 1-Math.abs(hcur-sunSs)/1.4);
+  if(glow>0){
+    const dg=ctx.createLinearGradient(0,horizonY-80,0,horizonY);
+    dg.addColorStop(0,'rgba(226,132,62,0)');
+    dg.addColorStop(1,`rgba(226,132,62,${(.32*glow).toFixed(3)})`);
+    ctx.fillStyle=dg; ctx.fillRect(0,horizonY-80,W,80);
+  }
+  if(night>.08) for(const s of stars){
+    ctx.fillStyle=`rgba(220,225,235,${(night*(.25+.45*(.5+.5*Math.sin(now/430+s.p)))).toFixed(3)})`;
+    ctx.fillRect(s.x*W, s.y*horizonY, 1.4, 1.4);
+  }
+  if(day>.03){
+    const t=clamp((hcur-sunSr)/Math.max(sunSs-sunSr,.1),0,1);
+    const sx=W*(.06+.88*t), sy=horizonY-8-Math.sin(Math.PI*t)*(horizonY-52);
+    for(let i=3;i>=1;i--){ ctx.fillStyle=`rgba(255,214,150,${(.05*i*day).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(sx,sy,8+i*8,0,7); ctx.fill(); }
+    ctx.fillStyle=`rgba(255,224,170,${(.9*day).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(sx,sy,8,0,7); ctx.fill();
+  }
+  if(night>.4){
+    const span=24-sunSs+sunSr;
+    const nt=clamp((hcur>=sunSs?hcur-sunSs:hcur+24-sunSs)/Math.max(span,.1),0,1);
+    const mx=W*(.08+.84*nt), my=horizonY-30-Math.sin(Math.PI*nt)*(horizonY-90);
+    ctx.fillStyle=`rgba(205,212,226,${(.85*night).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(mx,my,8,0,7); ctx.fill();
+    ctx.fillStyle=mixc('#050509','#14273F',day);
+    ctx.beginPath(); ctx.arc(mx+3.5,my-2,7,0,7); ctx.fill();
+  }
+}
+
+/* ═══ town layout: plots in rows, front row first ═══════════════ */
+let rows=[];
+function layoutRows(){
+  rows=[];
+  for(let r=0;r<5;r++){
+    const s=Math.max(.55,1-.09*r);
+    const gy=H-64-r*54;
+    const pw=66*s;
+    // every row keeps the right-hand column clear for the construction site
+    rows.push({s,gy,pw,cap:Math.max(4,Math.floor((W-90-215)/pw))});
+  }
+}
+function plotPos(idx){
+  let r=0, rest=idx;
+  while(r<rows.length-1 && rest>=rows[r].cap){ rest-=rows[r].cap; r++; }
+  const row=rows[r];
+  const jitter=(seededR(idx*7+3)-.5)*8;
+  return {x:45+rest*row.pw+row.pw/2+jitter, gy:row.gy, s:row.s, row:r};
+}
+// the live build always happens full-size at the front-right site
+function sitePos(j){ return {x:W-96-j*88, gy:rows[0].gy+4, s:1.1, row:-2}; }
+
+/* ═══ the entities ══════════════════════════════════════════════ */
+// committed plots: {kind:'house', model,color,tok,seed,start,end,popT,glowT} | {kind:'tree',seed,start,end,popT}
+let plots=[];
+// current interval construction: model -> house (provisional plot index = plots.length + order)
+let cur={}, curOrder=[], intervalStart=0;
+let confetti=[], floaters=[], puffs=[];
+
+function tierName(tok){ return TIERS[tierOf(tok)].name; }
+function fmtClock(ms){ const d=new Date(ms);
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
+
+function addTokens(model, tokens, simNow){
+  let h=cur[model];
+  if(!h){
+    h={kind:'house', model, color:MODELS[MIDX[model]].color, tok:0, seed:Math.floor(rand(1,1e6)),
+       start:intervalStart, end:intervalStart+INT_MS, popT:0, bumpT:1, glowT:1};
+    cur[model]=h; curOrder.push(model);
+  }
+  const before=tierOf(h.tok);
+  h.tok+=tokens; h.bumpT=0;
+  const after=tierOf(h.tok);
+  const p=sitePos(curOrder.indexOf(model));
+  floaters.push({txt:'+'+fmtTok(tokens), x:p.x+rand(-10,10), y:p.gy-70*p.s, age:0, color:'#C3C2B7', size:10});
+  if(after>before && h.tok>MIN_HOUSE_TOK){
+    h.popT=0;
+    floaters.push({txt:'⭐ '+TIERS[after].name+'!', x:p.x, y:p.gy-86*p.s, age:0, color:h.color, size:13});
+    for(let i=0;i<16;i++){ const a=rand(0,Math.PI*2), v=rand(40,150);
+      confetti.push({x:p.x,y:p.gy-40*p.s,vx:Math.cos(a)*v,vy:Math.sin(a)*v-70,age:0,life:rand(.5,1),color:h.color}); }
+  }
+}
+function finalizeInterval(){
+  let built=0;
+  for(const m of curOrder){
+    const h=cur[m];
+    if(h.tok>=MIN_HOUSE_TOK){
+      h.glowT=0;
+      h.fly={t:0, sj:curOrder.indexOf(m)};   // moving day: site → its plot
+      plots.push(h);
+      built++;
+    }
+  }
+  if(!built) plots.push({kind:'tree', seed:Math.floor(rand(1,1e6)),
+    start:intervalStart, end:intervalStart+INT_MS, popT:0});
+  cur={}; curOrder=[];
+  intervalStart+=INT_MS;
+}
+
+/* ═══ backfill: “the app was already running for hours” ═════════ */
+const SESSION_LOOKBACK = 4.7*3600*1000;
+let sessionStart=0;
+function backfill(realNow){
+  plots=[]; cur={}; curOrder=[];
+  sessionStart = Math.floor((realNow-SESSION_LOOKBACK)/INT_MS)*INT_MS;
+  let t=sessionStart, working=true;
+  while(t+INT_MS<=realNow){
+    working = Math.random() < (working ? .8 : .38);
+    if(!working){
+      plots.push({kind:'tree', seed:Math.floor(rand(1,1e6)), start:t, end:t+INT_MS, popT:1});
+    } else {
+      const total=3000+Math.pow(Math.random(),1.7)*rand(80000,420000);
+      // usually one focus model, sometimes two
+      const list=[pickModel()];
+      if(Math.random()<.3){ let m2=pickModel(); if(m2.id!==list[0].id) list.push(m2); }
+      const share=list.length===1?[1]:[rand(.6,.85),0]; if(share.length>1) share[1]=1-share[0];
+      list.forEach((m,i)=>{
+        const tok=Math.round(total*(share[i]||1));
+        if(tok<MIN_HOUSE_TOK) return;
+        plots.push({kind:'house', model:m.id, color:m.color, tok, seed:Math.floor(rand(1,1e6)),
+          start:t, end:t+INT_MS, popT:1, bumpT:1, glowT:1});
+      });
+    }
+    t+=INT_MS;
+  }
+  intervalStart=t;
+}
+
+/* ═══ house renderer ════════════════════════════════════════════ */
+function drawWindow(x,y,w,h,lit){
+  ctx.fillStyle=lit?'rgba(255,217,140,.95)':'rgba(9,11,15,.85)';
+  ctx.fillRect(x,y,w,h);
+}
+function drawHouse(h, cx, gy, s, night, now, underConstruction){
+  const tok=h.tok, tier=Math.min(tierOf(tok), TIERS.length-1);
+  const c=h.color;
+  const wall=mixc(c,'#0D0D0D',.42), wall2=mixc(c,'#0D0D0D',.30), roof=c,
+        trim=mixc(c,'#FFFFFF',.30), door='#241B12';
+  const sr=k=>seededR(h.seed+k);
+  const litP=night*.75+.08;
+  const lit=i=>sr(40+i)<litP;
+  const pop=h.popT<1?easeOutBack(clamp(h.popT,0,1)):1;
+  const bump=h.bumpT<1?1+.06*Math.sin(clamp(h.bumpT,0,1)*Math.PI):1;
+  ctx.save();
+  ctx.translate(cx,gy);
+  ctx.scale(s*pop*bump, s*pop*(2-bump));
+  if(tier===0){ // tent
+    ctx.fillStyle=wall2;
+    ctx.beginPath(); ctx.moveTo(-13,0); ctx.lineTo(0,-17); ctx.lineTo(13,0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=door;
+    ctx.beginPath(); ctx.moveTo(-4,0); ctx.lineTo(0,-8); ctx.lineTo(4,0); ctx.closePath(); ctx.fill();
+  } else if(tier===1){ // shack
+    ctx.fillStyle=wall; ctx.fillRect(-15,-16,30,16);
+    ctx.fillStyle=roof; ctx.fillRect(-17,-20,34,5);
+    ctx.fillStyle=door; ctx.fillRect(-4,-11,8,11);
+  } else if(tier===2){ // cabin
+    ctx.fillStyle=wall; ctx.fillRect(-17,-19,34,19);
+    ctx.fillStyle=roof;
+    ctx.beginPath(); ctx.moveTo(-20,-19); ctx.lineTo(0,-31); ctx.lineTo(20,-19); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=door; ctx.fillRect(-4,-12,8,12);
+    drawWindow(6,-14,7,7,lit(0));
+  } else if(tier===3){ // cottage
+    ctx.fillStyle=wall; ctx.fillRect(-20,-23,40,23);
+    ctx.fillStyle=roof;
+    ctx.beginPath(); ctx.moveTo(-24,-23); ctx.lineTo(0,-38); ctx.lineTo(24,-23); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=trim; ctx.fillRect(sr(1)<.5?-14:8,-45,5,9); // chimney
+    ctx.fillStyle=door; ctx.fillRect(-4,-13,8,13);
+    drawWindow(-15,-17,8,8,lit(0)); drawWindow(8,-17,8,8,lit(1));
+  } else if(tier===4){ // house
+    ctx.fillStyle=wall; ctx.fillRect(-22,-30,44,30);
+    ctx.fillStyle=roof;
+    ctx.beginPath(); ctx.moveTo(-26,-30); ctx.lineTo(0,-46); ctx.lineTo(26,-30); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=trim; ctx.fillRect(10,-53,5,10);
+    ctx.fillStyle=door; ctx.fillRect(-5,-14,10,14);
+    drawWindow(-17,-24,9,9,lit(0)); drawWindow(8,-24,9,9,lit(1));
+    drawWindow(-17,-11,9,9,lit(2));
+  } else if(tier===5){ // villa — two floors
+    ctx.fillStyle=wall; ctx.fillRect(-24,-22,48,22);
+    ctx.fillStyle=wall2; ctx.fillRect(-24,-42,48,20);
+    ctx.fillStyle=roof;
+    ctx.beginPath(); ctx.moveTo(-28,-42); ctx.lineTo(0,-57); ctx.lineTo(28,-42); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=trim; ctx.fillRect(-16,-64,5,10);
+    ctx.fillStyle=door; ctx.fillRect(-5,-14,10,14);
+    drawWindow(-18,-37,9,9,lit(0)); drawWindow(-4,-37,9,9,lit(1)); drawWindow(10,-37,9,9,lit(2));
+    drawWindow(-18,-16,9,9,lit(3)); drawWindow(10,-16,9,9,lit(4));
+  } else if(tier===6){ // manor — main + wing + fence
+    ctx.fillStyle=wall; ctx.fillRect(-27,-24,40,24);
+    ctx.fillStyle=wall2; ctx.fillRect(-27,-44,40,20);
+    ctx.fillStyle=roof;
+    ctx.beginPath(); ctx.moveTo(-31,-44); ctx.lineTo(-7,-58); ctx.lineTo(17,-44); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=wall; ctx.fillRect(13,-18,18,18);
+    ctx.fillStyle=roof;
+    ctx.beginPath(); ctx.moveTo(11,-18); ctx.lineTo(22,-27); ctx.lineTo(33,-18); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=trim; ctx.fillRect(-22,-65,5,11);
+    ctx.fillStyle=door; ctx.fillRect(-12,-14,10,14);
+    drawWindow(-22,-39,8,8,lit(0)); drawWindow(-9,-39,8,8,lit(1)); drawWindow(4,-39,8,8,lit(2));
+    drawWindow(-22,-18,8,8,lit(3)); drawWindow(4,-18,8,8,lit(4)); drawWindow(18,-13,7,7,lit(5));
+    ctx.strokeStyle=mixc(c,'#FFFFFF',.15); ctx.lineWidth=1.4;
+    for(const fx of [-38,-33,34,39]){ ctx.beginPath(); ctx.moveTo(fx,0); ctx.lineTo(fx,-7); ctx.stroke(); }
+    ctx.beginPath(); ctx.moveTo(-40,-4); ctx.lineTo(-31,-4); ctx.moveTo(32,-4); ctx.lineTo(41,-4); ctx.stroke();
+  } else { // keep — the little castle
+    ctx.fillStyle=wall; ctx.fillRect(-16,-52,32,52);
+    ctx.fillStyle=wall2; ctx.fillRect(-24,-24,10,24); ctx.fillRect(14,-24,10,24);
+    ctx.fillStyle=roof;
+    for(let i=-16;i<16;i+=8) ctx.fillRect(i,-58,5,6);
+    ctx.fillRect(-24,-29,10,5); ctx.fillRect(14,-29,10,5);
+    ctx.fillStyle=door;
+    ctx.beginPath(); ctx.ellipse(0,0,7,12,0,Math.PI,0); ctx.fill();
+    drawWindow(-8,-40,7,9,lit(0)); drawWindow(2,-40,7,9,lit(1));
+    drawWindow(-8,-24,7,9,lit(2)); drawWindow(2,-24,7,9,lit(3));
+    ctx.strokeStyle='#C3C2B7'; ctx.lineWidth=1.4;
+    ctx.beginPath(); ctx.moveTo(0,-58); ctx.lineTo(0,-72); ctx.stroke();
+    ctx.fillStyle=c;
+    const wv=Math.sin(now/170+h.seed)*2.5;
+    ctx.beginPath(); ctx.moveTo(0,-72); ctx.lineTo(13,-69+wv); ctx.lineTo(0,-65); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+  // solidify glow
+  if(h.glowT<1){
+    const k=clamp(h.glowT,0,1);
+    ctx.strokeStyle=`rgba(255,235,190,${(.8*(1-k)).toFixed(2)})`;
+    ctx.lineWidth=2;
+    ctx.strokeRect(cx-30*s, gy-74*s, 60*s, 74*s);
+  }
+  // scaffolding while under construction
+  if(underConstruction){
+    ctx.strokeStyle='rgba(184,162,76,.65)'; ctx.lineWidth=1.6;
+    const sw=30*s, sh=(14+58*clamp(tier/6,0,1))*s;
+    ctx.beginPath();
+    ctx.moveTo(cx-sw,gy); ctx.lineTo(cx-sw,gy-sh);
+    ctx.moveTo(cx+sw,gy); ctx.lineTo(cx+sw,gy-sh);
+    ctx.moveTo(cx-sw-4,gy-sh); ctx.lineTo(cx+sw+4,gy-sh);
+    ctx.moveTo(cx-sw,gy-sh*.55); ctx.lineTo(cx+sw,gy-sh*.55);
+    ctx.stroke();
+  }
+}
+function drawTree(t, cx, gy, s, now){
+  const pop=t.popT<1?easeOutBack(clamp(t.popT,0,1)):1;
+  const sway=Math.sin(now/900+t.seed)*1.5*s;
+  ctx.save(); ctx.translate(cx,gy); ctx.scale(s*pop,s*pop);
+  ctx.fillStyle='#4A3A28'; ctx.fillRect(-2,-12,4,12);
+  ctx.fillStyle='#46573D';
+  ctx.beginPath(); ctx.arc(sway*.4,-18,10,0,7); ctx.fill();
+  ctx.fillStyle='#55684A';
+  ctx.beginPath(); ctx.arc(sway,-25,7.5,0,7); ctx.fill();
+  ctx.restore();
+}
+
+/* ═══ sim clock: real time, optionally accelerated ══════════════ */
+let speed=50;
+let realBase=performance.now(), wallBase=Date.now();
+let simAcc=0;                      // accumulated accelerated ms
+const simNowOf=now=> wallBase + (now-realBase) + simAcc;
+document.querySelectorAll('#speedTabs button').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('#speedTabs button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); speed=+b.dataset.s;
+  };
+});
+
+/* event stream (stand-in for the app's live rows) */
+let evAcc=0, burstEnv=0, burstQ=[];
+function makeTokens(){ return 1500+Math.floor(Math.pow(Math.random(),2.2)*35000); }
+function genEvents(simDtMs, simNow, now){
+  while(burstQ.length&&burstQ[0]<=now){ burstQ.shift(); addTokens(pickModel().id, makeTokens(), simNow); }
+  if(Math.random()<simDtMs/60000*.5) burstEnv=Math.min(3,burstEnv+rand(1,2));
+  burstEnv*=Math.pow(.5,simDtMs/60000/1.5);
+  evAcc += simDtMs/60000*(3.2+burstEnv*5);
+  while(evAcc>=1){ evAcc-=1; addTokens(pickModel().id, makeTokens(), simNow); }
+}
+document.getElementById('burst').onclick=()=>{
+  const now=performance.now(), n=Math.round(rand(9,14));
+  for(let i=0;i<n;i++) burstQ.push(now+i*140+rand(0,80));
+  burstQ.sort((a,b)=>a-b);
+};
+
+/* ═══ hover receipts ════════════════════════════════════════════ */
+let mouse=null;
+cv.addEventListener('mousemove',e=>{ const r=cv.getBoundingClientRect(); mouse={x:e.clientX-r.left,y:e.clientY-r.top}; });
+cv.addEventListener('mouseleave',()=>{ mouse=null; });
+function entityAt(mx,my){
+  const all=[...plots.map((p,i)=>({e:p,pos:plotPos(i)})),
+             ...curOrder.map((m,j)=>({e:cur[m],pos:sitePos(j)}))];
+  for(let k=all.length-1;k>=0;k--){
+    const {e,pos}=all[k];
+    const w=34*pos.s, hh=(e.kind==='tree'?36:78)*pos.s;
+    if(mx>pos.x-w&&mx<pos.x+w&&my>pos.gy-hh&&my<pos.gy+4) return {e};
+  }
+  return null;
+}
+
+/* ═══ main loop ═════════════════════════════════════════════════ */
+const statsEl=document.getElementById('stats'), clockEl=document.getElementById('clock');
+let last=performance.now(), statT=0;
+
+function tick(now){
+  const dtMs=clamp(now-last,0,50); last=now;
+  const dt=dtMs/1000;
+  simAcc += dtMs*(speed-1);
+  const simNow=simNowOf(now);
+  genEvents(dtMs*speed, simNow, now);
+  while(simNow-intervalStart>=INT_MS) finalizeInterval();
+
+  // anim timers
+  for(const m of curOrder){ const h=cur[m]; h.popT+=dt*2.4; h.bumpT+=dt*3; }
+  for(let i=0;i<plots.length;i++){
+    const p=plots[i];
+    if(p.popT<1)p.popT+=dt*2.4;
+    if(p.kind==='house'&&p.glowT<1)p.glowT+=dt*1.2;
+    if(p.bumpT<1)p.bumpT+=dt*3;
+    if(p.fly){
+      p.fly.t+=dt*1.5;
+      if(p.fly.t>=1){
+        const dst=plotPos(i);
+        for(let k=0;k<8;k++) confetti.push({x:dst.x+rand(-14,14),y:dst.gy-2,
+          vx:rand(-40,40),vy:rand(-70,-20),age:0,life:rand(.3,.6),color:'#B8AE96'});
+        delete p.fly;
+      }
+    }
+  }
+  for(let i=confetti.length-1;i>=0;i--){ const c=confetti[i]; c.age+=dt; c.vy+=380*dt; c.x+=c.vx*dt; c.y+=c.vy*dt; if(c.age>c.life)confetti.splice(i,1); }
+  for(let i=floaters.length-1;i>=0;i--){ const f=floaters[i]; f.age+=dt; f.y-=22*dt; if(f.age>1.2)floaters.splice(i,1); }
+  // chimney puffs from the freshest solidified house
+  if(Math.random()<dt*2 && plots.length){
+    const p=plots[plots.length-1];
+    if(p.kind==='house'&&tierOf(p.tok)>=3){
+      const pos=plotPos(plots.length-1);
+      puffs.push({x:pos.x+(seededR(p.seed+1)<.5?-14:8)*pos.s+2, y:pos.gy-46*pos.s, r:2, age:0});
+    }
+  }
+  for(let i=puffs.length-1;i>=0;i--){ const u=puffs[i]; u.age+=dt; u.y-=14*dt; u.r+=3*dt; if(u.age>1.6)puffs.splice(i,1); }
+
+  /* ── draw ── */
+  const d=new Date(simNow), hcur=d.getHours()+d.getMinutes()/60+d.getSeconds()/3600;
+  const night=1-skyAmount(hcur);
+  ctx.clearRect(0,0,W,H);
+  drawSky(hcur, now);
+  // ground
+  const gg=ctx.createLinearGradient(0,horizonY,0,H);
+  gg.addColorStop(0,'#232720'); gg.addColorStop(1,'#151512');
+  ctx.fillStyle=gg; ctx.fillRect(0,horizonY,W,H-horizonY);
+  for(const row of rows){
+    ctx.strokeStyle='rgba(255,255,255,.05)';
+    ctx.beginPath(); ctx.moveTo(20,row.gy+6.5); ctx.lineTo(W-20,row.gy+6.5); ctx.stroke();
+  }
+  // chimney smoke behind buildings
+  ctx.fillStyle='rgba(200,200,200,.16)';
+  for(const u of puffs){ ctx.beginPath(); ctx.arc(u.x,u.y,u.r,0,7); ctx.fill(); }
+  // entities back rows first; flying houses and the live site draw on top
+  const ents=[...plots.map((p,i)=>({e:p, pos:p.fly?null:plotPos(i), idx:i})),
+              ...curOrder.map((m,j)=>({e:cur[m], pos:sitePos(j), building:true}))];
+  for(const it of ents){
+    if(it.pos) continue;               // resolve flying-house positions
+    const p=it.e, dst=plotPos(it.idx), src=sitePos(p.fly.sj);
+    const k=clamp(p.fly.t,0,1), ek=k<.5?2*k*k:1-Math.pow(-2*k+2,2)/2;
+    it.pos={x:lerp(src.x,dst.x,ek), gy:lerp(src.gy,dst.gy,ek)-Math.sin(Math.PI*ek)*34,
+            s:lerp(src.s,dst.s,ek), row:-1};
+  }
+  ents.sort((a,b)=>b.pos.row-a.pos.row);
+  for(const {e,pos,building} of ents){
+    if(e.kind==='tree') drawTree(e,pos.x,pos.gy,pos.s,now);
+    else if(e.tok>=MIN_HOUSE_TOK||!building) drawHouse(e,pos.x,pos.gy,pos.s,night,now,!!building);
+    else { // groundbreaking: a few pegs before the tent appears
+      ctx.fillStyle='rgba(184,162,76,.7)';
+      for(const dx of [-10,0,10]) ctx.fillRect(pos.x+dx-1,pos.gy-4,2,4);
+    }
+  }
+  // construction site decor: taped-off zone at the front right
+  {
+    const gy=rows[0].gy+4;
+    ctx.save();
+    ctx.setLineDash([5,4]);
+    ctx.strokeStyle='rgba(184,162,76,.45)'; ctx.lineWidth=1.4;
+    ctx.strokeRect(W-205,gy-118,180,126);
+    ctx.restore();
+    ctx.fillStyle='#898781'; ctx.font='10px "Segoe UI",system-ui'; ctx.textAlign='left';
+    ctx.fillText('🔨 current 5 min', W-200, gy-124);
+  }
+  // streetlamps on the front row, warm at night
+  for(let lx=70;lx<W-40;lx+=190){
+    const gy=rows[0].gy+10;
+    ctx.strokeStyle='#4A4A46'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(lx,gy); ctx.lineTo(lx,gy-26); ctx.stroke();
+    ctx.fillStyle=`rgba(255,214,140,${(.25+.65*night).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(lx,gy-29,3,0,7); ctx.fill();
+    if(night>.2){ ctx.fillStyle=`rgba(255,214,140,${(.07*night).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(lx,gy-29,14,0,7); ctx.fill(); }
+  }
+  // interval countdown ring above the site
+  {
+    const frac=clamp((simNow-intervalStart)/INT_MS,0,1);
+    const rx=W-115, ry=rows[0].gy-134;
+    ctx.strokeStyle='rgba(255,255,255,.15)'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(rx,ry,9,0,7); ctx.stroke();
+    ctx.strokeStyle='#3987E5';
+    ctx.beginPath(); ctx.arc(rx,ry,9,-Math.PI/2,-Math.PI/2+frac*Math.PI*2); ctx.stroke();
+    const rem=Math.max(0,INT_MS-(simNow-intervalStart));
+    ctx.fillStyle='#898781'; ctx.font='10px "Segoe UI",system-ui'; ctx.textAlign='center';
+    ctx.fillText(`${Math.floor(rem/60000)}:${String(Math.floor(rem/1000%60)).padStart(2,'0')}`, rx, ry+22);
+  }
+  // confetti + floaters
+  for(const c of confetti){ ctx.globalAlpha=Math.max(0,1-c.age/c.life); ctx.fillStyle=c.color; ctx.fillRect(c.x-1.5,c.y-1.5,3,3); }
+  ctx.globalAlpha=1;
+  for(const f of floaters){
+    ctx.globalAlpha=Math.max(0,1-f.age/1.2);
+    ctx.fillStyle=f.color; ctx.font=`600 ${f.size}px "Segoe UI",system-ui`; ctx.textAlign='center';
+    ctx.fillText(f.txt,f.x,f.y);
+  }
+  ctx.globalAlpha=1;
+  // hover receipt
+  if(mouse){
+    const hit=entityAt(mouse.x,mouse.y);
+    if(hit){
+      const e=hit.e;
+      const l1 = `${fmtClock(e.start)}–${fmtClock(e.end)}`;
+      const l2 = e.kind==='tree' ? 'break 🌳'
+        : `${MODELS[MIDX[e.model]].label} · ${fmtTok(e.tok)} tokens · ${tierName(e.tok)}`;
+      ctx.font='11px "Segoe UI",system-ui';
+      const w=Math.max(ctx.measureText(l1).width, ctx.measureText(l2).width)+18;
+      const bx=clamp(mouse.x+12,4,W-w-4), by=clamp(mouse.y-44,4,H-40);
+      ctx.fillStyle='rgba(16,16,15,.94)';
+      ctx.strokeStyle='rgba(255,255,255,.18)'; ctx.lineWidth=1;
+      ctx.beginPath();
+      if(ctx.roundRect) ctx.roundRect(bx,by,w,34,6); else ctx.rect(bx,by,w,34);
+      ctx.fill(); ctx.stroke();
+      ctx.textAlign='left';
+      ctx.fillStyle='#898781'; ctx.fillText(l1,bx+9,by+14);
+      ctx.fillStyle='#EDEBE0'; ctx.fillText(l2,bx+9,by+27);
+    }
+  }
+  // header clock + stats
+  clockEl.textContent=fmtClock(simNow)+(speed>1?` (×${speed})`:'');
+  statT-=dt;
+  if(statT<=0){
+    statT=.5;
+    const counts={fable:0,sonnet:0,opus:0,haiku:0}; let trees=0, total=0, best=null;
+    const everything=[...plots, ...curOrder.map(m=>cur[m]).filter(h=>h.tok>=MIN_HOUSE_TOK)];
+    for(const p of everything){
+      if(p.kind==='tree'){trees++; continue;}
+      counts[p.model]++; total+=p.tok;
+      if(!best||p.tok>best.tok) best=p;
+    }
+    const houses=Object.values(counts).reduce((a,b)=>a+b,0);
+    statsEl.innerHTML =
+      `<span>🏘 <b>${houses}</b> buildings</span>`+
+      MODELS.map(m=>`<span class="chip"><i style="background:${m.color}"></i><b>${counts[m.id]}</b></span>`).join('')+
+      `<span>🌳 <b>${trees}</b> breaks</span>`+
+      `<span><b>${fmtTok(total)}</b> tokens this session</span>`+
+      (best?`<span>grandest: <b>${tierName(best.tok)}</b> (${MODELS[MIDX[best.model]].label}, ${fmtTok(best.tok)})</span>`:'')+
+      `<span>session since <b>${fmtClock(sessionStart)}</b> — backfilled</span>`;
+  }
+}
+function frame(now){ tick(now); requestAnimationFrame(frame); }
+window.__tick=tick;   // manual stepping for automated tests
+
+resize();
+window.addEventListener('resize',resize);
+backfill(Date.now());
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

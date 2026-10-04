@@ -16,7 +16,9 @@ public sealed record ClaudeLimit(string Label, double Percent, string Severity, 
 /// email rides along raw so the UI can apply its own privacy masking.</summary>
 public sealed record SessionRefreshResult(string Status, string? UpdatedAccountId, string? UpdatedEmail);
 
-/// <summary>The limits of one Claude account the app has seen sign into Claude Code.</summary>
+/// <summary>The limits of one subscription account seen on this machine — a
+/// Claude account signed into Claude Code, or the ChatGPT account Codex uses.
+/// Provider is "anthropic" or "openai".</summary>
 public sealed record ClaudeAccountLimits(
     string Id,
     string Email,
@@ -26,7 +28,8 @@ public sealed record ClaudeAccountLimits(
     bool Stale,
     DateTimeOffset? FetchedAt,
     DateTimeOffset? CooldownUntil,
-    IReadOnlyList<ClaudeLimit> Limits);
+    IReadOnlyList<ClaudeLimit> Limits,
+    string Provider = "anthropic");
 
 /// <summary>
 /// Tracks rate limits across every Claude account that signs into Claude Code on

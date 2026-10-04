@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+<title>Ideas</title>
+<style>
+  /* ── palette: the same dark the tracker and the town use ─────────────────
+     Anything the design lane wants to restyle should be reachable from these
+     tokens or from the class hooks documented at the bottom of board.js. */
+  :root{
+    --page:#0D0D0D; --card:#1A1A19; --card2:#211F1E; --hairline:rgba(255,255,255,.10);
+    --ink:#FFFFFF; --ink2:#C3C2B7; --muted:#898781; --accent:#3987E5;
+    --gold:#D9A441;                 /* Claude's own ideas wear the town's gold */
+    --ok:#5FBF8A; --bad:#E5484D;
+    --radius:9px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0; background:var(--page); color:var(--ink2); overflow:hidden;
+    display:flex; flex-direction:column;
+    font:13.5px/1.5 "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing:antialiased}
+  button,input,textarea{font:inherit; color:inherit}
+  ::selection{background:rgba(57,135,229,.38)}
+  ::-webkit-scrollbar{width:9px; height:9px}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.11); border-radius:5px}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.2)}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  /* ── header ──────────────────────────────────────────────────────────── */
+  header{flex:none; display:flex; align-items:center; gap:10px; padding:8px 14px;
+    border-bottom:1px solid var(--hairline)}
+  header h1{margin:0; font-size:14.5px; font-weight:600; color:var(--ink); white-space:nowrap}
+  .seal{width:20px; height:20px; flex:none; border-radius:50%; display:grid; place-items:center;
+    font-size:11px; color:#08182B; background:var(--accent)}
+  .chip{display:inline-flex; align-items:center; gap:5px; white-space:nowrap; font-size:11px;
+    color:var(--muted); border:1px solid var(--hairline); border-radius:11px; padding:1px 9px}
+  #keys{font-size:11.5px; color:var(--muted); white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; margin-left:4px}
+  #keys kbd{font:inherit; color:var(--ink2); background:rgba(255,255,255,.06);
+    border:1px solid var(--hairline); border-radius:4px; padding:0 4px}
+  .spacer{margin-left:auto}
+  /* the save light: quiet by design — it only earns attention when it fails */
+  #saveState{font-variant-numeric:tabular-nums}
+  #saveState::before{content:''; width:6px; height:6px; border-radius:50%; background:var(--muted)}
+  #saveState[data-state="saved"]::before{background:var(--ok)}
+  #saveState[data-state="saving"]::before,
+  #saveState[data-state="dirty"]::before{background:var(--gold)}
+  #saveState[data-state="failed"]{color:#F0C3C4; border-color:rgba(229,72,77,.55)}
+  #saveState[data-state="failed"]::before{background:var(--bad)}
+
+  #banner{flex:none; display:none; margin:8px 12px 0; padding:7px 12px; font-size:12.5px;
+    color:#F0D9D9; background:rgba(60,20,20,.92); border:1px solid rgba(229,72,77,.5);
+    border-radius:7px}
+  #banner.on{display:block}
+
+  /* ── board: six columns, horizontally scrollable if the window is narrow ── */
+  #board{flex:1; min-height:0; display:grid; grid-auto-flow:column;
+    grid-auto-columns:minmax(208px,1fr); gap:9px; padding:10px 12px 12px; overflow-x:auto}
+  .col{display:flex; flex-direction:column; min-height:0; border-radius:var(--radius);
+    background:rgba(255,255,255,.022); border:1px solid var(--hairline)}
+  .col.drop-target{background:rgba(57,135,229,.055); border-color:rgba(57,135,229,.34)}
+  .col-head{flex:none; display:flex; align-items:center; gap:7px; padding:8px 10px 6px}
+  .col-head .nm{font-size:12px; font-weight:600; letter-spacing:.05em; text-transform:uppercase;
+    color:var(--ink2)}
+  .col-head .n{font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;
+    background:rgba(255,255,255,.06); border-radius:9px; padding:0 6px}
+  .col-head::after{content:''; flex:1; height:2px; border-radius:2px; background:var(--tint,transparent);
+    opacity:.55}
+  .col[data-status="inbox"]   {--tint:#6E6B63}
+  .col[data-status="proposed"]{--tint:var(--gold)}
+  .col[data-status="approved"]{--tint:var(--ok)}
+  .col[data-status="building"]{--tint:var(--accent)}
+  .col[data-status="shipped"] {--tint:#7A6BD9}
+  .col[data-status="declined"]{--tint:#8A4B4E}
+
+  /* add box — always there, never a modal, never loses its place */
+  .add{flex:none; display:flex; gap:6px; align-items:center; padding:0 8px 8px}
+  .add input{flex:1; min-width:0; background:var(--card); border:1px solid var(--hairline);
+    border-radius:7px; padding:6px 9px; font-size:12.5px; outline:none}
+  .add input:focus{border-color:var(--accent); background:#15171A}
+  .add input::placeholder{color:#6A6862}
+  .proj{flex:none; display:flex; border:1px solid var(--hairline); border-radius:7px; overflow:hidden}
+  .proj button{background:transparent; border:0; color:var(--muted); font-size:11px; font-weight:600;
+    padding:5px 7px; cursor:pointer}
+  .proj button[aria-pressed="true"]{background:rgba(57,135,229,.2); color:#CFE2FA}
+
+  .cards{flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:7px;
+    padding:0 8px 8px}
+  /* the empty line sits ABOVE the (then zero-height) card list, so it reads as a
+     note pinned under the column head rather than as text stranded at the bottom */
+  .empty{flex:none; padding:0 10px 10px; font-size:11.5px; line-height:1.45; color:#66645F}
+  .col.has-cards .empty{display:none}
+
+  /* ── card ────────────────────────────────────────────────────────────── */
+  .card{position:relative; flex:none; background:var(--card); border:1px solid var(--hairline);
+    border-radius:var(--radius); padding:8px 10px 8px 12px; cursor:grab; outline:none;
+    touch-action:none; user-select:none}
+  .card::before{content:''; position:absolute; left:0; top:0; bottom:0; width:3px;
+    border-radius:var(--radius) 0 0 var(--radius); background:var(--origin,transparent)}
+  .card[data-origin="claude"]{--origin:var(--gold)}
+  .card[data-origin="user"]  {--origin:var(--accent)}
+  .card:hover{border-color:rgba(255,255,255,.2); background:var(--card2)}
+  .card:focus-visible{border-color:var(--accent); box-shadow:0 0 0 2px rgba(57,135,229,.32)}
+  .card.editing{cursor:default; background:var(--card2); border-color:rgba(255,255,255,.2)}
+  .card-top{display:flex; align-items:center; gap:6px; margin-bottom:3px}
+  .cid{font:600 10.5px/1 ui-monospace,Consolas,monospace; letter-spacing:.04em; color:var(--muted)}
+  .card[data-origin="claude"] .cid{color:#C39B52}
+  .card[data-origin="user"] .cid{color:#6FA8E8}
+  .by{font-size:9.5px; letter-spacing:.09em; text-transform:uppercase; color:#5F5D58}
+  .sz{margin-left:auto; font:600 10px/1 "Segoe UI",system-ui; color:var(--muted);
+    border:1px solid var(--hairline); border-radius:4px; padding:2px 4px}
+  .ctitle{margin:0; font-size:13px; font-weight:600; color:var(--ink); line-height:1.35;
+    word-break:break-word}
+  .cnote{margin:4px 0 0; font-size:11.5px; line-height:1.42; color:var(--muted);
+    display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden}
+  .tags{display:flex; flex-wrap:wrap; gap:4px; margin-top:6px}
+  .tag{font-size:10px; color:#8E8C85; background:rgba(255,255,255,.055); border-radius:4px;
+    padding:1px 5px}
+  .reason{margin:6px 0 0; font-size:11px; line-height:1.4; color:#C58F91;
+    border-left:2px solid rgba(229,72,77,.45); padding-left:6px}
+
+  /* ── inline editor ───────────────────────────────────────────────────── */
+  .editor{display:flex; flex-direction:column; gap:6px; margin-top:2px}
+  .editor input,.editor textarea{width:100%; background:#121211; border:1px solid var(--hairline);
+    border-radius:6px; padding:5px 7px; font-size:12.5px; outline:none; resize:none}
+  .editor textarea{font-size:11.5px; color:var(--ink2); line-height:1.45}
+  .editor input:focus,.editor textarea:focus{border-color:var(--accent)}
+  .e-title{font-weight:600; color:var(--ink)}
+  .e-row{display:flex; gap:6px; align-items:center}
+  .sizes{display:flex; border:1px solid var(--hairline); border-radius:6px; overflow:hidden; flex:none}
+  .sizes button{background:transparent; border:0; color:var(--muted); font-size:11px; font-weight:600;
+    padding:4px 8px; cursor:pointer}
+  .sizes button[aria-pressed="true"]{background:rgba(57,135,229,.22); color:#CFE2FA}
+  .e-tags{flex:1; min-width:0}
+  .e-actions{justify-content:flex-end}
+  .e-hint{margin-right:auto; font-size:10.5px; color:#5F5D58}
+  .btn{background:rgba(255,255,255,.07); border:1px solid var(--hairline); border-radius:6px;
+    color:var(--ink2); font-size:11.5px; padding:4px 10px; cursor:pointer}
+  .btn:hover{background:rgba(255,255,255,.13)}
+  .btn.primary{background:var(--accent); border-color:transparent; color:#fff}
+  .btn.primary:hover{background:#4B93EA}
+  .btn:disabled{opacity:.4; cursor:default}
+
+  /* ── drag: pointer-driven, so the held card is a real element ────────── */
+  .card.is-source{display:none}          /* the slot stands in for it */
+  .slot{flex:none; border:1px dashed rgba(57,135,229,.65); border-radius:var(--radius);
+    background:rgba(57,135,229,.09)}
+  #dragLayer{position:fixed; inset:0; z-index:60; pointer-events:none}
+  #dragLayer .card{position:absolute; cursor:grabbing; background:var(--card2);
+    border-color:rgba(255,255,255,.26); box-shadow:0 14px 34px rgba(0,0,0,.55);
+    transform:rotate(1.3deg) scale(1.02); transform-origin:12% 50%}
+  #dragLayer .card.returning{transition:left .16s ease-out, top .16s ease-out, transform .16s ease-out;
+    transform:none}
+  body.dragging{cursor:grabbing}
+  body.dragging .card{cursor:grabbing}
+
+  /* ── decline reason: the one hard gate in the app ────────────────────── */
+  dialog{border:1px solid var(--hairline); border-radius:11px; background:var(--card);
+    color:var(--ink2); padding:0; width:min(420px,88vw); box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  dialog::backdrop{background:rgba(0,0,0,.55)}
+  .dlg{padding:14px 16px 13px; display:flex; flex-direction:column; gap:9px}
+  .dlg h2{margin:0; font-size:13.5px; color:var(--ink); font-weight:600}
+  .dlg p{margin:0; font-size:11.5px; color:var(--muted); line-height:1.45}
+  .dlg textarea{background:#121211; border:1px solid var(--hairline); border-radius:7px;
+    padding:7px 9px; font-size:12.5px; outline:none; resize:vertical; min-height:64px}
+  .dlg textarea:focus{border-color:var(--accent)}
+  .dlg .row{display:flex; gap:7px; justify-content:flex-end; align-items:center}
+
+  #toast{position:fixed; left:14px; bottom:12px; z-index:80; display:none; max-width:60vw;
+    font-size:11.5px; color:var(--ink2); background:rgba(26,26,25,.96);
+    border:1px solid var(--hairline); border-radius:8px; padding:6px 11px;
+    box-shadow:0 8px 22px rgba(0,0,0,.5)}
+  #toast.on{display:block}
+</style>
+</head>
+<body>
+<header>
+  <span class="seal">✦</span>
+  <h1>Ideas</h1>
+  <span class="chip" id="fileChip">ideas.json</span>
+  <span id="keys"><kbd>/</kbd> add · <kbd>ctrl</kbd>+<kbd>←→</kbd> move · <kbd>ctrl</kbd>+<kbd>z</kbd> undo</span>
+  <span class="spacer"></span>
+  <span class="chip" id="saveState" data-state="idle">loading</span>
+</header>
+
+<div id="banner"></div>
+<main id="board"></main>
+
+<dialog id="reasonDlg">
+  <form method="dialog" class="dlg">
+    <h2 id="reasonTitle">Decline</h2>
+    <p>A decline needs a reason — it is what stops the next agent wave pitching this again.</p>
+    <textarea id="reasonText" placeholder="why it's out…"></textarea>
+    <div class="row">
+      <button type="button" class="btn" id="reasonCancel">cancel</button>
+      <button type="button" class="btn primary" id="reasonOk" disabled>decline</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="dragLayer"></div>
+<div id="toast"></div>
+
+<script src="board.js"></script>
+</body>
+</html>

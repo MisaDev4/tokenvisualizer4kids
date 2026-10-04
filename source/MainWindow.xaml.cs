@@ -2,11 +2,16 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using Brush = System.Windows.Media.Brush;
 using Brushes = System.Windows.Media.Brushes;
 using Color = System.Windows.Media.Color;
+using ColorConverter = System.Windows.Media.ColorConverter;
+using Cursors = System.Windows.Input.Cursors;
+using KeyEventArgs = System.Windows.Input.KeyEventArgs;
+using Orientation = System.Windows.Controls.Orientation;
 using Path = System.IO.Path;
 using RadioButton = System.Windows.Controls.RadioButton;
 using Rectangle = System.Windows.Shapes.Rectangle;
@@ -21,13 +26,52 @@ public partial class MainWindow : Window
     private readonly AppSettings _settings;
     private readonly PricingService _pricing;
     private readonly UsageDatabase _database;
+    private readonly TranscriptVault _vault;
     private readonly UsageCollector _collector;
     private readonly ClaudeLimitsService _limitsService = new();
+    private readonly CodexLimitsService _codexLimitsService = new();
     private readonly TerminalStatusService _terminalsService = new();
+    private readonly AgentActivityService _agentsService = new();
+    private readonly GpuUsageService _gpuService = new();
     private readonly SessionTitleService _sessionTitles = new();
+    private readonly OpenCodeUsageService _openCodeService;
     private readonly LocalApiServer _apiServer;
+    private readonly RequestCaptureProxy _captureProxy = new();
     private readonly SemaphoreSlim _dashboardLock = new(1, 1);
+
+    // The heatmap's days before today, cached between RefreshUsageHeatmapAsync
+    // passes (see the comment there); keyed on the window they were read for.
+    private static readonly TimeSpan HeatmapEarlierRefresh = TimeSpan.FromMinutes(15);
+    private List<DailyUsageRow>? _heatmapEarlier;
+    private long _heatmapEarlierSince;
+    private long _heatmapEarlierUntil;
+    private long _heatmapEarlierAtMs;
+
+    /// <summary>An ANTHROPIC_BASE_URL someone else set, found when enabling the
+    /// request-capture relay — shown instead of silently overwriting it.</summary>
+    private string? _captureEnvConflict;
+
+    /// <summary>A CODEX_ROLLOUT_TRACE_ROOT someone else set — left alone, so
+    /// ephemeral Codex runs go uncounted rather than breaking their trace.</summary>
+    private string? _codexTraceConflict;
     private bool _terminalsScanning;
+    private bool _agentsScanning;
+    private bool _gpuScanning;
+    private bool _gpuCreditsFetching;
+
+    /// <summary>What the terminals page currently shows, flattened. The scan
+    /// behind it runs every 3s for the other pages, but re-templating 24 tiles
+    /// and their tooltips that often is pure waste when nothing moved. Cleared
+    /// while the page is off screen so the first tick back rebuilds.</summary>
+    private string _terminalsSignature = "";
+
+    /// <summary>What the agents page currently shows, flattened. A refresh that
+    /// changes nothing skips the ItemsSource swap so the pulse animations keep
+    /// their phase instead of restarting every tick.</summary>
+    private string _agentsSignature = "";
+
+    private string _agentsViewKey = "list";
+    private string _tilesStyleKey = "cozy";
     private bool _loaded;
     private bool _disposed;
     private string _rangeKey = "last7";
@@ -42,6 +86,12 @@ public partial class MainWindow : Window
     /// refresh routes by org id, so this only detects when its numbers landed
     /// on a different account than the one on screen.</summary>
     private string? _currentAccountId;
+
+    /// <summary>Last fetched accounts and their attributed-usage lines, kept so
+    /// a collapse/expand click re-renders the account cards without another
+    /// fetch or heatmap redraw.</summary>
+    private IReadOnlyList<ClaudeAccountLimits> _limitsAccounts = [];
+    private Dictionary<string, string> _limitsUsageTexts = new(StringComparer.Ordinal);
     private bool _heatmapRefreshing;
     private string _heatmapViewKey = "year";
     private string _heatmapMetricKey = "tokens";
@@ -63,7 +113,25 @@ public partial class MainWindow : Window
     private bool IsEndless => _liveWindowKey == "inf";
     private long _liveWindowMs = 300_000;
     private bool _livePulling;
-    private bool _cupLayoutDirty;
+    private bool _cupLayoutDirtyFlag;
+
+    /// <summary>A pending layout pass. It is a property, not a field, because
+    /// raising it is also the wake-up signal for the frame loop: LiveFrame
+    /// detaches itself once nothing can move, so every caller that dirties the
+    /// layout (new block, resize, settled round, sediment rebuild, view swap)
+    /// has to be able to start it again.</summary>
+    private bool _cupLayoutDirty
+    {
+        get => _cupLayoutDirtyFlag;
+        set
+        {
+            _cupLayoutDirtyFlag = value;
+            if (value && LiveViewVisible)
+            {
+                StartLiveFrames();
+            }
+        }
+    }
     private bool _liveFramesActive;
     private long _lastFrameTicks;
 
@@ -81,6 +149,24 @@ public partial class MainWindow : Window
     private System.Windows.Shapes.Path? _cupWalls;
     private readonly List<CupLayer> _cupLayers = [];
     private readonly List<(DateTime EndedAt, double Cost, long Tokens)> _roundHistory = [];
+
+    // Block budget for the whole cup. Every block is a live element that each
+    // new response re-lays-out (and, when the floor moves, re-animates), so a
+    // night of agents in endless mode used to leave tens of thousands of them
+    // on the canvas and the dashboard crawling.
+    private const int MaxCupBlocks = 800;
+
+    // Endless trims its oldest blocks in batches, so the pile reflows once per
+    // batch rather than shifting every block on every arrival.
+    private const int EndlessTrimBatch = 200;
+
+    // What endless mode trimmed off the bottom: the stacked totals keep
+    // counting it, and a late update to a trimmed event is not re-spawned.
+    private double _endlessTrimmedCost;
+    private long _endlessTrimmedTokens;
+    private long _endlessTrimmedMessages;
+    private int _endlessTrimmedCount;
+    private long _endlessTrimmedThroughMs = long.MinValue;
 
     // Arrival cursor for the live pull: a longer round must not re-ingest
     // events that already settled into layers.
@@ -142,19 +228,45 @@ public partial class MainWindow : Window
         public double CurrentX { get; set; } = double.NaN;
         public double CurrentY { get; set; } = double.NaN;
 
+        // Sitting exactly on its target: AdvanceCup skips it entirely, so a deep
+        // pile costs nothing per frame. Cleared by PackInto whenever the target,
+        // the side or the floor beneath it moves.
+        public bool Settled { get; set; }
+
         // Part of a settled layer: packed below the active round's floor.
         public bool Frozen { get; set; }
     }
 
-    // Chart colors follow the model, not its current rank: slots are assigned on first
-    // sight and kept for the session, so switching ranges never repaints a model.
-    private const int MaxModelSlots = 5;
-
+    // Slots only fix the chart's stacking order (biggest spenders claim low
+    // slots first, so they sit at the bottom of the stack). Every model gets
+    // one — nothing pools into a gray "Other" band. Colors are not tied to
+    // slots: each model's color persists in settings, so nothing repaints
+    // between runs or ranges.
     // Mirrors UsageDatabase.MaxBuckets: bar sizes that would exceed it are disabled.
     private const int MaxChartBars = 1500;
     private readonly Dictionary<string, int> _modelSlots = new(StringComparer.OrdinalIgnoreCase);
     private readonly Brush[] _seriesBrushes;
     private readonly Brush _otherBrush;
+    private readonly Dictionary<string, SolidColorBrush> _brushByHex = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Saturation/lightness for generated model colors. Hues are not preset:
+    /// each new model gets the hue farthest on the wheel from every color in use, so
+    /// colors stay as distinguishable as the model count allows. Keep in sync with the
+    /// HueSlider gradient stops in MainWindow.xaml.</summary>
+    private const double ModelColorSaturation = 0.70;
+    private const double ModelColorLightness = 0.58;
+
+    /// <summary>Known families claim these first, so on a fresh install Fable is
+    /// blue and Opus is coral no matter which one happens to show up first.</summary>
+    private static readonly (string Token, string Hex)[] FamilySeeds =
+    [
+        ("fable", "#3987E5"),
+        ("mythos", "#3987E5"),
+        ("opus", "#E5484D"),
+        ("sonnet", "#9085E9"),
+        ("haiku", "#199E70"),
+        ("gpt", "#12A594")
+    ];
 
     private static readonly IntervalChoice[] Intervals =
     [
@@ -200,10 +312,17 @@ public partial class MainWindow : Window
         _settings = AppSettings.Load();
         _pricing = new PricingService();
         _database = new UsageDatabase();
-        _collector = new UsageCollector(_database, _settings);
+        _vault = new TranscriptVault(_database, _settings);
+        _collector = new UsageCollector(_database, _settings, vault: _vault);
         _collector.ProgressChanged += Collector_ProgressChanged;
         _collector.DataChanged += Collector_DataChanged;
         _collector.Error += Collector_Error;
+        // OpenCode (and T3 Code, which embeds it) records usage in its own
+        // SQLite store rather than tailable JSONL, so it gets a poller instead
+        // of a collector root. Same refresh path as the collector: the live
+        // feed and dashboard update the moment new rows land.
+        _openCodeService = new OpenCodeUsageService(_database);
+        _openCodeService.DataChanged += Collector_DataChanged;
         _apiServer = new LocalApiServer(_database, _pricing);
 
         _rangeKey = NormalizeRangeKey(_settings.SelectedRange);
@@ -241,6 +360,14 @@ public partial class MainWindow : Window
         (_dashPanelKey == "live" ? PanelLive : PanelModels).IsChecked = true;
         _tabKey = NormalizeTabKey(_settings.SelectedTab);
         TabRadioFor(_tabKey).IsChecked = true;
+        _agentsViewKey = _settings.SelectedAgentsView is "map" or "lanes" or "tiles"
+            ? _settings.SelectedAgentsView
+            : "list";
+        AgentsViewRadioFor(_agentsViewKey).IsChecked = true;
+        _tilesStyleKey = _settings.SelectedTilesStyle is "meter" or "mini" or "rich"
+            ? _settings.SelectedTilesStyle
+            : "cozy";
+        TilesStyleRadioFor(_tilesStyleKey).IsChecked = true;
 
         IntervalComboBox.ItemsSource = Intervals;
         IntervalComboBox.SelectedItem = Intervals
@@ -271,6 +398,22 @@ public partial class MainWindow : Window
         }
 
         UpdateApiStatusText();
+        CaptureCheckBox.IsChecked = _settings.CaptureRequestsEnabled;
+        if (_settings.CaptureRequestsEnabled)
+        {
+            StartRequestCapture();
+        }
+
+        UpdateCaptureStatusText();
+        // Before Window_Loaded starts the collector, so the trace folder exists
+        // when its watcher is attached.
+        CodexTraceCheckBox.IsChecked = _settings.CodexTraceEnabled;
+        if (_settings.CodexTraceEnabled)
+        {
+            _codexTraceConflict = CodexTraces.SetEnvironment();
+        }
+
+        UpdateCodexTraceStatusText();
         DatabasePathText.Text = $"Local index: {DisplayLocalPath(_database.DatabasePath)}";
 
         // Keeps short ranges live: the window slides and the newest bucket fills in
@@ -304,13 +447,30 @@ public partial class MainWindow : Window
 
         // Terminal states flip in seconds (a turn ends, a prompt is answered),
         // so this polls faster than the other feeds; the scan only tails a
-        // handful of recently touched transcript files.
+        // handful of recently touched transcript files. It runs whatever tab is
+        // up — the live chips and the local API read it — and RefreshTerminalsAsync
+        // gates the tile rebuild on the page being on screen and actually changed.
         var terminalsRefresh = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(3)
         };
         terminalsRefresh.Tick += async (_, _) => await RefreshTerminalsAsync();
         terminalsRefresh.Start();
+
+        // Subagent trees only matter while their page is on screen; the scan
+        // itself is incremental (saved file offsets), so this stays cheap.
+        var agentsRefresh = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(3)
+        };
+        agentsRefresh.Tick += async (_, _) =>
+        {
+            if (_tabKey == "agents" && IsVisible)
+            {
+                await RefreshAgentsAsync();
+            }
+        };
+        agentsRefresh.Start();
     }
 
     private async Task RefreshTerminalsAsync()
@@ -341,65 +501,99 @@ public partial class MainWindow : Window
                 return;
             }
 
+            // Everything above feeds other pages and the local API, so it runs
+            // on every tick; the tiles below only exist while this page is up.
+            if (_tabKey != "terminals")
+            {
+                _terminalsSignature = "";
+                return;
+            }
+
             // A terminal is named by what its chat is about (the session's
             // first prompt); the folder name is the fallback. Two identical
             // names still get a session stub so the tiles stay tellable apart.
-            var nameBySession = terminals.ToDictionary(
-                status => status.SessionId,
-                status => SessionTopic(status.SessionId) ?? DisplayProject(status.ProjectName),
-                StringComparer.OrdinalIgnoreCase);
+            // Two terminals can carry the same session id — a resumed session
+            // whose old process is still winding down — so this is built the
+            // same last-one-wins way as bySession above rather than with
+            // ToDictionary, which throws on the repeat.
+            var nameBySession = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var status in terminals)
+            {
+                nameBySession[status.SessionId] =
+                    SessionTopic(status.SessionId) ?? DisplayProject(status.ProjectName);
+            }
             var duplicateNames = nameBySession.Values
                 .GroupBy(name => name, StringComparer.OrdinalIgnoreCase)
                 .Where(group => group.Count() > 1)
                 .Select(group => group.Key)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            TerminalsPanel.ItemsSource = terminals.Take(24).Select(status =>
+
+            // One clock for the whole pass, so the age a tile shows and the age
+            // the signature was taken from can never straddle a minute boundary.
+            var now = DateTimeOffset.UtcNow;
+            var shown = terminals.Take(24).Select(status =>
             {
-                var age = DateTimeOffset.UtcNow - status.LastActivity;
-                var (state, text, meaning) = status.State switch
-                {
-                    TerminalState.Ready => (
-                        (Brush)FindResource("Series2Brush"),
-                        age.TotalSeconds < 60 ? "ready" : $"ready · {AgeText(age)}",
-                        "Turn finished — waiting for your prompt."),
-                    TerminalState.Waiting => (
-                        LimitWarningBrush,
-                        $"waiting · {AgeText(age)}",
-                        "Mid-turn but quiet — possibly a permission prompt or a long tool."),
-                    _ => (
-                        (Brush)FindResource("AccentBrush"),
-                        "working…",
-                        "Mid-turn: the model is generating or running tools.")
-                };
-                var displayName = DisplayProject(status.ProjectName);
                 var baseName = nameBySession[status.SessionId];
-                var name = duplicateNames.Contains(baseName)
-                    ? $"{baseName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
-                    : baseName;
-                var displayPath = HidePersonal
-                    ? $@"~\…\{displayName}"
-                    : status.ProjectPath;
-                var (iconGeometry, iconBrush, appName) = status.App == TerminalApp.Codex
-                    ? (OpenAiIconGeometry, OpenAiIconBrush, "Codex")
-                    : (AnthropicIconGeometry, AnthropicIconBrush, "Claude Code");
-                return new TerminalTileVm(
-                    name,
-                    text,
-                    state,
-                    state,
-                    EdgeBrushFor(state),
-                    iconGeometry,
-                    iconBrush,
-                    displayPath,
-                    $"{appName} · {displayPath}\n{meaning}{SessionPromptLines(status.SessionId)}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}" +
-                        (status.Pid > 0 ? "\n\nClick to bring this terminal to the front." : ""),
-                    status.Pid,
-                    status.Pid > 0 ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow);
+                var displayName = DisplayProject(status.ProjectName);
+                return (
+                    Status: status,
+                    Text: StatusTextFor(status.State, now - status.LastActivity),
+                    Name: duplicateNames.Contains(baseName)
+                        ? $"{baseName} · {status.SessionId[..Math.Min(4, status.SessionId.Length)]}"
+                        : baseName,
+                    DisplayPath: HidePersonal ? $@"~\…\{displayName}" : status.ProjectPath);
             }).ToList();
 
             var ready = terminals.Count(status => status.State == TerminalState.Ready);
             var working = terminals.Count(status => status.State == TerminalState.Working);
             var waiting = terminals.Count(status => status.State == TerminalState.Waiting);
+
+            // Re-templating 24 tiles and their tooltips costs far more than the
+            // scan does, and at 3s it would land on a page that mostly hasn't
+            // moved. The signature carries every string a tile shows — the age
+            // text included, so it turns over exactly when the page would.
+            var signature = $"{ready}|{working}|{waiting}|{terminals.Count}|" + string.Join("", shown.Select(entry =>
+                $"{entry.Status.SessionId}|{entry.Status.State}|{entry.Text}|" +
+                $"{entry.Name}|{entry.DisplayPath}|{entry.Status.Pid}|"));
+            if (signature == _terminalsSignature)
+            {
+                return;
+            }
+
+            _terminalsSignature = signature;
+            TerminalsPanel.ItemsSource = shown.Select(entry =>
+            {
+                var status = entry.Status;
+                var (state, meaning) = status.State switch
+                {
+                    TerminalState.Ready => (
+                        (Brush)FindResource("Series2Brush"),
+                        "Turn finished — waiting for your prompt."),
+                    TerminalState.Waiting => (
+                        LimitWarningBrush,
+                        "Mid-turn but quiet — possibly a permission prompt or a long tool."),
+                    _ => (
+                        (Brush)FindResource("AccentBrush"),
+                        "Mid-turn: the model is generating or running tools.")
+                };
+                var (iconGeometry, iconBrush, appName) = status.App == TerminalApp.Codex
+                    ? (OpenAiIconGeometry, OpenAiIconBrush, "Codex")
+                    : (AnthropicIconGeometry, AnthropicIconBrush, "Claude Code");
+                return new TerminalTileVm(
+                    entry.Name,
+                    entry.Text,
+                    state,
+                    state,
+                    EdgeBrushFor(state),
+                    iconGeometry,
+                    iconBrush,
+                    entry.DisplayPath,
+                    $"{appName} · {entry.DisplayPath}\n{meaning}{SessionPromptLines(status.SessionId)}\nlast activity {status.LastActivity.ToLocalTime():h:mm:ss tt} · session {status.SessionId[..Math.Min(8, status.SessionId.Length)]}" +
+                        (status.Pid > 0 ? "\n\nClick to bring this terminal to the front." : ""),
+                    status.Pid,
+                    status.Pid > 0 ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow);
+            }).ToList();
+
             TerminalsSubtitle.Text =
                 $"{ready} ready · {working} working · {waiting} waiting · " +
                 $"open terminals, matched to running Claude Code and Codex processes";
@@ -429,6 +623,15 @@ public partial class MainWindow : Window
         ? $"{(int)age.TotalHours}h {age.Minutes}m"
         : $"{Math.Max(1, (int)age.TotalMinutes)}m";
 
+    /// <summary>The line a tile shows under its name. The signature gate reads
+    /// it too, so the two can't disagree about when the page has changed.</summary>
+    private static string StatusTextFor(TerminalState state, TimeSpan age) => state switch
+    {
+        TerminalState.Ready => age.TotalSeconds < 60 ? "ready" : $"ready · {AgeText(age)}",
+        TerminalState.Waiting => $"waiting · {AgeText(age)}",
+        _ => "working…"
+    };
+
     private sealed record TerminalTileVm(
         string Name,
         string StatusText,
@@ -442,10 +645,1023 @@ public partial class MainWindow : Window
         int Pid,
         System.Windows.Input.Cursor Cursor);
 
+    // ── Agents page ────────────────────────────────────────────────────────
+
+    private async Task RefreshAgentsAsync()
+    {
+        if (_agentsScanning)
+        {
+            return;
+        }
+
+        _agentsScanning = true;
+        try
+        {
+            var scanTimer = System.Diagnostics.Stopwatch.StartNew();
+            var scanned = await _agentsService.ScanAsync(TimeSpan.FromHours(6));
+            scanTimer.Stop();
+
+            // A live board, not a history: a session shows while its
+            // orchestrator or any of its agents is still moving — an
+            // orchestrator crunching results after every subagent settled
+            // is work in progress, not history.
+            var sessions = scanned
+                .Where(session => session.Head.State != SubagentState.Done ||
+                                  session.Agents.Any(agent => agent.State != SubagentState.Done))
+                .ToList();
+            TraceAgentsScan(scanTimer.ElapsedMilliseconds, scanned, sessions);
+            if (_disposed)
+            {
+                return;
+            }
+
+            var working = sessions.Sum(session => session.Agents.Count(agent => agent.State == SubagentState.Running));
+            var quiet = sessions.Sum(session => session.Agents.Count(agent => agent.State == SubagentState.Quiet));
+            AgentsSubtitle.Text = sessions.Count == 0
+                ? "The moment any Claude session is working — itself or through agents — it appears here."
+                : $"{working} working · {quiet} quiet · " +
+                  $"{sessions.Count} live session{(sessions.Count == 1 ? "" : "s")}";
+            AgentsEmpty.Visibility = sessions.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            var cards = sessions.Take(16).Select(BuildOrchestratorCard).ToList();
+
+            // Redrawing identical content would restart every pulse animation,
+            // so the signature gate only swaps the list when something changed.
+            TilesStyleGroup.Visibility = _agentsViewKey == "tiles" ? Visibility.Visible : Visibility.Collapsed;
+
+            // Tiles carry a live burn sparkline, so raw totals join the
+            // signature there — the other views only redraw on text changes.
+            var tilesExtra = _agentsViewKey == "tiles"
+                ? $"{_tilesStyleKey}|{sessions.Sum(session => session.Head.Tokens.Total + session.Agents.Sum(agent => agent.Tokens.Total))}|"
+                : "";
+            var signature = _agentsViewKey + "|" + tilesExtra + string.Join("", cards.Select(card =>
+                $"{card.Name}|{card.StateText}|{card.HeadStatusText}|{card.HeadMetricsText}|" +
+                $"{card.SummaryText}|{card.PathText}|" +
+                string.Join("", card.Agents.Select(row =>
+                    $"{row.TypeBadge}|{row.Description}|{row.StatusText}|{row.MetricsText}"))));
+            if (signature != _agentsSignature)
+            {
+                _agentsSignature = signature;
+                var list = _agentsViewKey == "list";
+                AgentsPanel.Visibility = list ? Visibility.Visible : Visibility.Collapsed;
+                AgentsAltPanel.Visibility = list ? Visibility.Collapsed : Visibility.Visible;
+                AgentsAltPanel.Children.Clear();
+                if (list)
+                {
+                    AgentsPanel.ItemsSource = cards;
+                }
+                else
+                {
+                    AgentsPanel.ItemsSource = null;
+                    foreach (var session in sessions.Take(16))
+                    {
+                        AgentsAltPanel.Children.Add(_agentsViewKey switch
+                        {
+                            "map" => BuildSessionMap(session),
+                            "lanes" => BuildSessionLanes(session),
+                            _ => BuildSessionTiles(session)
+                        });
+                    }
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            // A refresh failure must be visible on the page and in the log —
+            // silently dying here reads as "the tab detects nothing".
+            TraceAgentsError(exception);
+            AgentsSubtitle.Text = $"agents scan failed: {exception.Message} — details in agents-scan.log";
+        }
+        finally
+        {
+            _agentsScanning = false;
+        }
+    }
+
+    /// <summary>One line per refresh, plus the per-session picture whenever it
+    /// changes — the flight recorder for "the tab showed nothing" reports.</summary>
+    private void TraceAgentsScan(
+        long scanMs, IReadOnlyList<OrchestratorActivity> scanned, List<OrchestratorActivity> shown)
+    {
+        try
+        {
+            var running = scanned.Sum(session => session.Agents.Count(agent => agent.State == SubagentState.Running));
+            var picture = string.Join("; ", scanned.Select(session =>
+                $"{session.ProjectName}/{session.SessionId[..Math.Min(8, session.SessionId.Length)]} " +
+                $"head={session.Head.State} " +
+                $"run={session.Agents.Count(agent => agent.State == SubagentState.Running)} " +
+                $"quiet={session.Agents.Count(agent => agent.State == SubagentState.Quiet)} " +
+                $"done={session.Agents.Count(agent => agent.State == SubagentState.Done)}"));
+            var line =
+                $"{DateTime.Now:MM-dd HH:mm:ss} scan={scanMs}ms sessions={scanned.Count} shown={shown.Count} " +
+                $"agents={scanned.Sum(session => session.Agents.Count)} running={running} view={_agentsViewKey}";
+            if (picture != _agentsTraceSignature)
+            {
+                _agentsTraceSignature = picture;
+                line += picture.Length == 0 ? "\n  (no sessions)" : $"\n  {picture.Replace("; ", "\n  ")}";
+            }
+
+            File.AppendAllText(AppPaths.AgentsScanLogPath, line + "\n");
+            if (++_agentsTraceCount % 500 == 0 &&
+                new FileInfo(AppPaths.AgentsScanLogPath) is { Exists: true, Length: > 1_000_000 } info)
+            {
+                var tail = File.ReadAllLines(info.FullName);
+                File.WriteAllLines(info.FullName, tail.Skip(tail.Length - 2000));
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // The log is diagnostics, never worth failing a refresh over.
+        }
+    }
+
+    private void TraceAgentsError(Exception exception)
+    {
+        try
+        {
+            File.AppendAllText(
+                AppPaths.AgentsScanLogPath,
+                $"{DateTime.Now:MM-dd HH:mm:ss} ERROR {exception}\n");
+        }
+        catch (Exception secondary) when (secondary is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private string _agentsTraceSignature = "";
+    private int _agentsTraceCount;
+
+    private OrchestratorCardVm BuildOrchestratorCard(OrchestratorActivity session)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var muted = (Brush)FindResource("MutedBrush");
+
+        // Only agents still out working get rows; whatever already finished
+        // folds into one summary line so the totals keep adding up.
+        var visible = session.Agents.Where(agent => agent.State != SubagentState.Done).ToList();
+        var collapsed = session.Agents.Where(agent => agent.State == SubagentState.Done).ToList();
+
+        var rows = visible.Select(agent =>
+        {
+            var glance = GlanceFor(agent, now);
+            return new AgentRowVm(
+                new Thickness(17 + (agent.Depth - 1) * 22, 2, 0, 2),
+                glance.DotBrush,
+                glance.IsRunning,
+                glance.Badge,
+                glance.Description,
+                glance.StatusText,
+                glance.StatusBrush,
+                glance.MetricsText,
+                glance.Tooltip);
+        }).ToList();
+
+        if (collapsed.Count > 0)
+        {
+            var foldedTokens = collapsed.Sum(agent => agent.Tokens.Total);
+            var foldedCost = collapsed.Sum(agent => _pricing.Calculate("anthropic", agent.Model, agent.Tokens).Cost);
+            rows.Add(new AgentRowVm(
+                new Thickness(17, 2, 0, 2),
+                Brushes.Transparent,
+                false,
+                $"+{collapsed.Count}",
+                collapsed.Count == 1 ? "agent already finished" : "agents already finished",
+                "",
+                muted,
+                $"{FormatCompact(foldedTokens)} tok · {FormatMoney(foldedCost)}",
+                $"{collapsed.Count} agent{(collapsed.Count == 1 ? "" : "s")} from this session already finished; " +
+                "only agents still working get their own row."));
+        }
+
+        var glanceS = SessionGlanceFor(session);
+        return new OrchestratorCardVm(
+            glanceS.Name,
+            glanceS.StateText,
+            glanceS.StateBrush,
+            glanceS.HeadBrush,
+            glanceS.IsRunning,
+            glanceS.EdgeBrush,
+            AnthropicIconGeometry,
+            AnthropicIconBrush,
+            glanceS.PathText,
+            glanceS.SummaryText,
+            glanceS.Head.StatusText,
+            glanceS.Head.StatusBrush,
+            glanceS.Head.MetricsText,
+            glanceS.Tooltip,
+            glanceS.Pid,
+            glanceS.Pid > 0 ? Cursors.Hand : Cursors.Arrow,
+            rows);
+    }
+
+    /// <summary>Everything any of the four views needs to say about one agent.</summary>
+    private sealed record AgentGlance(
+        Brush DotBrush,
+        bool IsRunning,
+        string Badge,
+        string Description,
+        string StatusText,
+        Brush StatusBrush,
+        string MetricsText,
+        string Tooltip);
+
+    private AgentGlance GlanceFor(SubagentActivity agent, DateTimeOffset now)
+    {
+        var accent = (Brush)FindResource("AccentBrush");
+        var settled = (Brush)FindResource("Series2Brush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var (dotBrush, statusText, statusBrush, isRunning) = agent.State switch
+        {
+            SubagentState.Running => (
+                accent,
+                agent.LastTool.Length > 0 ? $"working · {ToolLabel(agent.LastTool)}" : "working…",
+                accent,
+                true),
+            SubagentState.Quiet => (
+                LimitWarningBrush,
+                $"quiet · {AgeText(now - agent.LastActivity)}",
+                LimitWarningBrush,
+                false),
+            _ => (
+                settled,
+                $"{agent.DoneLabel} · {AgeText(now - (agent.CompletedAt ?? agent.LastActivity))} ago",
+                muted,
+                false)
+        };
+
+        var elapsed = (agent.CompletedAt ?? now) - agent.StartedAt;
+        var estimate = _pricing.Calculate("anthropic", agent.Model, agent.Tokens);
+        var metrics = agent.Tokens.Total == 0
+            ? "starting…"
+            : $"{FormatCompact(agent.Tokens.Total)} tok" +
+              (estimate.IsPriced ? $" · {FormatMoney(estimate.Cost)}" : "") +
+              $" · {AgeText(elapsed)}";
+        var description = HidePersonal ? "task hidden" : agent.Description;
+        var tooltip =
+            $"{agent.AgentType} agent{(agent.Model.Length > 0 ? $" · {agent.Model}" : "")}\n{description}\n" +
+            $"started {agent.StartedAt.ToLocalTime():h:mm:ss tt} · {statusText}\n" +
+            $"{FormatCompact(agent.Tokens.Input)} in · {FormatCompact(agent.Tokens.Output)} out · " +
+            $"{FormatCompact(agent.Tokens.CacheRead + agent.Tokens.CacheWrite)} cache · {agent.ToolCalls} tool calls";
+        return new AgentGlance(
+            dotBrush, isRunning, agent.AgentType, description, statusText, statusBrush, metrics, tooltip);
+    }
+
+    private sealed record SessionGlance(
+        string Name,
+        string StateText,
+        Brush StateBrush,
+        Brush HeadBrush,
+        bool IsRunning,
+        Brush EdgeBrush,
+        string PathText,
+        string SummaryText,
+        string Tooltip,
+        int Pid,
+        AgentGlance Head);
+
+    private SessionGlance SessionGlanceFor(OrchestratorActivity session)
+    {
+        var accent = (Brush)FindResource("AccentBrush");
+        var settled = (Brush)FindResource("Series2Brush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var head = GlanceFor(session.Head, DateTimeOffset.UtcNow);
+        var headRunning = session.Head.State == SubagentState.Running;
+        var headQuiet = session.Head.State == SubagentState.Quiet;
+        var live = session.Agents.Count(agent => agent.State == SubagentState.Running);
+        var quietCount = session.Agents.Count(agent => agent.State == SubagentState.Quiet);
+        var name = SessionTopic(session.SessionId) ?? DisplayProject(session.ProjectName);
+        var stateText = live > 0
+            ? $"{live} agent{(live == 1 ? "" : "s")} working"
+            : quietCount > 0
+                ? $"{quietCount} agent{(quietCount == 1 ? "" : "s")} quiet"
+                : session.Agents.Count > 0
+                    ? "agents settled"
+                    : "no agents out";
+        var totalTokens = session.Agents.Sum(agent => agent.Tokens.Total);
+        var totalCost = session.Agents.Sum(agent => _pricing.Calculate("anthropic", agent.Model, agent.Tokens).Cost);
+        var summary =
+            $"{session.Agents.Count} agent{(session.Agents.Count == 1 ? "" : "s")} · " +
+            $"{FormatCompact(totalTokens)} tok · {FormatMoney(totalCost)}";
+        var appName = session.IsDesktopApp ? "Claude app" : "Claude Code";
+        var displayPath = HidePersonal ? $@"~\…\{DisplayProject(session.ProjectName)}" : session.ProjectPath;
+        var pid = SessionPid(session.SessionId);
+        var headBrush = headRunning || live > 0
+            ? accent
+            : headQuiet || quietCount > 0 ? LimitWarningBrush : settled;
+        return new SessionGlance(
+            name,
+            stateText,
+            headRunning || live > 0 ? accent : headQuiet || quietCount > 0 ? LimitWarningBrush : muted,
+            headBrush,
+            headRunning || live > 0,
+            EdgeBrushFor(headBrush),
+            $"{appName} · {displayPath}",
+            summary,
+            $"{appName} · {displayPath}\nsession {session.SessionId[..Math.Min(8, session.SessionId.Length)]} · " +
+                $"last activity {session.LastActivity.ToLocalTime():h:mm:ss tt}\n" +
+                $"orchestrator {head.StatusText} · {head.MetricsText}" +
+                (pid > 0 ? "\n\nClick to bring this terminal to the front." : ""),
+            pid,
+            head);
+    }
+
+    /// <summary>MCP tool names carry their server as a prefix; the tail is the
+    /// part a human recognizes.</summary>
+    private static string ToolLabel(string name)
+    {
+        var split = name.LastIndexOf("__", StringComparison.Ordinal);
+        return split >= 0 && split + 2 < name.Length ? name[(split + 2)..] : name;
+    }
+
+    private void OrchestratorCard_Clicked(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: OrchestratorCardVm { Pid: > 0 } vm })
+        {
+            TerminalFocusService.TryFocus(vm.Pid);
+        }
+    }
+
+    private void AgentsViewButton_Checked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: string key } || key == _agentsViewKey && _loaded)
+        {
+            return;
+        }
+
+        _agentsViewKey = key;
+        if (AgentsAltPanel is null)
+        {
+            return;
+        }
+
+        _agentsSignature = "";
+        if (_loaded)
+        {
+            _settings.SelectedAgentsView = key;
+            _settings.Save();
+            _ = RefreshAgentsAsync();
+        }
+    }
+
+    private RadioButton AgentsViewRadioFor(string key) => key switch
+    {
+        "map" => AgentsViewMap,
+        "lanes" => AgentsViewLanes,
+        "tiles" => AgentsViewTiles,
+        _ => AgentsViewList
+    };
+
+    private void TilesStyleButton_Checked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: string key } || key == _tilesStyleKey && _loaded)
+        {
+            return;
+        }
+
+        _tilesStyleKey = key;
+        if (AgentsAltPanel is null)
+        {
+            return;
+        }
+
+        _agentsSignature = "";
+        if (_loaded)
+        {
+            _settings.SelectedTilesStyle = key;
+            _settings.Save();
+            _ = RefreshAgentsAsync();
+        }
+    }
+
+    private RadioButton TilesStyleRadioFor(string key) => key switch
+    {
+        "meter" => TilesStyleMeter,
+        "mini" => TilesStyleMini,
+        "rich" => TilesStyleRich,
+        _ => TilesStyleCozy
+    };
+
+    /// <summary>Tokens burned per scan, drawn as a strip of tiny bars — flat
+    /// means coasting, tall means producing. The newest bar is rightmost.</summary>
+    private FrameworkElement BurnSparkline(IReadOnlyList<long> samples, Brush active)
+    {
+        var baseline = (Brush)FindResource("RaisedBrush");
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Height = 15 };
+        var recent = samples.Count > 22 ? samples.Skip(samples.Count - 22).ToList() : samples.ToList();
+        var peak = Math.Max(1, recent.Count == 0 ? 1 : recent.Max());
+        for (var index = 0; index < 22; index++)
+        {
+            var value = index < 22 - recent.Count ? 0 : recent[index - (22 - recent.Count)];
+            panel.Children.Add(new Rectangle
+            {
+                Width = 4,
+                Height = value > 0 ? 3 + 12.0 * value / peak : 2,
+                RadiusX = 1,
+                RadiusY = 1,
+                Fill = value > 0 ? active : baseline,
+                Opacity = value > 0 ? 0.85 : 1,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(0, 0, 1, 0)
+            });
+        }
+
+        return panel;
+    }
+
+    /// <summary>"claude-fable-5 (fast)" → "fable-5 (fast)": the family is the
+    /// part that matters on a 200px tile.</summary>
+    private static string ShortModel(string model) =>
+        model.StartsWith("claude-", StringComparison.OrdinalIgnoreCase) ? model["claude-".Length..] : model;
+
+    private static TextBlock GlanceText(
+        string text, double size, Brush brush, FontWeight? weight = null, Thickness? margin = null) => new()
+    {
+        Text = text,
+        FontSize = size,
+        Foreground = brush,
+        FontWeight = weight ?? FontWeights.Normal,
+        Margin = margin ?? new Thickness(0),
+        VerticalAlignment = VerticalAlignment.Center,
+        TextTrimming = TextTrimming.CharacterEllipsis
+    };
+
+    private Border AgentsCardShell(SessionGlance glance, UIElement content) => new()
+    {
+        Style = (Style)FindResource("Card"),
+        Padding = new Thickness(20, 16, 20, 16),
+        Margin = new Thickness(0, 0, 0, 14),
+        BorderBrush = glance.EdgeBrush,
+        BorderThickness = new Thickness(1),
+        ToolTip = glance.Tooltip,
+        Child = content
+    };
+
+    /// <summary>Map view: the orchestrator as a node on top, agents fanned out
+    /// beneath it on a connector bus — the fleet's shape at a glance.</summary>
+    private FrameworkElement BuildSessionMap(OrchestratorActivity session)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var glance = SessionGlanceFor(session);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var line = (Brush)FindResource("RaisedBrush");
+
+        var stack = new StackPanel();
+        var pillContent = new StackPanel { Orientation = Orientation.Horizontal };
+        pillContent.Children.Add(new Ellipse
+        {
+            Width = 9, Height = 9, Fill = glance.HeadBrush,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 8, 0)
+        });
+        var pillName = GlanceText(glance.Name, 13.5, ink, FontWeights.SemiBold);
+        pillName.MaxWidth = 420;
+        pillContent.Children.Add(pillName);
+        pillContent.Children.Add(GlanceText(
+            glance.Head.StatusText, 11, glance.Head.StatusBrush, FontWeights.SemiBold, new Thickness(10, 1, 0, 0)));
+        pillContent.Children.Add(GlanceText(
+            glance.StateText, 11.5, glance.StateBrush, FontWeights.SemiBold, new Thickness(10, 1, 0, 0)));
+        stack.Children.Add(new Border
+        {
+            Background = line,
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(14, 8, 14, 8),
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+            BorderBrush = glance.EdgeBrush,
+            BorderThickness = new Thickness(1),
+            Child = pillContent
+        });
+        var subtitle = GlanceText(
+            $"{glance.SummaryText}  ·  {glance.PathText}", 10.5, muted, null, new Thickness(0, 6, 0, 0));
+        subtitle.HorizontalAlignment = System.Windows.HorizontalAlignment.Center;
+        stack.Children.Add(subtitle);
+        stack.Children.Add(new Border
+        {
+            Width = 1, Height = 14, Background = line, HorizontalAlignment = System.Windows.HorizontalAlignment.Center
+        });
+        stack.Children.Add(new Border { Height = 1, Background = line, Margin = new Thickness(70, 0, 70, 0) });
+
+        // Nested agents hang inside their root's column, prefixed ↳.
+        var liveAgents = session.Agents.Where(agent => agent.State != SubagentState.Done).ToList();
+        var groups = new List<(SubagentActivity Root, List<SubagentActivity> Children)>();
+        foreach (var agent in liveAgents)
+        {
+            if (agent.Depth <= 1 || groups.Count == 0)
+            {
+                groups.Add((agent, []));
+            }
+            else
+            {
+                groups[^1].Children.Add(agent);
+            }
+        }
+
+        var wrap = new WrapPanel { HorizontalAlignment = System.Windows.HorizontalAlignment.Center };
+        foreach (var (root, children) in groups)
+        {
+            var column = new StackPanel { Margin = new Thickness(7, 0, 7, 0) };
+            column.Children.Add(new Border
+            {
+                Width = 1, Height = 12, Background = line, HorizontalAlignment = System.Windows.HorizontalAlignment.Center
+            });
+            column.Children.Add(AgentNodeBox(root, now));
+            foreach (var child in children)
+            {
+                var childRow = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal, Margin = new Thickness(16, 6, 0, 0)
+                };
+                childRow.Children.Add(GlanceText("↳", 12, muted, null, new Thickness(0, 0, 6, 0)));
+                childRow.Children.Add(AgentNodeBox(child, now, width: 170));
+                column.Children.Add(childRow);
+            }
+
+            wrap.Children.Add(column);
+        }
+
+        var finished = session.Agents.Where(agent => agent.State == SubagentState.Done).ToList();
+        if (finished.Count > 0)
+        {
+            var foldStack = new StackPanel();
+            foldStack.Children.Add(GlanceText($"+{finished.Count} finished", 11.5, muted, FontWeights.SemiBold));
+            foldStack.Children.Add(GlanceText(
+                $"{FormatCompact(finished.Sum(agent => agent.Tokens.Total))} tok · " +
+                FormatMoney(finished.Sum(agent => _pricing.Calculate("anthropic", agent.Model, agent.Tokens).Cost)),
+                10, muted, null, new Thickness(0, 3, 0, 0)));
+            var foldColumn = new StackPanel { Margin = new Thickness(7, 0, 7, 0) };
+            foldColumn.Children.Add(new Border
+            {
+                Width = 1, Height = 12, Background = line, HorizontalAlignment = System.Windows.HorizontalAlignment.Center
+            });
+            foldColumn.Children.Add(new Border
+            {
+                Width = 130,
+                BorderBrush = line,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(10, 8, 10, 8),
+                Child = foldStack
+            });
+            wrap.Children.Add(foldColumn);
+        }
+
+        stack.Children.Add(wrap);
+        return AgentsCardShell(glance, stack);
+    }
+
+    private FrameworkElement AgentNodeBox(SubagentActivity agent, DateTimeOffset now, double width = 190)
+    {
+        var glance = GlanceFor(agent, now);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var stack = new StackPanel();
+        var head = new StackPanel { Orientation = Orientation.Horizontal };
+        head.Children.Add(new Ellipse
+        {
+            Width = 7, Height = 7, Fill = glance.DotBrush,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 6, 0)
+        });
+        head.Children.Add(GlanceText(glance.Badge, 10, muted));
+        stack.Children.Add(head);
+        stack.Children.Add(GlanceText(glance.Description, 11.5, ink, null, new Thickness(0, 5, 0, 0)));
+        stack.Children.Add(GlanceText(
+            glance.StatusText, 10.5, glance.StatusBrush, FontWeights.SemiBold, new Thickness(0, 4, 0, 0)));
+        stack.Children.Add(GlanceText(glance.MetricsText, 10, muted, null, new Thickness(0, 2, 0, 0)));
+        return new Border
+        {
+            Width = width,
+            Background = (Brush)FindResource("RaisedBrush"),
+            BorderBrush = EdgeBrushFor(glance.DotBrush),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(10, 8, 10, 8),
+            Margin = new Thickness(0, 0, 0, 0),
+            ToolTip = glance.Tooltip,
+            Child = stack
+        };
+    }
+
+    /// <summary>Lanes view: one horizontal bar per agent from launch to now, so
+    /// waves of parallel work and stragglers are visible as shapes.</summary>
+    private FrameworkElement BuildSessionLanes(OrchestratorActivity session)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var glance = SessionGlanceFor(session);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+
+        var stack = new StackPanel();
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var title = new StackPanel { Orientation = Orientation.Horizontal };
+        title.Children.Add(new Ellipse
+        {
+            Width = 9, Height = 9, Fill = glance.HeadBrush,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 8, 0)
+        });
+        var laneName = GlanceText(glance.Name, 13.5, ink, FontWeights.SemiBold);
+        laneName.MaxWidth = 430;
+        title.Children.Add(laneName);
+        title.Children.Add(GlanceText(
+            glance.Head.StatusText, 11, glance.Head.StatusBrush, FontWeights.SemiBold, new Thickness(10, 1, 0, 0)));
+        title.Children.Add(GlanceText(
+            glance.StateText, 11.5, glance.StateBrush, FontWeights.SemiBold, new Thickness(10, 1, 0, 0)));
+        header.Children.Add(title);
+        var headerSummary = GlanceText(glance.SummaryText, 11, muted);
+        Grid.SetColumn(headerSummary, 1);
+        header.Children.Add(headerSummary);
+        stack.Children.Add(header);
+        stack.Children.Add(GlanceText(glance.PathText, 10.5, muted, null, new Thickness(17, 3, 0, 8)));
+
+        var liveAgents = session.Agents.Where(agent => agent.State != SubagentState.Done).ToList();
+        var minStart = liveAgents.Count > 0 ? liveAgents.Min(agent => agent.StartedAt) : now;
+        var span = now - minStart;
+        if (span < TimeSpan.FromMinutes(5))
+        {
+            span = TimeSpan.FromMinutes(5);
+        }
+
+        foreach (var agent in liveAgents)
+        {
+            var agentGlance = GlanceFor(agent, now);
+            var row = new Grid { Margin = new Thickness(0, 2, 0, 2) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(250) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
+
+            var label = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(agent.Depth > 1 ? 16 : 0, 0, 8, 0)
+            };
+            label.Children.Add(new Ellipse
+            {
+                Width = 7, Height = 7, Fill = agentGlance.DotBrush,
+                VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 6, 0)
+            });
+            label.Children.Add(GlanceText(agentGlance.Description, 11.5, ink));
+            label.ToolTip = agentGlance.Tooltip;
+            row.Children.Add(label);
+
+            // Star-sized spacer/bar/spacer columns place the bar without any
+            // pixel math surviving a resize.
+            var startFraction = Math.Clamp((agent.StartedAt - minStart) / span, 0, 0.97);
+            var barFraction = Math.Max(0.03, 1 - startFraction);
+            var lane = new Grid { VerticalAlignment = VerticalAlignment.Center };
+            lane.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = new GridLength(Math.Max(0.0001, startFraction), GridUnitType.Star)
+            });
+            lane.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = new GridLength(barFraction, GridUnitType.Star)
+            });
+            var bar = new Border
+            {
+                Height = 12,
+                CornerRadius = new CornerRadius(6),
+                Background = agentGlance.DotBrush,
+                Opacity = 0.9,
+                ToolTip = agentGlance.Tooltip
+            };
+            Grid.SetColumn(bar, 1);
+            lane.Children.Add(bar);
+            Grid.SetColumn(lane, 1);
+            row.Children.Add(lane);
+
+            var metrics = GlanceText(agentGlance.MetricsText, 10.5, muted, null, new Thickness(10, 0, 0, 0));
+            metrics.TextAlignment = TextAlignment.Right;
+            Grid.SetColumn(metrics, 2);
+            row.Children.Add(metrics);
+            stack.Children.Add(row);
+        }
+
+        var axis = new Grid { Margin = new Thickness(258, 4, 160, 0) };
+        axis.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        axis.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        axis.Children.Add(GlanceText($"{AgeText(span)} ago", 10, muted));
+        var nowLabel = GlanceText("now", 10, muted);
+        Grid.SetColumn(nowLabel, 1);
+        axis.Children.Add(nowLabel);
+        stack.Children.Add(axis);
+
+        var finished = session.Agents.Count(agent => agent.State == SubagentState.Done);
+        if (finished > 0)
+        {
+            stack.Children.Add(GlanceText(
+                $"+{finished} agent{(finished == 1 ? "" : "s")} already finished",
+                10.5, muted, null, new Thickness(13, 6, 0, 0)));
+        }
+
+        return AgentsCardShell(glance, stack);
+    }
+
+    /// <summary>Tiles view: mission control — one compact tile per agent, the
+    /// same grammar as the Terminals page.</summary>
+    private FrameworkElement BuildSessionTiles(OrchestratorActivity session)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var glance = SessionGlanceFor(session);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+
+        var stack = new StackPanel { Margin = new Thickness(0, 0, 0, 6) };
+
+        // The orchestrator gets its own bar — the main agent the tiles below
+        // report to, with its own live status, not just a session label.
+        var bar = new Grid();
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.Children.Add(new Ellipse
+        {
+            Width = 9, Height = 9, Fill = glance.HeadBrush,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 8, 0)
+        });
+        var chip = new Border
+        {
+            Background = (Brush)FindResource("RaisedBrush"),
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(6, 1.5, 6, 1.5),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 8, 0),
+            Child = GlanceText("orchestrator", 10, muted)
+        };
+        Grid.SetColumn(chip, 1);
+        bar.Children.Add(chip);
+        var tilesName = GlanceText(glance.Name, 13, ink, FontWeights.SemiBold);
+        tilesName.MaxWidth = 380;
+        Grid.SetColumn(tilesName, 2);
+        bar.Children.Add(tilesName);
+        var headStatus = GlanceText(
+            glance.Head.StatusText, 11, glance.Head.StatusBrush, FontWeights.SemiBold, new Thickness(10, 1, 0, 0));
+        Grid.SetColumn(headStatus, 3);
+        bar.Children.Add(headStatus);
+        if (_tilesStyleKey is "meter" or "rich")
+        {
+            var headSpark = BurnSparkline(session.Head.RateSamples, glance.Head.DotBrush);
+            headSpark.Margin = new Thickness(12, 0, 0, 0);
+            headSpark.VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetColumn(headSpark, 5);
+            bar.Children.Add(headSpark);
+        }
+
+        var headMetrics = GlanceText(glance.Head.MetricsText, 10.5, muted, null, new Thickness(12, 1, 0, 0));
+        Grid.SetColumn(headMetrics, 6);
+        bar.Children.Add(headMetrics);
+        var fleetState = GlanceText(
+            glance.StateText, 11, glance.StateBrush, FontWeights.SemiBold, new Thickness(14, 1, 0, 0));
+        Grid.SetColumn(fleetState, 7);
+        bar.Children.Add(fleetState);
+        stack.Children.Add(new Border
+        {
+            Style = (Style)FindResource("Card"),
+            Padding = new Thickness(13, 8, 13, 8),
+            Margin = new Thickness(0, 0, 0, 8),
+            BorderBrush = glance.EdgeBrush,
+            BorderThickness = new Thickness(1),
+            ToolTip = glance.Tooltip,
+            Child = bar
+        });
+
+        var wrap = new WrapPanel();
+        foreach (var agent in session.Agents.Where(item => item.State != SubagentState.Done))
+        {
+            wrap.Children.Add(_tilesStyleKey switch
+            {
+                "meter" => MeterTile(agent, now),
+                "mini" => MiniTile(agent, now),
+                "rich" => RichTile(agent, now),
+                _ => CozyTile(agent, now)
+            });
+        }
+
+        var finished = session.Agents.Where(agent => agent.State == SubagentState.Done).ToList();
+        if (finished.Count > 0)
+        {
+            var fold = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            fold.Children.Add(GlanceText($"+{finished.Count} finished", 11.5, muted, FontWeights.SemiBold));
+            fold.Children.Add(GlanceText(
+                $"{FormatCompact(finished.Sum(agent => agent.Tokens.Total))} tok · " +
+                FormatMoney(finished.Sum(agent => _pricing.Calculate("anthropic", agent.Model, agent.Tokens).Cost)),
+                10, muted, null, new Thickness(0, 3, 0, 0)));
+            wrap.Children.Add(new Border
+            {
+                Width = 130,
+                BorderBrush = (Brush)FindResource("RaisedBrush"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(12, 11, 12, 11),
+                Margin = new Thickness(0, 0, 10, 10),
+                Child = fold
+            });
+        }
+
+        // The tile wall hangs off the orchestrator bar behind a thin trunk
+        // line — the same parent → children shape the list view draws.
+        var body = new Grid();
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        if (wrap.Children.Count > 0)
+        {
+            body.Children.Add(new Border
+            {
+                Width = 1,
+                Background = (Brush)FindResource("RaisedBrush"),
+                Margin = new Thickness(10, 0, 13, 10)
+            });
+        }
+
+        Grid.SetColumn(wrap, 1);
+        body.Children.Add(wrap);
+        stack.Children.Add(body);
+        return stack;
+    }
+
+    private Border TileShell(AgentGlance glance, UIElement content, double width, Thickness padding) => new()
+    {
+        Style = (Style)FindResource("Card"),
+        Width = width,
+        Padding = padding,
+        Margin = new Thickness(0, 0, 10, 10),
+        BorderBrush = EdgeBrushFor(glance.DotBrush),
+        BorderThickness = new Thickness(1),
+        ToolTip = glance.Tooltip,
+        Child = content
+    };
+
+    private StackPanel TileHead(SubagentActivity agent, AgentGlance glance, double dotSize = 8)
+    {
+        var muted = (Brush)FindResource("MutedBrush");
+        var head = new StackPanel { Orientation = Orientation.Horizontal };
+        head.Children.Add(new Ellipse
+        {
+            Width = dotSize, Height = dotSize, Fill = glance.DotBrush,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 7, 0)
+        });
+        head.Children.Add(GlanceText(agent.Depth > 1 ? $"↳ {glance.Badge}" : glance.Badge, 10, muted));
+        return head;
+    }
+
+    /// <summary>The baseline tile: state, task, tool, cost.</summary>
+    private FrameworkElement CozyTile(SubagentActivity agent, DateTimeOffset now)
+    {
+        var glance = GlanceFor(agent, now);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var tile = new StackPanel();
+        tile.Children.Add(TileHead(agent, glance));
+        tile.Children.Add(GlanceText(glance.Description, 12, ink, FontWeights.SemiBold, new Thickness(0, 6, 0, 0)));
+        tile.Children.Add(GlanceText(
+            glance.StatusText, 11, glance.StatusBrush, FontWeights.SemiBold, new Thickness(0, 5, 0, 0)));
+        tile.Children.Add(GlanceText(glance.MetricsText, 10.5, muted, null, new Thickness(0, 3, 0, 0)));
+        return TileShell(glance, tile, 224, new Thickness(14, 11, 14, 11));
+    }
+
+    /// <summary>Cozy plus a burn sparkline and the model — "is it producing?"
+    /// answered without reading a number.</summary>
+    private FrameworkElement MeterTile(SubagentActivity agent, DateTimeOffset now)
+    {
+        var glance = GlanceFor(agent, now);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var tile = new StackPanel();
+
+        var head = new Grid();
+        head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        head.Children.Add(TileHead(agent, glance));
+        var model = GlanceText(ShortModel(agent.Model), 9.5, muted);
+        Grid.SetColumn(model, 1);
+        head.Children.Add(model);
+        tile.Children.Add(head);
+
+        tile.Children.Add(GlanceText(glance.Description, 12, ink, FontWeights.SemiBold, new Thickness(0, 6, 0, 0)));
+        tile.Children.Add(GlanceText(
+            glance.StatusText, 11, glance.StatusBrush, FontWeights.SemiBold, new Thickness(0, 5, 0, 0)));
+        var spark = BurnSparkline(agent.RateSamples, glance.DotBrush);
+        spark.Margin = new Thickness(0, 7, 0, 0);
+        tile.Children.Add(spark);
+        tile.Children.Add(GlanceText(glance.MetricsText, 10.5, muted, null, new Thickness(0, 5, 0, 0)));
+        return TileShell(glance, tile, 224, new Thickness(14, 11, 14, 11));
+    }
+
+    /// <summary>Half-size: task and verb only — the biggest wall of agents that
+    /// still reads. Everything else lives in the tooltip.</summary>
+    private FrameworkElement MiniTile(SubagentActivity agent, DateTimeOffset now)
+    {
+        var glance = GlanceFor(agent, now);
+        var ink = (Brush)FindResource("InkBrush");
+        var tile = new StackPanel();
+        var head = new StackPanel { Orientation = Orientation.Horizontal };
+        head.Children.Add(new Ellipse
+        {
+            Width = 7, Height = 7, Fill = glance.DotBrush,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 1, 6, 0)
+        });
+        head.Children.Add(GlanceText(glance.Description, 11, ink, FontWeights.SemiBold));
+        tile.Children.Add(head);
+        tile.Children.Add(GlanceText(
+            glance.StatusText, 10, glance.StatusBrush, FontWeights.SemiBold, new Thickness(13, 3, 0, 0)));
+        return TileShell(glance, tile, 158, new Thickness(11, 8, 11, 8));
+    }
+
+    /// <summary>The full briefing: two-line task, model, burn meter, and the
+    /// token split — for when the wall is small and attention is high.</summary>
+    private FrameworkElement RichTile(SubagentActivity agent, DateTimeOffset now)
+    {
+        var glance = GlanceFor(agent, now);
+        var ink = (Brush)FindResource("InkBrush");
+        var muted = (Brush)FindResource("MutedBrush");
+        var tile = new StackPanel();
+
+        var head = new Grid();
+        head.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        head.Children.Add(TileHead(agent, glance));
+        var model = GlanceText(ShortModel(agent.Model), 9.5, muted);
+        Grid.SetColumn(model, 1);
+        head.Children.Add(model);
+        tile.Children.Add(head);
+
+        var description = GlanceText(glance.Description, 12.5, ink, FontWeights.SemiBold, new Thickness(0, 7, 0, 0));
+        description.TextWrapping = TextWrapping.Wrap;
+        description.MaxHeight = 38;
+        tile.Children.Add(description);
+
+        var statusRow = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+        statusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        statusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        statusRow.Children.Add(GlanceText(glance.StatusText, 11, glance.StatusBrush, FontWeights.SemiBold));
+        var age = GlanceText(
+            $"{AgeText((agent.CompletedAt ?? now) - agent.StartedAt)} in", 10, muted);
+        Grid.SetColumn(age, 1);
+        statusRow.Children.Add(age);
+        tile.Children.Add(statusRow);
+
+        var spark = BurnSparkline(agent.RateSamples, glance.DotBrush);
+        spark.Margin = new Thickness(0, 7, 0, 0);
+        tile.Children.Add(spark);
+
+        var estimate = _pricing.Calculate("anthropic", agent.Model, agent.Tokens);
+        tile.Children.Add(GlanceText(
+            $"{FormatCompact(agent.Tokens.Total)} tok" +
+            (estimate.IsPriced ? $" · {FormatMoney(estimate.Cost)}" : "") +
+            $" · {FormatCompact(agent.Tokens.Output)} out · {agent.ToolCalls} tools",
+            10.5, muted, null, new Thickness(0, 5, 0, 0)));
+        return TileShell(glance, tile, 264, new Thickness(15, 12, 15, 12));
+    }
+
+    private sealed record AgentRowVm(
+        Thickness Indent,
+        Brush DotBrush,
+        bool IsRunning,
+        string TypeBadge,
+        string Description,
+        string StatusText,
+        Brush StatusBrush,
+        string MetricsText,
+        string Tooltip);
+
+    private sealed record OrchestratorCardVm(
+        string Name,
+        string StateText,
+        Brush StateBrush,
+        Brush DotBrush,
+        bool IsRunning,
+        Brush EdgeBrush,
+        Geometry IconGeometry,
+        Brush IconBrush,
+        string PathText,
+        string SummaryText,
+        string HeadStatusText,
+        Brush HeadStatusBrush,
+        string HeadMetricsText,
+        string Tooltip,
+        int Pid,
+        System.Windows.Input.Cursor Cursor,
+        IReadOnlyList<AgentRowVm> Agents);
+
     /// <summary>One line of truth about how live an account's numbers are —
     /// being signed in no longer hides a feed that can't actually update.</summary>
     private static string AccountStatusText(ClaudeAccountLimits account)
     {
+        if (account.Provider == "openai")
+        {
+            // Codex limits ride its own session logs, so their freshness is
+            // simply "when did Codex last answer" — no fetching, no cooldowns.
+            return account.IsActive
+                ? "Codex is running now"
+                : account.FetchedAt is { } snapshot
+                    ? $"updates while Codex runs · limits from {FormatResetTime(snapshot.ToLocalTime())}"
+                    : "waiting for a Codex session — limits arrive with its first response";
+        }
+
         var status = account.IsActive
             ? account.Stale
                 ? account.FetchedAt is { } fetched
@@ -484,7 +1700,21 @@ public partial class MainWindow : Window
                 // Keep the last drawn grid; the next tick retries.
             }
 
-            var accounts = await _limitsService.FetchAllAsync();
+            var claudeAccounts = await _limitsService.FetchAllAsync();
+
+            // The ChatGPT account Codex uses, read from its local files — it
+            // renders as one more card, after the Claude accounts.
+            IReadOnlyList<ClaudeAccountLimits> codexAccounts;
+            try
+            {
+                codexAccounts = await _codexLimitsService.FetchAllAsync();
+            }
+            catch
+            {
+                codexAccounts = [];
+            }
+
+            var accounts = claudeAccounts.Concat(codexAccounts).ToList();
             _apiServer.UpdateLimits(accounts);
             if (_disposed)
             {
@@ -504,12 +1734,14 @@ public partial class MainWindow : Window
 
             // Known subscription spend on this machine, for the insights page's
             // plan-value comparison. Accounts with unknown plans contribute nothing.
-            var planTotal = accounts.Sum(account => PlanMonthlyUsd(account.Plan, account.RateLimitTier) ?? 0);
+            var planTotal = accounts.Sum(account => PlanMonthlyUsd(account) ?? 0);
             _planMonthlyUsd = planTotal > 0 ? planTotal : null;
 
             // The compact top bar mirrors whichever account Claude Code is
             // signed into right now; the limits page lists every account.
-            var current = accounts.FirstOrDefault(account => account.IsActive) ?? accounts[0];
+            var current = claudeAccounts.FirstOrDefault(account => account.IsActive)
+                ?? claudeAccounts.FirstOrDefault()
+                ?? accounts[0];
             _currentAccountId = current.Id;
             var currentEmail = DisplayEmail(current.Email);
             LimitsBarAccount.Text = ShortAccountName(currentEmail);
@@ -546,6 +1778,21 @@ public partial class MainWindow : Window
             var usageTexts = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var account in accounts)
             {
+                if (account.Provider == "openai")
+                {
+                    // Codex transcripts carry no account identity either, but
+                    // only one ChatGPT account signs in at a time — all local
+                    // Codex usage is its.
+                    var (codexCost, codexTokens) = await _database.GetUsageInSpansAsync(
+                        "codex",
+                        "openai",
+                        [(attributionSinceMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())],
+                        _pricing);
+                    usageTexts[account.Id] =
+                        $"≈ {FormatMoney(codexCost)} · {FormatCompact(codexTokens)} tok of local Codex usage · last 7 days";
+                    continue;
+                }
+
                 var spans = _limitsService.SignedInSpans(account.Id, attributionSinceMs);
                 if (spans.Count == 0)
                 {
@@ -553,7 +1800,7 @@ public partial class MainWindow : Window
                     continue;
                 }
 
-                var (cost, tokens) = await _database.GetClaudeUsageInSpansAsync(spans, _pricing);
+                var (cost, tokens) = await _database.GetUsageInSpansAsync("claude", "anthropic", spans, _pricing);
                 usageTexts[account.Id] =
                     $"≈ {FormatMoney(cost)} · {FormatCompact(tokens)} tok of local usage attributed · last 7 days";
             }
@@ -563,56 +1810,123 @@ public partial class MainWindow : Window
                 return;
             }
 
-            LimitsDetailList.ItemsSource = accounts.Select(account => new AccountVm(
-                DisplayEmail(account.Email),
-                PlanLabel(account.Plan, account.RateLimitTier),
-                AccountStatusText(account),
-                account.IsActive ? (Brush)FindResource("AccentBrush") : (Brush)FindResource("MutedBrush"),
-                usageTexts.GetValueOrDefault(account.Id, ""),
-                account.Limits.Select(limit =>
-                {
-                    // The thin bar under the usage bar: how far through the
-                    // limit window we are, i.e. how close the reset is.
-                    double resetShare = 0;
-                    var resetTooltip = "";
-                    if (limit.ResetsAt is { } resetsAt)
-                    {
-                        var period = limit.Label == "5h" ? TimeSpan.FromHours(5) : TimeSpan.FromDays(7);
-                        resetShare = Math.Clamp(
-                            1 - (resetsAt - DateTimeOffset.Now).TotalMilliseconds / period.TotalMilliseconds,
-                            0,
-                            1);
-                        resetTooltip = $"{resetShare * 100:0}% of the way through this " +
-                                       $"{(limit.Label == "5h" ? "5-hour window" : "week")}";
-                    }
+            // A collapsed account that signs in again is back in use — reopen
+            // its card on its own. The comparison runs against a persisted id
+            // so a switch that happened while the app was closed still counts.
+            var activeAccount = accounts.FirstOrDefault(account => account.IsActive);
+            if (activeAccount is not null && activeAccount.Id != _settings.LimitsLastActiveAccountId)
+            {
+                _settings.LimitsLastActiveAccountId = activeAccount.Id;
+                _settings.CollapsedClaudeAccounts.Remove(activeAccount.Id);
+                _settings.Save();
+            }
 
-                    return new LimitDetailVm(
-                        LimitTitle(limit.Label),
-                        limit.ResetsAt is { } at ? FormatResetDetail(at)
-                            : limit is { Label: "5h", Percent: 0 }
-                                ? "idle — a new 5-hour window starts with the next message"
-                                : "reset time unknown",
-                        $"{limit.Percent:0}%",
-                        LimitBarBrush(limit),
-                        Math.Clamp(limit.Percent / 100.0, 0, 1),
-                        LimitBarBrush(limit),
-                        resetShare,
-                        limit.ResetsAt is null ? Visibility.Collapsed : Visibility.Visible,
-                        resetTooltip);
-                }).ToList())).ToList();
+            _limitsAccounts = accounts;
+            _limitsUsageTexts = usageTexts;
+            RenderLimitsAccounts();
 
             // The stamp reflects the data's age, not this render's, so a feed
             // that can't fetch (rate limited, offline) doesn't claim freshness.
             var lastFetch = accounts.Max(account => account.FetchedAt);
             LimitsPageSubtitle.Text =
                 $"{accounts.Count} {(accounts.Count == 1 ? "account" : "accounts")} · " +
-                $"the same numbers Claude Code shows under /usage · " +
+                (codexAccounts.Count > 0
+                    ? "the same numbers Claude Code and Codex show under /usage · "
+                    : "the same numbers Claude Code shows under /usage · ") +
                 (lastFetch is { } at ? $"updated {at.LocalDateTime:h:mm tt}" : "no successful update yet");
         }
         finally
         {
             _limitsRefreshing = false;
         }
+    }
+
+    /// <summary>Draws the per-account cards from the last fetch. A collapsed
+    /// card shrinks to its one-line header and sinks below the expanded ones.</summary>
+    private void RenderLimitsAccounts()
+    {
+        var collapsedIds = _settings.CollapsedClaudeAccounts;
+        LimitsDetailList.ItemsSource = _limitsAccounts
+            .OrderBy(account => collapsedIds.Contains(account.Id) ? 1 : 0)
+            .Select(account =>
+            {
+                var collapsed = collapsedIds.Contains(account.Id);
+                return new AccountVm(
+                    account.Id,
+                    DisplayEmail(account.Email),
+                    account.Provider == "openai"
+                        ? OpenAiPlanLabel(account.Plan)
+                        : PlanLabel(account.Plan, account.RateLimitTier),
+                    AccountStatusText(account),
+                    account.IsActive ? (Brush)FindResource("AccentBrush") : (Brush)FindResource("MutedBrush"),
+                    _limitsUsageTexts.GetValueOrDefault(account.Id, ""),
+                    account.Provider == "openai"
+                        ? "Estimated at API prices from local Codex logs. Codex transcripts carry no " +
+                          "account identity, but only one ChatGPT account signs in at a time — all local " +
+                          "Codex usage is attributed here."
+                        : "Estimated from local logs: usage that landed while this account was the one " +
+                          "signed into Claude Code. Attribution is only as complete as the time the " +
+                          "tracker has been running.",
+                    collapsed ? "▸" : "▾",
+                    collapsed ? Visibility.Collapsed : Visibility.Visible,
+                    collapsed ? 0.55 : 1.0,
+                    collapsed
+                        ? "Click to expand this account again. It also reopens on its own the next time it signs in to Claude Code."
+                        : "Click to collapse this account to one line — for accounts you no longer use.",
+                    account.Limits.Select(limit =>
+                    {
+                        // The thin bar under the usage bar: how far through the
+                        // limit window we are, i.e. how close the reset is.
+                        double resetShare = 0;
+                        var resetTooltip = "";
+                        if (limit.ResetsAt is { } resetsAt)
+                        {
+                            var period = LimitPeriod(limit.Label);
+                            resetShare = Math.Clamp(
+                                1 - (resetsAt - DateTimeOffset.Now).TotalMilliseconds / period.TotalMilliseconds,
+                                0,
+                                1);
+                            resetTooltip = $"{resetShare * 100:0}% of the way through this " +
+                                           (period >= TimeSpan.FromDays(7)
+                                               ? "week"
+                                               : period >= TimeSpan.FromDays(1)
+                                                   ? $"{period.TotalDays:0}-day window"
+                                                   : $"{period.TotalHours:0}-hour window");
+                        }
+
+                        return new LimitDetailVm(
+                            LimitTitle(limit.Label),
+                            limit.ResetsAt is { } at ? FormatResetDetail(at)
+                                : limit is { Label: "5h", Percent: 0 }
+                                    ? "idle — a new 5-hour window starts with the next message"
+                                    : "reset time unknown",
+                            $"{limit.Percent:0}%",
+                            LimitBarBrush(limit),
+                            Math.Clamp(limit.Percent / 100.0, 0, 1),
+                            LimitBarBrush(limit),
+                            resetShare,
+                            limit.ResetsAt is null ? Visibility.Collapsed : Visibility.Visible,
+                            resetTooltip);
+                    }).ToList());
+            }).ToList();
+    }
+
+    /// <summary>Header click on a limits-page account card: collapse it to its
+    /// one-line header, or expand it again.</summary>
+    private void AccountCardHeader_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not string id || id.Length == 0)
+        {
+            return;
+        }
+
+        if (!_settings.CollapsedClaudeAccounts.Remove(id))
+        {
+            _settings.CollapsedClaudeAccounts.Add(id);
+        }
+
+        _settings.Save();
+        RenderLimitsAccounts();
     }
 
     // ── Daily activity heatmap ─────────────────────────────────────────────
@@ -749,7 +2063,24 @@ public partial class MainWindow : Window
             var gridStart = thisWeekStart.AddDays(-7 * (weeks - 1));
             var since = new DateTimeOffset(thisWeekStart.AddDays(-7 * 51)).ToUnixTimeMilliseconds();
 
-            var days = await _database.GetDailyUsageAsync(since, _pricing);
+            // Only today is read on every pass. This runs on the 60 s limits
+            // timer and used to re-read every event of the year each time —
+            // measured 2026-09-01: 453k rows, ~300 MB of page reads a minute —
+            // for cells that only move when an old transcript is re-parsed.
+            // The earlier days are re-read every HeatmapEarlierRefresh, or at
+            // once when the window shifts (a new day, a different view).
+            var todayStart = new DateTimeOffset(today).ToUnixTimeMilliseconds();
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (_heatmapEarlier is null || _heatmapEarlierSince != since || _heatmapEarlierUntil != todayStart ||
+                nowMs - _heatmapEarlierAtMs >= HeatmapEarlierRefresh.TotalMilliseconds)
+            {
+                _heatmapEarlier = await _database.GetDailyUsageAsync(since, _pricing, untilMs: todayStart);
+                _heatmapEarlierSince = since;
+                _heatmapEarlierUntil = todayStart;
+                _heatmapEarlierAtMs = nowMs;
+            }
+
+            var days = _heatmapEarlier.Concat(await _database.GetDailyUsageAsync(todayStart, _pricing)).ToList();
             if (_disposed)
             {
                 return;
@@ -1085,8 +2416,19 @@ public partial class MainWindow : Window
     {
         "5h" => "5-hour session",
         "Week" => "Weekly · all models",
+        // Codex windows are labeled by length ("3h", "3d"); anything else is a
+        // Claude model-scoped weekly row carrying its display name.
+        _ when System.Text.RegularExpressions.Regex.IsMatch(label, @"^\d+h$") => $"{label[..^1]}-hour session",
+        _ when System.Text.RegularExpressions.Regex.IsMatch(label, @"^\d+d$") => $"{label[..^1]}-day window",
         _ => $"Weekly · {label}"
     };
+
+    /// <summary>How long the window behind a limit row runs — drives the thin
+    /// "how close is the reset" bar.</summary>
+    private static TimeSpan LimitPeriod(string label) =>
+        label.Length > 1 && label[^1] == 'h' && int.TryParse(label[..^1], out var hours) ? TimeSpan.FromHours(hours)
+        : label.Length > 1 && label[^1] == 'd' && int.TryParse(label[..^1], out var days) ? TimeSpan.FromDays(days)
+        : TimeSpan.FromDays(7);
 
     private static string PlanLabel(string? plan, string? tier)
     {
@@ -1117,14 +2459,34 @@ public partial class MainWindow : Window
         return $"{name} {multiplier.Groups[1].Value}x{price}";
     }
 
-    /// <summary>What the account's plan bills per month, when the tier makes it knowable.</summary>
-    private static double? PlanMonthlyUsd(string? plan, string? tier) => plan switch
+    /// <summary>"ChatGPT Plus · $20/mo" — the Codex account's plan line. The
+    /// same plan words mean different prices at OpenAI ("pro" is $200 there),
+    /// so ChatGPT plans get their own table.</summary>
+    private static string OpenAiPlanLabel(string? plan) => plan switch
     {
-        "pro" => 20,
-        "max" when tier?.EndsWith("_5x", StringComparison.Ordinal) == true => 100,
-        "max" when tier?.EndsWith("_20x", StringComparison.Ordinal) == true => 200,
-        _ => null
+        "plus" => "ChatGPT Plus · $20/mo",
+        "pro" => "ChatGPT Pro · $200/mo",
+        "team" => "ChatGPT Team",
+        "enterprise" => "ChatGPT Enterprise",
+        "free" or null or "" => "ChatGPT",
+        _ => $"ChatGPT {char.ToUpperInvariant(plan[0])}{plan[1..]}"
     };
+
+    /// <summary>What the account's plan bills per month, when the tier makes it knowable.</summary>
+    private static double? PlanMonthlyUsd(ClaudeAccountLimits account) => account.Provider == "openai"
+        ? account.Plan switch
+        {
+            "plus" => 20,
+            "pro" => 200,
+            _ => null
+        }
+        : account.Plan switch
+        {
+            "pro" => 20,
+            "max" when account.RateLimitTier?.EndsWith("_5x", StringComparison.Ordinal) == true => 100,
+            "max" when account.RateLimitTier?.EndsWith("_20x", StringComparison.Ordinal) == true => 200,
+            _ => null
+        };
 
     // ── Hide personal data ─────────────────────────────────────────────────
     // Display-only masking for screenshots and screen shares. Each real value
@@ -1278,6 +2640,91 @@ public partial class MainWindow : Window
         UpdateApiStatusText();
     }
 
+    private void CaptureCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _settings.CaptureRequestsEnabled = CaptureCheckBox.IsChecked == true;
+        _settings.Save();
+        if (_settings.CaptureRequestsEnabled)
+        {
+            StartRequestCapture();
+        }
+        else
+        {
+            _captureProxy.Stop();
+            RequestCaptureProxy.ClearEnvironment();
+            _captureEnvConflict = null;
+        }
+
+        UpdateCaptureStatusText();
+    }
+
+    /// <summary>Starts the relay, then routes new sessions through it — but only
+    /// when the env var isn't already claimed by something else, and never while
+    /// the relay failed to bind (a dead base URL would break Claude Code).</summary>
+    private void StartRequestCapture()
+    {
+        if (_captureProxy.Start(_settings.CaptureProxyPort))
+        {
+            _captureEnvConflict = RequestCaptureProxy.SetEnvironment(_captureProxy.Port);
+            return;
+        }
+
+        // A previous run that was killed can leave the variable behind; with no
+        // relay to answer it, clear it rather than leave Claude Code pointed at
+        // nothing.
+        _captureEnvConflict = null;
+        RequestCaptureProxy.ClearEnvironment();
+    }
+
+    private void UpdateCaptureStatusText()
+    {
+        CaptureStatusText.Text = !_captureProxy.IsRunning
+            ? _captureProxy.Error is { } error && _settings.CaptureRequestsEnabled
+                ? $"Capture off: {error}"
+                : "Off — transcripts show only what Claude Code writes to disk (no system prompt)."
+            : _captureEnvConflict is { } existing
+                ? $"Relay running, but ANTHROPIC_BASE_URL is already \"{existing}\" — left untouched, so nothing routes through it."
+                : $"Relaying api.anthropic.com via localhost:{_captureProxy.Port}. Sessions started from now on get " +
+                  "their system prompt and tool schemas shown in the transcript viewer; restart open ones to include them.";
+    }
+
+    private void CodexTraceCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+
+        _settings.CodexTraceEnabled = CodexTraceCheckBox.IsChecked == true;
+        _settings.Save();
+        if (_settings.CodexTraceEnabled)
+        {
+            _codexTraceConflict = CodexTraces.SetEnvironment();
+        }
+        else
+        {
+            CodexTraces.ClearEnvironment();
+            _codexTraceConflict = null;
+        }
+
+        UpdateCodexTraceStatusText();
+    }
+
+    private void UpdateCodexTraceStatusText()
+    {
+        CodexTraceStatusText.Text = !_settings.CodexTraceEnabled
+            ? "Off — Codex runs that save no session log (codex exec --ephemeral) aren't counted."
+            : _codexTraceConflict is { } existing
+                ? $"{CodexTraces.EnvName} is already \"{existing}\" — left untouched, so runs that save no session log aren't counted."
+                : "Codex processes started from now on write a usage trace, so runs that save no session log are " +
+                  "counted too. Restart open terminals and apps to include theirs.";
+    }
+
     private void UpdateApiStatusText()
     {
         ApiStatusText.Text = _apiServer.IsRunning
@@ -1353,11 +2800,17 @@ public partial class MainWindow : Window
         string ResetTooltip);
 
     private sealed record AccountVm(
+        string Id,
         string Email,
         string PlanText,
         string StatusText,
         Brush StatusBrush,
         string UsageText,
+        string UsageTip,
+        string Chevron,
+        Visibility DetailsVisibility,
+        double CardOpacity,
+        string ToggleTip,
         List<LimitDetailVm> Limits);
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -1397,6 +2850,7 @@ public partial class MainWindow : Window
         try
         {
             await Task.WhenAll(_collector.StartAsync(), _pricing.InitializeAsync());
+            _openCodeService.Start();
             await RefreshDashboardAsync();
 
             // Both live views start with the app, whatever tab or mode is
@@ -1407,9 +2861,20 @@ public partial class MainWindow : Window
             _liveTimer.Start();
             _ = RefreshLimitsAsync();
             _ = RefreshTerminalsAsync();
+            if (_tabKey == "agents")
+            {
+                _ = RefreshAgentsAsync();
+            }
+
             if (_tabKey == "insights")
             {
                 _ = RefreshInsightsAsync();
+            }
+
+            GpuCreditExpiryBox.Text = _settings.AwsCreditExpiry;
+            if (_tabKey == "gpu")
+            {
+                _ = RefreshGpuAsync();
             }
         }
         catch (Exception exception)
@@ -1561,6 +3026,286 @@ public partial class MainWindow : Window
         _ => null
     };
 
+    // ── GPU view ───────────────────────────────────────────────────────────
+
+    private sealed record GpuRowVm(
+        string Title,
+        string StateText,
+        Brush StateBrush,
+        Brush StateTextBrush,
+        string DetailText,
+        string Tooltip,
+        string RateText,
+        Brush RateBrush,
+        string RunCostText);
+
+    private void GpuRefreshButton_Click(object sender, RoutedEventArgs e) => _ = RefreshGpuAsync();
+
+    private async Task RefreshGpuAsync()
+    {
+        if (_gpuScanning)
+        {
+            return;
+        }
+
+        _gpuScanning = true;
+        GpuRefreshButton.IsEnabled = false;
+        GpuStatusText.Visibility = Visibility.Visible;
+        GpuStatusText.Text = "Asking AWS…";
+        try
+        {
+            var creditsTask = RefreshGpuCreditsAsync(force: false);
+            var result = await _gpuService.ScanAsync();
+            await creditsTask;
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (result.Error is not null)
+            {
+                GpuError.Text = result.Error;
+                GpuError.Visibility = Visibility.Visible;
+                GpuEmpty.Visibility = Visibility.Collapsed;
+                GpuPanel.ItemsSource = null;
+                GpuStatusText.Text = $"checked {result.ScannedAt.ToLocalTime():h:mm:ss tt}";
+                return;
+            }
+
+            GpuError.Visibility = Visibility.Collapsed;
+            GpuEmpty.Visibility = result.Instances.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            GpuPanel.ItemsSource = result.Instances.Select(BuildGpuRow).ToList();
+
+            var running = result.Instances.Where(i => i.State == "running").ToList();
+            var knownRate = running.Where(i => i.HourlyUsd is not null).Sum(i => i.HourlyUsd!.Value);
+            var rateText = running.Count == 0 ? ""
+                : running.Any(i => i.HourlyUsd is null) ? $" · ≥ ${knownRate:0.00}/hr"
+                : $" · ${knownRate:0.00}/hr";
+            var account = result.AccountId is null ? ""
+                : HidePersonal ? " · account ••••"
+                : $" · account {result.AccountId}";
+            var region = result.Region is null ? "" : $" · {result.Region}";
+            GpuStatusText.Text =
+                $"{running.Count} running · {result.Instances.Count} total{rateText}{account}{region}" +
+                $" · checked {result.ScannedAt.ToLocalTime():h:mm:ss tt}";
+        }
+        finally
+        {
+            _gpuScanning = false;
+            GpuRefreshButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>Renders the credits card, asking Cost Explorer only when the
+    /// cached answer is stale (each question costs $0.01) or a new baseline
+    /// was just saved.</summary>
+    private async Task RefreshGpuCreditsAsync(bool force)
+    {
+        if (_gpuCreditsFetching)
+        {
+            return;
+        }
+
+        var checkedAt = DateTimeOffset.FromUnixTimeMilliseconds(_settings.AwsCreditsCheckedMs);
+        var stale = DateTimeOffset.UtcNow - checkedAt > TimeSpan.FromHours(6);
+        if (stale || force)
+        {
+            _gpuCreditsFetching = true;
+            try
+            {
+                DateOnly? baselineDay = DateOnly.TryParse(_settings.AwsCreditBaselineDate, out var day)
+                    ? day
+                    : null;
+                var credits = await _gpuService.GetCreditsAppliedAsync(baselineDay);
+                if (_disposed)
+                {
+                    return;
+                }
+
+                if (credits.Error is not null)
+                {
+                    GpuCreditsMain.Text = "—";
+                    GpuCreditsSub.Text = credits.Error;
+                    return;
+                }
+
+                _settings.AwsCreditsSinceBaselineUsd = credits.AppliedSinceStart;
+                _settings.AwsCreditsMonthUsd = credits.AppliedThisMonth;
+                _settings.AwsCreditsSinceTokensUsd = credits.SinceTokensUsd;
+                _settings.AwsCreditsSinceGpuUsd = credits.SinceGpuUsd;
+                _settings.AwsCreditsMonthTokensUsd = credits.MonthTokensUsd;
+                _settings.AwsCreditsMonthGpuUsd = credits.MonthGpuUsd;
+                _settings.AwsCreditsCheckedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                _settings.Save();
+            }
+            finally
+            {
+                _gpuCreditsFetching = false;
+            }
+        }
+
+        RenderGpuCredits();
+    }
+
+    private void RenderGpuCredits()
+    {
+        if (_settings.AwsCreditsCheckedMs == 0)
+        {
+            GpuCreditsMain.Text = "—";
+            GpuCreditsSub.Text = "Waiting for the first Cost Explorer answer.";
+            return;
+        }
+
+        var parts = new List<string>();
+        if (_settings.AwsCreditBaselineDate.Length > 0)
+        {
+            var remaining = Math.Max(0, _settings.AwsCreditBaselineUsd - _settings.AwsCreditsSinceBaselineUsd);
+            GpuCreditsMain.Text = $"≈ ${remaining:#,##0.00} remaining";
+            if (DateOnly.TryParse(_settings.AwsCreditExpiry, out var expiry))
+            {
+                var daysLeft = expiry.DayNumber - DateOnly.FromDateTime(DateTime.Today).DayNumber;
+                parts.Add(daysLeft < 0
+                    ? $"expired {expiry:MMM d, yyyy}"
+                    : $"expires {expiry:MMM d, yyyy} · {daysLeft} d left");
+            }
+        }
+        else
+        {
+            GpuCreditsMain.Text = $"${_settings.AwsCreditsMonthUsd:#,##0.00} applied this month";
+            parts.Add("AWS keeps a promo credit's remaining balance console-only — copy it from Billing → Credits once and this card counts down from there");
+        }
+
+        if (_settings.AwsCreditBaselineDate.Length > 0)
+        {
+            parts.Add($"${_settings.AwsCreditsMonthUsd:#,##0.00} applied this month");
+        }
+
+        // Both tokens (Bedrock) and GPUs (EC2) drain the same credit pot, so
+        // say which one is doing the draining. Baseline set → split the
+        // countdown's burn; otherwise split this month's figure.
+        var split = _settings.AwsCreditBaselineDate.Length > 0
+            ? CreditSplit(_settings.AwsCreditsSinceBaselineUsd,
+                _settings.AwsCreditsSinceTokensUsd, _settings.AwsCreditsSinceGpuUsd)
+            : CreditSplit(_settings.AwsCreditsMonthUsd,
+                _settings.AwsCreditsMonthTokensUsd, _settings.AwsCreditsMonthGpuUsd);
+        if (split is not null)
+        {
+            parts.Add(split);
+        }
+
+        var checkedAt = DateTimeOffset.FromUnixTimeMilliseconds(_settings.AwsCreditsCheckedMs).ToLocalTime();
+        parts.Add($"checked {checkedAt:MMM d, h:mm tt}");
+        GpuCreditsSub.Text = string.Join(" · ", parts);
+    }
+
+    /// <summary>"$12.34 tokens + $5.67 GPUs + $0.10 other", or null while the
+    /// burn is still zero. "Other" is whatever credit application the two
+    /// tracked services don't explain (S3, data transfer, …).</summary>
+    private static string? CreditSplit(double total, double tokens, double gpu)
+    {
+        if (tokens < 0.005 && gpu < 0.005)
+        {
+            return null;
+        }
+
+        var bits = new List<string>();
+        if (tokens >= 0.005)
+        {
+            bits.Add($"${tokens:#,##0.00} tokens");
+        }
+
+        if (gpu >= 0.005)
+        {
+            bits.Add($"${gpu:#,##0.00} GPUs");
+        }
+
+        var other = total - tokens - gpu;
+        if (other >= 0.005)
+        {
+            bits.Add($"${other:#,##0.00} other");
+        }
+
+        return string.Join(" + ", bits);
+    }
+
+    private void GpuCreditSave_Click(object sender, RoutedEventArgs e)
+    {
+        var balanceText = GpuCreditBalanceBox.Text.Trim().TrimStart('$').Replace(",", "");
+        if (!double.TryParse(balanceText, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var balance) || balance < 0)
+        {
+            GpuCreditsSub.Text = "The balance needs to be a plain number, e.g. 1234.56";
+            return;
+        }
+
+        var expiryText = GpuCreditExpiryBox.Text.Trim();
+        if (expiryText.Length > 0 && !DateOnly.TryParse(expiryText, out _))
+        {
+            GpuCreditsSub.Text = "The expiry date needs to look like 2027-01-31 (or be left empty).";
+            return;
+        }
+
+        _settings.AwsCreditBaselineUsd = balance;
+        _settings.AwsCreditBaselineDate = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        _settings.AwsCreditExpiry = expiryText;
+        _settings.AwsCreditsSinceBaselineUsd = 0;
+        _settings.AwsCreditsSinceTokensUsd = 0;
+        _settings.AwsCreditsSinceGpuUsd = 0;
+        _settings.AwsCreditsCheckedMs = 0;
+        _settings.Save();
+        GpuCreditBalanceBox.Text = "";
+        _ = RefreshGpuCreditsAsync(force: true);
+    }
+
+    private GpuRowVm BuildGpuRow(GpuInstanceInfo info)
+    {
+        var running = info.State == "running";
+        var transitional = info.State is "pending" or "stopping" or "shutting-down";
+        var stateBrush = running ? (Brush)FindResource("Series2Brush")
+            : transitional ? (Brush)FindResource("Series3Brush")
+            : (Brush)FindResource("MutedBrush");
+        var uptime = running && info.LaunchTime is not null
+            ? DateTimeOffset.UtcNow - info.LaunchTime.Value
+            : (TimeSpan?)null;
+        var detailParts = new List<string> { info.InstanceType, info.GpuModel };
+        if (info.AvailabilityZone.Length > 0)
+        {
+            detailParts.Add(info.AvailabilityZone);
+        }
+
+        if (uptime is not null)
+        {
+            detailParts.Add("up " + UptimeText(uptime.Value));
+        }
+
+        if (info.Name.Length > 0 && info.InstanceId.Length > 0)
+        {
+            detailParts.Add(info.InstanceId);
+        }
+
+        var runCost = running && uptime is not null && info.HourlyUsd is not null
+            ? $"≈ ${info.HourlyUsd.Value * uptime.Value.TotalHours:0.00} this run"
+            : running && info.HourlyUsd is null ? "rate unknown"
+            : "";
+        return new GpuRowVm(
+            info.Name.Length > 0 ? info.Name : info.InstanceId,
+            info.State,
+            stateBrush,
+            running ? (Brush)FindResource("Series2Brush") : (Brush)FindResource("MutedBrush"),
+            string.Join(" · ", detailParts),
+            $"{info.InstanceId} · {info.InstanceType} · {info.GpuModel}" +
+                (info.LaunchTime is null ? "" : $"\nlaunched {info.LaunchTime.Value.ToLocalTime():MMM d, h:mm tt}") +
+                "\n'This run' counts from the instance's last start — AWS resets the launch time on stop/start.",
+            running && info.HourlyUsd is not null ? $"${info.HourlyUsd.Value:0.00}/hr" : "",
+            (Brush)FindResource("InkBrush"),
+            runCost);
+    }
+
+    private static string UptimeText(TimeSpan span) =>
+        span.TotalDays >= 1 ? $"{(int)span.TotalDays}d {span.Hours}h"
+        : span.TotalHours >= 1 ? $"{(int)span.TotalHours}h {span.Minutes}m"
+        : $"{Math.Max(1, (int)span.TotalMinutes)}m";
+
     // ── Live view ──────────────────────────────────────────────────────────
 
     private void TabButton_Checked(object sender, RoutedEventArgs e)
@@ -1591,8 +3336,10 @@ public partial class MainWindow : Window
         var live = _tabKey == "live";
         var limits = _tabKey == "limits";
         var terminals = _tabKey == "terminals";
+        var agents = _tabKey == "agents";
         var insights = _tabKey == "insights";
-        var dashboard = !live && !limits && !terminals && !insights;
+        var gpu = _tabKey == "gpu";
+        var dashboard = !live && !limits && !terminals && !agents && !insights && !gpu;
         var livePanel = dashboard && _dashPanelKey == "live";
         DashboardHero.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
         DashboardContent.Visibility = dashboard ? Visibility.Visible : Visibility.Collapsed;
@@ -1600,7 +3347,9 @@ public partial class MainWindow : Window
         LiveRoot.Visibility = live ? Visibility.Visible : Visibility.Collapsed;
         LimitsRoot.Visibility = limits ? Visibility.Visible : Visibility.Collapsed;
         TerminalsRoot.Visibility = terminals ? Visibility.Visible : Visibility.Collapsed;
+        AgentsRoot.Visibility = agents ? Visibility.Visible : Visibility.Collapsed;
         InsightsRoot.Visibility = insights ? Visibility.Visible : Visibility.Collapsed;
+        GpuRoot.Visibility = gpu ? Visibility.Visible : Visibility.Collapsed;
         ModelsCard.Visibility = livePanel ? Visibility.Collapsed : Visibility.Visible;
         PlaceLiveFeedCard(livePanel);
         PlacePanelGroup(livePanel);
@@ -1626,9 +3375,21 @@ public partial class MainWindow : Window
             _ = RefreshTerminalsAsync();
         }
 
+        if (agents && _loaded)
+        {
+            _ = RefreshAgentsAsync();
+        }
+
         if (insights && _loaded)
         {
             _ = RefreshInsightsAsync();
+        }
+
+        if (gpu && _loaded)
+        {
+            // The call is free (describe-instances), so opening the page is
+            // itself the button press; the Refresh button covers re-checks.
+            _ = RefreshGpuAsync();
         }
     }
 
@@ -1814,6 +3575,7 @@ public partial class MainWindow : Window
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         if (_cupBubbles.Count == 0 && !_cupLayoutDirty)
         {
+            StopLiveFrames();
             return;
         }
 
@@ -1905,6 +3667,7 @@ public partial class MainWindow : Window
 
         _cupBubbles.Clear();
         _cupLayers.Clear();
+        ResetEndlessTrim();
         _cupWalls = null;
         LiveCanvas.Children.Clear();
         _roundStartMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
@@ -1934,7 +3697,8 @@ public partial class MainWindow : Window
                 // whose event time predates the round belong to the graph and
                 // the sediment rebuild, not to the round in progress.
                 if (!_cupBubbles.ContainsKey(row.EventKey) &&
-                    row.TimestampMs < _roundStartMs - 60_000)
+                    (row.TimestampMs < _roundStartMs - 60_000 ||
+                     IsEndless && row.TimestampMs <= _endlessTrimmedThroughMs))
                 {
                     continue;
                 }
@@ -1944,6 +3708,7 @@ public partial class MainWindow : Window
 
             if (rows.Count > 0)
             {
+                TrimEndlessPile();
                 _cupLastSeenMs = Math.Max(_cupLastSeenMs, maxUpdated);
                 LivePulseDot.Opacity = 1.0;
                 LivePulseText.Text = $"last update {DateTime.Now:h:mm:ss tt}";
@@ -1992,17 +3757,44 @@ public partial class MainWindow : Window
         _cupLayoutDirty = true;
     }
 
+    /// <summary>Keeps an endless pile within the block budget: the oldest
+    /// blocks leave the canvas, their totals stay in the stacked counters.</summary>
+    private void TrimEndlessPile()
+    {
+        if (!IsEndless)
+        {
+            return;
+        }
+
+        var active = _cupBubbles.Values.Where(bubble => !bubble.Frozen).ToList();
+        if (active.Count <= MaxCupBlocks)
+        {
+            return;
+        }
+
+        foreach (var bubble in active
+                     .OrderBy(bubble => bubble.FirstSeenMs)
+                     .Take(active.Count - (MaxCupBlocks - EndlessTrimBatch)))
+        {
+            _endlessTrimmedCost += bubble.Cost;
+            _endlessTrimmedTokens += bubble.Event.Tokens.Total;
+            _endlessTrimmedMessages += bubble.Event.Messages;
+            _endlessTrimmedCount++;
+            _endlessTrimmedThroughMs = Math.Max(_endlessTrimmedThroughMs, bubble.FirstSeenMs);
+            LiveCanvas.Children.Remove(bubble.Visual);
+            _cupBubbles.Remove(bubble.Event.EventKey);
+        }
+
+        _cupLayoutDirty = true;
+    }
+
     private void AssignLiveModelSlot(string model)
     {
-        if (!_modelSlots.ContainsKey(model) && _modelSlots.Count < MaxModelSlots)
+        if (!_modelSlots.ContainsKey(model))
         {
             _modelSlots[model] = _modelSlots.Count;
         }
     }
-
-    private Color LiveModelColor(string model) => BrushForModel(model) is SolidColorBrush solid
-        ? solid.Color
-        : ((SolidColorBrush)FindResource("AccentBrush")).Color;
 
     private static SolidColorBrush LiveStrokeBrush()
     {
@@ -2014,8 +3806,8 @@ public partial class MainWindow : Window
     private FrameworkElement CreateCupVisual(LiveBubble bubble)
     {
         var row = bubble.Event;
-        var fill = new SolidColorBrush(LiveModelColor(row.Model)) { Opacity = 0.85 };
-        fill.Freeze();
+        // The exact brush the chart uses — no opacity, so the two always match.
+        var fill = BrushForModel(row.Model);
         var label = new TextBlock
         {
             FontWeight = FontWeights.SemiBold,
@@ -2033,7 +3825,8 @@ public partial class MainWindow : Window
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(5),
             Child = label,
-            ToolTip = BuildLiveTooltip(row)
+            ToolTip = BuildLiveTooltip(row),
+            Cursor = Cursors.Hand
         };
         ToolTipService.SetInitialShowDelay(visual, 150);
         ToolTipService.SetShowDuration(visual, 60000);
@@ -2042,7 +3835,80 @@ public partial class MainWindow : Window
         // block does — and the block keeps growing while output streams — so
         // rebuild the text on every hover instead of freezing it at spawn.
         visual.ToolTipOpening += (_, _) => visual.ToolTip = BuildLiveTooltip(bubble.Event);
+
+        // Double-click opens the log this block was parsed out of, at this
+        // response: the block says how much it cost, the transcript says why.
+        visual.MouseLeftButtonDown += async (_, args) =>
+        {
+            if (args.ClickCount == 2)
+            {
+                args.Handled = true;
+                await OpenTranscriptAsync(bubble.Event);
+            }
+        };
         return visual;
+    }
+
+    /// <summary>Opens the transcript window for one live block. Everything the
+    /// index keeps is a token count; the conversation is re-read from the log
+    /// file the event came from.</summary>
+    private async Task OpenTranscriptAsync(LiveEventRow row)
+    {
+        try
+        {
+            Mouse.OverrideCursor = Cursors.Wait;
+            var source = await _database.GetEventSourceAsync(row.EventKey);
+            if (source is not { } found)
+            {
+                System.Windows.MessageBox.Show(this,
+                    "That block is no longer in the index, so its log can't be located.",
+                    "Transcript", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var readPath = found.SourcePath;
+            var recovered = false;
+            if (!File.Exists(found.SourcePath))
+            {
+                // Bot session forks and rewinds are deleted seconds after they
+                // are written; the vault kept a copy of anything indexed young.
+                var copy = await _vault.MaterializeAsync(found.SourcePath);
+                if (copy is null)
+                {
+                    System.Windows.MessageBox.Show(this,
+                        $"The log this block came from is gone, and no copy was kept:\n{DisplayLocalPath(found.SourcePath)}",
+                        "Transcript", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                readPath = copy;
+                recovered = true;
+            }
+
+            var document = await TranscriptReader.ReadAsync(
+                readPath, found.Client, row.TimestampMs);
+            var estimate = _pricing.Calculate(row.Provider, row.Model, row.Tokens);
+            var time = DateTimeOffset.FromUnixTimeMilliseconds(row.TimestampMs).ToLocalTime();
+            var context = new TranscriptContext(
+                ContextSessionName(row),
+                $"{row.Model} · {row.Client} · {time:h:mm:ss tt} · " +
+                $"{FormatCompact(row.Tokens.Total)} tokens · " +
+                (estimate.IsPriced ? estimate.Cost.ToString("C4", Usd) : "no pricing match"),
+                recovered
+                    ? $"{DisplayLocalPath(found.SourcePath)} · the original was deleted; this is the tracker's copy"
+                    : DisplayLocalPath(found.SourcePath));
+
+            new TranscriptWindow(document, context, HidePersonal) { Owner = this }.Show();
+        }
+        catch (Exception exception)
+        {
+            System.Windows.MessageBox.Show(this, "That log could not be opened: " + exception.Message,
+                "Transcript", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            Mouse.OverrideCursor = null;
+        }
     }
 
     /// <summary>Round bookkeeping and counters, every 250 ms; the cup keeps
@@ -2062,8 +3928,10 @@ public partial class MainWindow : Window
         var nowMs = DateTimeOffset.Now.ToUnixTimeMilliseconds();
         TickCupRound(nowMs);
 
-        double costWindow = 0, cost60 = 0, cost5m = 0;
-        long tokensWindow = 0, tokens60 = 0, tokens5m = 0, messagesWindow = 0;
+        // The round's totals start from whatever an endless pile trimmed away.
+        double costWindow = _endlessTrimmedCost, cost60 = 0, cost5m = 0;
+        long tokensWindow = _endlessTrimmedTokens, tokens60 = 0, tokens5m = 0;
+        var messagesWindow = _endlessTrimmedMessages;
         var latestBySession = new Dictionary<string, LiveEventRow>(StringComparer.Ordinal);
         foreach (var bubble in _cupBubbles.Values)
         {
@@ -2266,19 +4134,21 @@ public partial class MainWindow : Window
     private int SessionPid(string sessionId) =>
         _terminalsBySession.TryGetValue(sessionId, out var terminal) ? terminal.Pid : 0;
 
-    /// <summary>Which chat a session is: its first prompt when one is known
-    /// (works even after the terminal closed — history remembers), then the
-    /// project name while the terminal is open, then the client plus a stub.</summary>
+    /// <summary>Which project a live session belongs to. While a terminal is
+    /// open, lead with the working-directory name so usage from a newly opened
+    /// project is recognizable on the dashboard. Once it closes, the remembered
+    /// first prompt is the best available label; the tooltip still carries both.</summary>
     private string ContextSessionName(LiveEventRow row)
     {
+        if (_terminalsBySession.TryGetValue(row.SessionId, out var terminal))
+        {
+            var folderName = Path.GetFileName(terminal.ProjectPath.TrimEnd('\\', '/'));
+            return DisplayProject(string.IsNullOrWhiteSpace(folderName) ? terminal.ProjectName : folderName);
+        }
+
         if (SessionTopic(row.SessionId) is { } topic)
         {
             return $"“{topic}”";
-        }
-
-        if (_terminalsBySession.TryGetValue(row.SessionId, out var terminal))
-        {
-            return DisplayProject(terminal.ProjectName);
         }
 
         var stub = row.SessionId.Length > 6 ? row.SessionId[..6] : row.SessionId;
@@ -2401,8 +4271,9 @@ public partial class MainWindow : Window
     private void SettleRound(long nowMs)
     {
         var active = _cupBubbles.Values.Where(bubble => !bubble.Frozen).ToList();
-        var cost = active.Sum(bubble => bubble.Cost);
-        var tokens = active.Sum(bubble => bubble.Event.Tokens.Total);
+        var cost = active.Sum(bubble => bubble.Cost) + _endlessTrimmedCost;
+        var tokens = active.Sum(bubble => bubble.Event.Tokens.Total) + _endlessTrimmedTokens;
+        ResetEndlessTrim();
         _lastRoundCost = cost;
         _lastRoundTokens = tokens;
         _bestRoundCost = Math.Max(_bestRoundCost, cost);
@@ -2434,8 +4305,8 @@ public partial class MainWindow : Window
                 Caption = caption
             });
 
-            // Keep the sediment bounded.
-            while (_cupLayers.Count > 20)
+            // Keep the sediment bounded, in layers and in blocks.
+            while (_cupLayers.Count > 20 || _cupLayers.Count > 1 && _cupBubbles.Count > MaxCupBlocks)
             {
                 var oldest = _cupLayers[^1];
                 _cupLayers.RemoveAt(_cupLayers.Count - 1);
@@ -2457,6 +4328,15 @@ public partial class MainWindow : Window
         {
             LiveScroll.ScrollToVerticalOffset(0);
         }
+    }
+
+    private void ResetEndlessTrim()
+    {
+        _endlessTrimmedCost = 0;
+        _endlessTrimmedTokens = 0;
+        _endlessTrimmedMessages = 0;
+        _endlessTrimmedCount = 0;
+        _endlessTrimmedThroughMs = long.MinValue;
     }
 
     /// <summary>Divider line + score caption that separate one sediment layer from the next.</summary>
@@ -2536,6 +4416,10 @@ public partial class MainWindow : Window
             var blocks = new List<LiveBubble>();
             double cost = 0;
             long tokens = 0;
+
+            // Past the block budget, older rounds still score in the history
+            // bars but get no blocks on the canvas.
+            var drawBlocks = _cupBubbles.Count < MaxCupBlocks;
             foreach (var row in rows)
             {
                 // Skip events outside this window and events already on the
@@ -2547,6 +4431,13 @@ public partial class MainWindow : Window
                 }
 
                 var estimate = _pricing.Calculate(row.Provider, row.Model, row.Tokens);
+                cost += estimate.Cost;
+                tokens += row.Tokens.Total;
+                if (!drawBlocks)
+                {
+                    continue;
+                }
+
                 AssignLiveModelSlot(row.Model);
                 var bubble = new LiveBubble
                 {
@@ -2563,8 +4454,6 @@ public partial class MainWindow : Window
                 _cupBubbles[row.EventKey] = bubble;
                 LiveCanvas.Children.Add(bubble.Visual);
                 blocks.Add(bubble);
-                cost += estimate.Cost;
-                tokens += row.Tokens.Total;
             }
 
             var endedAt = DateTimeOffset.FromUnixTimeMilliseconds(windowEnd).LocalDateTime;
@@ -2625,7 +4514,7 @@ public partial class MainWindow : Window
     {
         if (IsEndless)
         {
-            var stacked = _cupBubbles.Values.Count(bubble => !bubble.Frozen);
+            var stacked = _cupBubbles.Values.Count(bubble => !bubble.Frozen) + _endlessTrimmedCount;
             LiveRoundText.Text = stacked == 1
                 ? "endless · 1 block stacked"
                 : $"endless · {stacked} blocks stacked";
@@ -2669,6 +4558,10 @@ public partial class MainWindow : Window
 
     private sealed record RoundBarVm(double Height, Brush Brush, string Tooltip);
 
+    /// <summary>Distance at which the easing is done as far as the eye is
+    /// concerned; the block snaps to target and stops being animated.</summary>
+    private const double CupSettleEpsilon = 0.5;
+
     private void AdvanceCup(long nowMs, double width, double viewportHeight, double dt)
     {
         if (_cupLayoutDirty)
@@ -2679,11 +4572,14 @@ public partial class MainWindow : Window
 
         // Frame-rate independent easing: the same settle speed at 30 or 120 fps.
         var ease = 1 - Math.Exp(-9 * dt);
+        var moving = 0;
         foreach (var bubble in _cupBubbles.Values)
         {
-            if (bubble.Side <= 0)
+            if (bubble.Settled || bubble.Side <= 0)
             {
-                // Waits for its first layout pass.
+                // Settled blocks are already on target — most of a deep pile is
+                // frozen sediment far below the rim — and a block without a
+                // layout pass has no target to move toward yet.
                 continue;
             }
 
@@ -2696,10 +4592,30 @@ public partial class MainWindow : Window
 
             bubble.CurrentX += (bubble.TargetX - bubble.CurrentX) * ease;
             bubble.CurrentY += (bubble.TargetY - bubble.CurrentY) * ease;
+            if (Math.Abs(bubble.TargetX - bubble.CurrentX) < CupSettleEpsilon &&
+                Math.Abs(bubble.TargetY - bubble.CurrentY) < CupSettleEpsilon)
+            {
+                // Within half a pixel: snap exactly once, then leave it alone.
+                bubble.CurrentX = bubble.TargetX;
+                bubble.CurrentY = bubble.TargetY;
+                bubble.Settled = true;
+            }
+            else
+            {
+                moving++;
+            }
+
             bubble.Visual.Width = bubble.Side;
             bubble.Visual.Height = bubble.Side;
             Canvas.SetLeft(bubble.Visual, bubble.CurrentX);
             Canvas.SetTop(bubble.Visual, bubble.CurrentY);
+        }
+
+        if (moving == 0)
+        {
+            // A still cup costs nothing: drop off the render loop until
+            // _cupLayoutDirty (or a tab switch) wakes it again.
+            StopLiveFrames();
         }
     }
 
@@ -2778,10 +4694,10 @@ public partial class MainWindow : Window
         var x = wallInset;
         var rowBase = 0d;
         var rowHeight = 0d;
+        var maxSide = Math.Max(24, width - 2 * wallInset);
         foreach (var bubble in blocks)
         {
-            var side = Math.Max(6, CupSide(bubble) * scale);
-            bubble.Side = side;
+            var side = Math.Clamp(CupSide(bubble) * scale, 6, maxSide);
             if (x + side > width - wallInset && x > wallInset)
             {
                 rowBase += rowHeight + gap;
@@ -2789,8 +4705,16 @@ public partial class MainWindow : Window
                 rowHeight = 0;
             }
 
+            var targetY = floorY - rowBase - side;
+            if (bubble.Side != side || bubble.TargetX != x || bubble.TargetY != targetY)
+            {
+                // Moved, resized or re-floored: it has to animate again.
+                bubble.Settled = false;
+            }
+
+            bubble.Side = side;
             bubble.TargetX = x;
-            bubble.TargetY = floorY - rowBase - side;
+            bubble.TargetY = targetY;
             x += side + gap;
             rowHeight = Math.Max(rowHeight, side);
 
@@ -2835,9 +4759,10 @@ public partial class MainWindow : Window
         var x = wallInset;
         var rowBase = 0d;
         var rowHeight = 0d;
+        var maxSide = Math.Max(24, width - 2 * wallInset);
         foreach (var bubble in ordered)
         {
-            var side = Math.Max(6, CupSide(bubble) * scale);
+            var side = Math.Clamp(CupSide(bubble) * scale, 6, maxSide);
             if (x + side > width - wallInset && x > wallInset)
             {
                 rowBase += rowHeight + gap;
@@ -2860,11 +4785,15 @@ public partial class MainWindow : Window
             ? bubble.Cost.ToString("$0.00", Usd)
             : bubble.Cost.ToString("$0.000", Usd);
 
-    /// <summary>Block area tracks the selected metric; unpriced costs fall back to tokens.</summary>
+    /// <summary>Block area tracks the selected metric; unpriced costs fall back
+    /// to tokens. The cap sits near $14 / 14M tokens — high enough that a $9
+    /// reply reads clearly bigger than a $2 one (the old 118 cap was hit at
+    /// ~$1.30). Scale-to-fit and the packers' width clamp keep big blocks in
+    /// the cup.</summary>
     private double CupSide(LiveBubble bubble)
     {
         var sqrt = LiveMetricSqrt(bubble);
-        return Math.Clamp(14 + 92 * sqrt, 14, 118);
+        return Math.Clamp(14 + 92 * sqrt, 14, 360);
     }
 
     /// <summary>√(metric) on a scale where 1.0 ≈ $1 or 1M tokens.</summary>
@@ -2910,7 +4839,8 @@ public partial class MainWindow : Window
                $"Input: {tokens.Input:N0} · Output: {tokens.Output:N0}\n" +
                $"Cache read: {tokens.CacheRead:N0} · write: {tokens.CacheWrite:N0}\n" +
                $"Reasoning: {tokens.Reasoning:N0}\n" +
-               $"Session {row.SessionId}";
+               $"Session {row.SessionId}\n\n" +
+               "Double-click to read this response in its transcript.";
     }
 
     private RadioButton TabRadioFor(string key) => key switch
@@ -2918,12 +4848,14 @@ public partial class MainWindow : Window
         "live" => TabLive,
         "limits" => TabLimits,
         "terminals" => TabTerminals,
+        "agents" => TabAgents,
         "insights" => TabInsights,
+        "gpu" => TabGpu,
         _ => TabDashboard
     };
 
     private static string NormalizeTabKey(string key) =>
-        key is "live" or "limits" or "terminals" or "insights" ? key : "dashboard";
+        key is "live" or "limits" or "terminals" or "agents" or "insights" or "gpu" ? key : "dashboard";
 
     private RadioButton LiveWindowRadioFor(string key) => key switch
     {
@@ -2964,12 +4896,38 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Dragging a window edge raises this per mouse move, and a redraw
+    /// is every element on the canvas rebuilt — so a resize draws once it
+    /// settles. An empty canvas (first layout, or a size too small to plot)
+    /// still draws straight away, so the chart never waits to appear.</summary>
     private void ChartCanvas_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        if (_latestData is not null)
+        if (_latestData is null)
+        {
+            return;
+        }
+
+        if (_chartDrawnSignature is null)
         {
             DrawChart();
+            return;
         }
+
+        if (_chartResizeTimer is null)
+        {
+            _chartResizeTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(180)
+            };
+            _chartResizeTimer.Tick += (_, _) =>
+            {
+                _chartResizeTimer!.Stop();
+                DrawChart();
+            };
+        }
+
+        _chartResizeTimer.Stop();
+        _chartResizeTimer.Start();
     }
 
     private void IntervalComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -2993,7 +4951,9 @@ public partial class MainWindow : Window
 
         _settings.SessionGapHours = selected.Hours;
         _settings.Save();
-        StatusText.Text = $"A session now ends after {selected.Label.ToLowerInvariant()}";
+        StatusText.Text = _settings.ManualSessionStartMs is null
+            ? $"A session now ends after {selected.Label.ToLowerInvariant()}"
+            : $"A session now ends after {selected.Label.ToLowerInvariant()} — but the current start is pinned by you";
         if (_rangeKey == "session")
         {
             await RefreshDashboardAsync();
@@ -3033,15 +4993,18 @@ public partial class MainWindow : Window
                 _rangeKey,
                 _pricing,
                 BarsUnitFor(_barsKey),
-                (long)(_settings.SessionGapHours * 3_600_000));
+                (long)(_settings.SessionGapHours * 3_600_000),
+                _settings.ManualSessionStartMs);
             _latestData = data;
 
             // A session's length only becomes known once the data is in; the
-            // offered bar sizes follow it (a 9-hour session outgrows 15 s bars).
+            // offered bar sizes follow it (a 9-hour session outgrows 15 s bars),
+            // and it is worth saying out loud under the cost — a $9 session
+            // reads very differently at twenty minutes than at nine hours.
             if (_rangeKey == "session")
             {
-                var span = data.Buckets.Count > 0
-                    ? DateTimeOffset.Now.ToUnixTimeMilliseconds() - data.Buckets[0].StartMs
+                var span = data.RangeStartMs is { } sessionStart
+                    ? Math.Max(0, DateTimeOffset.Now.ToUnixTimeMilliseconds() - sessionStart)
                     : (long?)null;
                 if (span != _sessionSpanMs)
                 {
@@ -3049,6 +5012,8 @@ public partial class MainWindow : Window
                     UpdateBarsAvailability();
                 }
             }
+
+            UpdateSessionLength(data);
             AssignModelSlots(data);
             var totals = data.Totals;
 
@@ -3095,7 +5060,7 @@ public partial class MainWindow : Window
                     $"{ContextSessionName(priciest)}\n{priciest.Model} · {at:h:mm:ss tt}\n" +
                     $"{priciest.Tokens.Total:N0} tokens — an expensive single reply usually " +
                     "means a huge context went in with it.";
-                TopReplyDetailText.Text = $"{priciest.Model} · {at:h:mm tt}";
+                TopReplyDetailText.Text = $"{ContextSessionName(priciest)} · {at:h:mm tt}";
             }
 
             UpdateModels(data);
@@ -3121,24 +5086,474 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>The line under the hero cost saying how long the current work
+    /// session has run — shown only on the Session range, where the range has
+    /// a length of its own. It runs from the session's start (pinned, or the
+    /// first event after the last break) to now, so a quiet stretch shorter
+    /// than the session break still counts. The "since …" half is the button
+    /// that opens the pin popup.</summary>
+    private void UpdateSessionLength(DashboardData data)
+    {
+        if (_rangeKey != "session" || data.RangeStartMs is not { } startMs)
+        {
+            SessionLengthPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var pinned = _settings.ManualSessionStartMs is not null;
+        var start = DateTimeOffset.FromUnixTimeMilliseconds(startMs).ToLocalTime();
+        var elapsed = TimeSpan.FromMilliseconds(
+            Math.Max(0, DateTimeOffset.Now.ToUnixTimeMilliseconds() - startMs));
+
+        // Name the day once the start slips out of today, so a forgotten pin
+        // from yesterday cannot masquerade as this morning's.
+        var day = start.Date == DateTimeOffset.Now.Date ? "" : $"{start:ddd} ";
+        SessionLengthText.Text = FormatSessionLength(elapsed);
+        SessionLengthText.ToolTip =
+            $"This work session started at {start:h:mm tt} on {start:ddd d MMM} and " +
+            $"has run {FormatSessionLength(elapsed)} so far. " +
+            (pinned
+                ? "The start is pinned by you; click the 'since' button to move it or go back to automatic."
+                : $"It ends after {_settings.SessionGapHours:0.##} h of quiet (Settings → Session break).");
+        SessionStartToggle.Content = pinned
+            ? $"since {day}{start:h:mm tt} · pinned"
+            : $"since {day}{start:h:mm tt}";
+        SessionLengthPanel.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>Prefill the pin popup with the session's current start so
+    /// "pin it right here" is a two-keystroke edit, not a blank form.</summary>
+    private void SessionStartToggle_Checked(object sender, RoutedEventArgs e)
+    {
+        var startMs = _settings.ManualSessionStartMs ?? _latestData?.RangeStartMs;
+        SessionStartTimeBox.Text = startMs is { } ms
+            ? DateTimeOffset.FromUnixTimeMilliseconds(ms).ToLocalTime().ToString("h:mm tt")
+            : "";
+        SessionStartHint.Visibility = Visibility.Collapsed;
+        SessionStartAutoButton.IsEnabled = _settings.ManualSessionStartMs is not null;
+        SessionStartTimeBox.Focus();
+        SessionStartTimeBox.SelectAll();
+    }
+
+    private void SessionStartTimeBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            e.Handled = true;
+            SessionStartPin_Click(sender, e);
+        }
+    }
+
+    /// <summary>Time-of-day formats the pin box accepts: "10", "10:00",
+    /// "10:00 am", "6 pm", "22:15". Exact formats rather than a permissive
+    /// DateTime.Parse so "10" can never be read as the 10th of the month.</summary>
+    private static readonly string[] SessionStartFormats =
+    [
+        "h:mm tt", "h:mmtt", "h tt", "htt", "H:mm", "HH:mm", "%H"
+    ];
+
+    private void SessionStartPin_Click(object sender, RoutedEventArgs e)
+    {
+        var text = SessionStartTimeBox.Text.Trim();
+        if (!DateTime.TryParseExact(text, SessionStartFormats, CultureInfo.CurrentCulture,
+                DateTimeStyles.None, out var parsed) &&
+            !DateTime.TryParseExact(text, SessionStartFormats, CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out parsed))
+        {
+            SessionStartHint.Text = "Could not read that as a time — try 10:00, 6:30 pm, or 22:15.";
+            SessionStartHint.Visibility = Visibility.Visible;
+            return;
+        }
+
+        // The chosen clock time means "the most recent time it was that time":
+        // today, or yesterday when it has not come around yet today.
+        var now = DateTimeOffset.Now;
+        var start = new DateTimeOffset(now.Date + parsed.TimeOfDay, now.Offset);
+        if (start > now)
+        {
+            start = start.AddDays(-1);
+        }
+
+        _settings.ManualSessionStartMs = start.ToUnixTimeMilliseconds();
+        _settings.Save();
+        SessionStartToggle.IsChecked = false;
+        StatusText.Text = $"Session pinned to start at {start:h:mm tt}";
+        _ = RefreshDashboardAsync();
+    }
+
+    private void SessionStartAuto_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.ManualSessionStartMs = null;
+        _settings.Save();
+        SessionStartToggle.IsChecked = false;
+        StatusText.Text = "Session start is automatic again (last long quiet stretch)";
+        _ = RefreshDashboardAsync();
+    }
+
+    /// <summary>"5:25 (5h 25m)" — the clock reading first, then the same span
+    /// spelled out so nobody reads 5:25 as five minutes.</summary>
+    private static string FormatSessionLength(TimeSpan elapsed)
+    {
+        var hours = (int)elapsed.TotalHours;
+        var minutes = elapsed.Minutes;
+        var spelled = hours > 0 ? $"{hours}h {minutes}m" : $"{minutes}m";
+        return $"{hours}:{minutes:00} ({spelled})";
+    }
+
     // ── Model breakdown ────────────────────────────────────────────────────
 
     private void AssignModelSlots(DashboardData data)
     {
-        // Models arrive sorted by cost, so the biggest spenders claim free slots first.
+        // Models arrive sorted by cost, so the biggest spenders claim low slots first.
         foreach (var model in data.Models.Select(row => row.Model))
         {
-            if (_modelSlots.ContainsKey(model) || _modelSlots.Count >= MaxModelSlots)
+            if (!_modelSlots.ContainsKey(model))
             {
-                continue;
+                _modelSlots[model] = _modelSlots.Count;
             }
-
-            _modelSlots[model] = _modelSlots.Count;
         }
     }
 
     private Brush BrushForModel(string model) =>
-        _modelSlots.TryGetValue(model, out var slot) ? _seriesBrushes[slot] : _otherBrush;
+        string.IsNullOrEmpty(model) ? _otherBrush : BrushForHex(ColorHexForModel(model));
+
+    private Brush BrushForHex(string hex)
+    {
+        if (!_brushByHex.TryGetValue(hex, out var brush))
+        {
+            brush = new SolidColorBrush(TryParseHex(hex, out var color) ? color : Colors.Gray);
+            brush.Freeze();
+            _brushByHex[hex] = brush;
+        }
+
+        return brush;
+    }
+
+    /// <summary>The model's persisted color, assigning and saving one on first sight.</summary>
+    private string ColorHexForModel(string model)
+    {
+        if (_settings.ModelColors.TryGetValue(model, out var hex) && TryParseHex(hex, out _))
+        {
+            return hex;
+        }
+
+        hex = DefaultHexForModel(model);
+        _settings.ModelColors[model] = hex;
+        _settings.Save();
+        return hex;
+    }
+
+    private string DefaultHexForModel(string model)
+    {
+        var used = _settings.ModelColors.Values.ToList();
+        foreach (var (token, hex) in FamilySeeds)
+        {
+            if (model.Contains(token, StringComparison.OrdinalIgnoreCase) &&
+                !used.Contains(hex, StringComparer.OrdinalIgnoreCase))
+            {
+                return hex;
+            }
+        }
+
+        return HexFromHue(FarthestHue([.. used.Select(HueOf).OfType<double>()]));
+    }
+
+    /// <summary>The hue (0-360) of a stored color, or null for grays, whose hue is
+    /// meaningless and would only distort the spread.</summary>
+    private static double? HueOf(string hex)
+    {
+        if (!TryParseHex(hex, out var color))
+        {
+            return null;
+        }
+
+        double r = color.R / 255.0, g = color.G / 255.0, b = color.B / 255.0;
+        var max = Math.Max(r, Math.Max(g, b));
+        var delta = max - Math.Min(r, Math.Min(g, b));
+        if (delta < 0.08)
+        {
+            return null;
+        }
+
+        var hue = max == r ? (g - b) / delta
+            : max == g ? (b - r) / delta + 2
+            : (r - g) / delta + 4;
+        return (hue * 60 + 360) % 360;
+    }
+
+    /// <summary>The hue with the greatest minimum wheel distance to every hue in use.</summary>
+    private static double FarthestHue(IReadOnlyList<double> used)
+    {
+        if (used.Count == 0)
+        {
+            return 212; // the app's blue
+        }
+
+        double best = 0, bestScore = -1;
+        for (var candidate = 0; candidate < 360; candidate += 2)
+        {
+            var score = used.Min(hue =>
+            {
+                var d = Math.Abs(candidate - hue) % 360;
+                return Math.Min(d, 360 - d);
+            });
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    private static string HexFromHue(double hue)
+    {
+        hue = (hue % 360 + 360) % 360;
+        var c = (1 - Math.Abs(2 * ModelColorLightness - 1)) * ModelColorSaturation;
+        var x = c * (1 - Math.Abs(hue / 60 % 2 - 1));
+        var m = ModelColorLightness - c / 2;
+        var (r, g, b) = ((int)(hue / 60)) switch
+        {
+            0 => (c, x, 0d),
+            1 => (x, c, 0d),
+            2 => (0d, c, x),
+            3 => (0d, x, c),
+            4 => (x, 0d, c),
+            _ => (c, 0d, x)
+        };
+        byte To(double v) => (byte)Math.Round((v + m) * 255);
+        return $"#{To(r):X2}{To(g):X2}{To(b):X2}";
+    }
+
+    private static bool TryParseHex(string hex, out Color color)
+    {
+        try
+        {
+            color = (Color)ColorConverter.ConvertFromString(hex);
+            return true;
+        }
+        catch
+        {
+            color = default;
+            return false;
+        }
+    }
+
+    /// <summary>Header → "Town ↗": launches Token Town, the standalone Electron app in
+    /// the repo's town/ folder. It reads usage.db read-only over its own data feed, so
+    /// starting the process is the only integration the tracker needs.</summary>
+    private void TownButton_Click(object sender, RoutedEventArgs e)
+    {
+        string? townDir = null;
+        var dir = AppContext.BaseDirectory;
+        for (var i = 0; i < 6 && !string.IsNullOrEmpty(dir); i++)
+        {
+            var candidate = Path.Combine(dir, "town");
+            if (File.Exists(Path.Combine(candidate, "src", "main.js")))
+            {
+                townDir = candidate;
+                break;
+            }
+
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        if (townDir is null)
+        {
+            System.Windows.MessageBox.Show(this,
+                "Couldn't find the town folder next to TokenTracker.exe.",
+                "Token Town", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var electron = Path.Combine(townDir, "node_modules", "electron", "dist", "electron.exe");
+        if (!File.Exists(electron))
+        {
+            System.Windows.MessageBox.Show(this,
+                $"Token Town isn't installed yet — run \"npm install\" in:\n{townDir}",
+                "Token Town", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = electron,
+                Arguments = $"\"{townDir}\"",
+                WorkingDirectory = townDir,
+                UseShellExecute = false
+            });
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(this, "Token Town failed to start: " + ex.Message,
+                "Token Town", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void SettingsToggle_Checked(object sender, RoutedEventArgs e) => RebuildModelColorEditor();
+
+    /// <summary>Settings → Model colors: one row per known model — a chip with the
+    /// current color and a hue slider. Assignments live in settings.json.</summary>
+    private void RebuildModelColorEditor()
+    {
+        ModelColorsPanel.Children.Clear();
+        var models = _settings.ModelColors.Keys
+            .OrderBy(model => _modelSlots.TryGetValue(model, out var slot) ? slot : int.MaxValue)
+            .ThenBy(model => model, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        SpreadColorsButton.Visibility = models.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+        if (models.Count == 0)
+        {
+            ModelColorsPanel.Children.Add(new TextBlock
+            {
+                Text = "Models appear here once usage arrives.",
+                FontSize = 11,
+                Foreground = (Brush)FindResource("MutedBrush"),
+                Margin = new Thickness(0, 4, 0, 0)
+            });
+            return;
+        }
+
+        foreach (var model in models)
+        {
+            var current = ColorHexForModel(model);
+            ModelColorsPanel.Children.Add(new TextBlock
+            {
+                Text = model,
+                FontSize = 11,
+                Foreground = (Brush)FindResource("Ink2Brush"),
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(0, 8, 0, 4)
+            });
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition());
+            var chip = new Border
+            {
+                Width = 18,
+                Height = 18,
+                CornerRadius = new CornerRadius(5),
+                Margin = new Thickness(0, 0, 8, 0),
+                Background = BrushForHex(current),
+                BorderThickness = new Thickness(1),
+                BorderBrush = (Brush)FindResource("HairlineBrush"),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            row.Children.Add(chip);
+
+            var slider = new Slider
+            {
+                Style = (Style)FindResource("HueSlider"),
+                Value = HueOf(current) ?? 0,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(slider, 1);
+            var captured = model;
+            slider.ValueChanged += (_, args) =>
+            {
+                var hex = HexFromHue(args.NewValue);
+                _settings.ModelColors[captured] = hex;
+                chip.Background = BrushForHex(hex);
+                QueueModelColorRepaint();
+            };
+            row.Children.Add(slider);
+            ModelColorsPanel.Children.Add(row);
+        }
+    }
+
+    private System.Windows.Threading.DispatcherTimer? _modelColorRepaintTimer;
+
+    /// <summary>Coalesces a slider drag's stream of changes into one save + repaint.</summary>
+    private void QueueModelColorRepaint()
+    {
+        if (_modelColorRepaintTimer is null)
+        {
+            _modelColorRepaintTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(150)
+            };
+            _modelColorRepaintTimer.Tick += (_, _) =>
+            {
+                _modelColorRepaintTimer!.Stop();
+                _settings.Save();
+                ApplyModelColors();
+            };
+        }
+
+        _modelColorRepaintTimer.Stop();
+        _modelColorRepaintTimer.Start();
+    }
+
+    /// <summary>Settings → "Spread colors apart": reassigns every model so colors sit as
+    /// far apart on the wheel as possible. Family seeds keep their signature hue.</summary>
+    private void SpreadColorsButton_Click(object sender, RoutedEventArgs e)
+    {
+        var models = _settings.ModelColors.Keys
+            .OrderBy(model => _modelSlots.TryGetValue(model, out var slot) ? slot : int.MaxValue)
+            .ThenBy(model => model, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var seedsTaken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hues = new List<double>();
+        var pending = new List<string>();
+        foreach (var model in models)
+        {
+            string? assigned = null;
+            foreach (var (token, hex) in FamilySeeds)
+            {
+                if (model.Contains(token, StringComparison.OrdinalIgnoreCase) && seedsTaken.Add(hex))
+                {
+                    assigned = hex;
+                    break;
+                }
+            }
+
+            if (assigned is null)
+            {
+                pending.Add(model);
+                continue;
+            }
+
+            _settings.ModelColors[model] = assigned;
+            if (HueOf(assigned) is { } hue)
+            {
+                hues.Add(hue);
+            }
+        }
+
+        foreach (var model in pending)
+        {
+            var hue = FarthestHue(hues);
+            hues.Add(hue);
+            _settings.ModelColors[model] = HexFromHue(hue);
+        }
+
+        _settings.Save();
+        ApplyModelColors();
+        RebuildModelColorEditor();
+    }
+
+    /// <summary>Repaints everything colored by model after an assignment changes.</summary>
+    private void ApplyModelColors()
+    {
+        foreach (var bubble in _cupBubbles.Values)
+        {
+            if (bubble.Visual is Border border)
+            {
+                border.Background = BrushForModel(bubble.Event.Model);
+            }
+        }
+
+        UpdateLiveLegend();
+        if (_latestData is { } data)
+        {
+            UpdateModels(data);
+            UpdateChart();
+        }
+    }
 
     private void UpdateModels(DashboardData data)
     {
@@ -3252,12 +5667,60 @@ public partial class MainWindow : Window
             : $"{first:MMM d} – {last:MMM d} · local time";
     }
 
+    /// <summary>What the chart on screen was drawn from, flattened — null while
+    /// the canvas holds nothing. A redraw is thousands of elements, so the 30 s
+    /// dashboard refresh must reach it only when something it draws changed.</summary>
+    private string? _chartDrawnSignature;
+
+    private System.Windows.Threading.DispatcherTimer? _chartResizeTimer;
+
+    /// <summary>Everything <see cref="DrawChart"/> reads, cheaply. The totals
+    /// stand in for the buckets' contents: an event that lands in any bucket
+    /// moves them too. Model slots carry their colors, since a recolor repaints
+    /// the same numbers.</summary>
+    private string ChartSignature(DashboardData data)
+    {
+        var totals = data.Totals;
+        var slots = string.Join(",", _modelSlots
+            .OrderBy(pair => pair.Value)
+            .Select(pair => $"{pair.Value}:{ColorHexForModel(pair.Key)}"));
+        return string.Join("|",
+            _metricKey,
+            TableToggle.IsChecked == true ? "table" : "chart",
+            (int)Math.Round(ChartCanvas.ActualWidth),
+            (int)Math.Round(ChartCanvas.ActualHeight),
+            data.Unit,
+            data.Buckets.Count,
+            data.Buckets.Count == 0 ? 0 : data.Buckets[0].StartMs,
+            data.Buckets.Count == 0 ? 0 : data.Buckets[^1].StartMs,
+            totals.Total,
+            totals.Messages,
+            totals.EstimatedCost.ToString("R", Usd),
+            totals.UnpricedEvents,
+            data.Models.Count,
+            slots);
+    }
+
     private void DrawChart()
     {
+        if (_latestData is not { } data)
+        {
+            return;
+        }
+
+        var signature = ChartSignature(data);
+        if (signature == _chartDrawnSignature)
+        {
+            return;
+        }
+
         var canvas = ChartCanvas;
         canvas.Children.Clear();
-        if (_latestData is not { } data || canvas.ActualWidth < 60 || canvas.ActualHeight < 60)
+        if (canvas.ActualWidth < 60 || canvas.ActualHeight < 60)
         {
+            // Nothing drawn: leave the signature null so the size that can hold
+            // a chart draws immediately rather than waiting out the debounce.
+            _chartDrawnSignature = null;
             return;
         }
 
@@ -3269,6 +5732,7 @@ public partial class MainWindow : Window
                 ? "No priced usage in this range — see pricing status in Settings."
                 : "No usage recorded in this range.";
             ChartEmptyText.Visibility = Visibility.Visible;
+            _chartDrawnSignature = signature;
             return;
         }
 
@@ -3304,6 +5768,7 @@ public partial class MainWindow : Window
         var plotHeight = plotBottom - plotTop;
         if (plotWidth < 40 || plotHeight < 40)
         {
+            _chartDrawnSignature = null;
             return;
         }
 
@@ -3362,6 +5827,22 @@ public partial class MainWindow : Window
         var washBrush = new SolidColorBrush(Color.FromArgb(0x0E, 0xFF, 0xFF, 0xFF));
         washBrush.Freeze();
 
+        // One wash for the whole chart, moved to the hovered slot, added here so
+        // it stays behind the bars — a lit column, not a veil over the marks.
+        var wash = new Rectangle
+        {
+            Width = Math.Max(1, slotWidth),
+            Height = plotHeight,
+            Fill = washBrush,
+            RadiusX = 4,
+            RadiusY = 4,
+            Visibility = Visibility.Hidden,
+            IsHitTestVisible = false
+        };
+        Canvas.SetLeft(wash, plotLeft);
+        Canvas.SetTop(wash, plotTop);
+        canvas.Children.Add(wash);
+
         var values = new double[count];
         for (var i = 0; i < count; i++)
         {
@@ -3375,21 +5856,6 @@ public partial class MainWindow : Window
             var bucket = buckets[i];
             var slotLeft = plotLeft + slotWidth * i;
             var barLeft = slotLeft + (slotWidth - barWidth) / 2;
-
-            // Hover wash spanning the full slot, behind the bar.
-            var wash = new Rectangle
-            {
-                Width = Math.Max(1, slotWidth),
-                Height = plotHeight,
-                Fill = washBrush,
-                RadiusX = 4,
-                RadiusY = 4,
-                Visibility = Visibility.Hidden,
-                IsHitTestVisible = false
-            };
-            Canvas.SetLeft(wash, slotLeft);
-            Canvas.SetTop(wash, plotTop);
-            canvas.Children.Add(wash);
 
             // Stacked by model: slot order keeps each model's color and position stable.
             var segments = BuildSegments(bucket);
@@ -3416,40 +5882,25 @@ public partial class MainWindow : Window
                 yCursor -= height;
             }
 
-            // A label is drawn when it fits its slot; on dense charts (minute view) local
-            // peaks may still borrow their neighbours' air, since a peak's neighbours are
-            // never taller than the label's anchor bar.
+            // A label is drawn when its anchor is the tallest bar under the label's
+            // horizontal footprint, however many slots that spans — so even 1px bars
+            // get labelled at their local peaks, and a label never covers a taller bar.
             if (showBarLabels && values[i] > 0)
             {
                 var text = FormatMoneyShort(values[i]);
                 var width = LabelWidth(text) + 2;
-                var isPeak = values[i] >= (i > 0 ? values[i - 1] : 0) &&
-                             values[i] >= (i < count - 1 ? values[i + 1] : 0);
-                if (width <= slotWidth - 2 || (isPeak && width <= slotWidth * 3))
+                var reach = Math.Max(0, (int)Math.Ceiling((width - slotWidth) / (2 * slotWidth)));
+                var tallest = true;
+                for (var j = Math.Max(0, i - reach); tallest && j <= Math.Min(count - 1, i + reach); j++)
+                {
+                    tallest = values[j] <= values[i];
+                }
+
+                if (tallest)
                 {
                     labelCandidates.Add((i, text, width));
                 }
             }
-
-            // Full-slot hit target carrying the tooltip, built lazily on first
-            // hover: at 1000+ buckets, eager tooltips dominate the redraw.
-            var hit = new Rectangle
-            {
-                Width = Math.Max(1, slotWidth),
-                Height = plotHeight,
-                Fill = Brushes.Transparent
-            };
-            ToolTipService.SetInitialShowDelay(hit, 120);
-            ToolTipService.SetShowDuration(hit, 60000);
-            hit.MouseEnter += (_, _) =>
-            {
-                wash.Visibility = Visibility.Visible;
-                hit.ToolTip ??= BuildBucketTooltip(bucket, data.Unit);
-            };
-            hit.MouseLeave += (_, _) => wash.Visibility = Visibility.Hidden;
-            Canvas.SetLeft(hit, slotLeft);
-            Canvas.SetTop(hit, plotTop);
-            canvas.Children.Add(hit);
         }
 
         // Place labels last (on top of the marks), greedily left-to-right so none collide.
@@ -3478,6 +5929,63 @@ public partial class MainWindow : Window
             canvas.Children.Add(label);
             lastLabelRight = left + width;
         }
+
+        // One hover surface over the plot rather than a hit target per bucket:
+        // the slot under the pointer is arithmetic on its X, and a fine-grained
+        // range would otherwise carry a thousand elements with handlers each.
+        // The tooltip is still built on demand — at 1000+ buckets, eager
+        // tooltips dominate the redraw.
+        var surface = new Rectangle
+        {
+            Width = plotWidth,
+            Height = plotHeight,
+            Fill = Brushes.Transparent
+        };
+        var tip = new System.Windows.Controls.ToolTip
+        {
+            Placement = System.Windows.Controls.Primitives.PlacementMode.Mouse,
+            PlacementTarget = surface
+        };
+        surface.ToolTip = tip;
+        ToolTipService.SetInitialShowDelay(surface, 120);
+        ToolTipService.SetShowDuration(surface, 60000);
+
+        var hovered = -1;
+        var shown = false;
+        tip.Opened += (_, _) => shown = true;
+        surface.MouseMove += (_, e) =>
+        {
+            var slot = Math.Clamp((int)((e.GetPosition(canvas).X - plotLeft) / slotWidth), 0, count - 1);
+            if (slot == hovered)
+            {
+                return;
+            }
+
+            hovered = slot;
+            Canvas.SetLeft(wash, plotLeft + slotWidth * slot);
+            wash.Visibility = Visibility.Visible;
+            tip.Content = BuildBucketTooltip(buckets[slot], data.Unit);
+            if (shown)
+            {
+                // Once a tip has shown, the next slot re-opens it so it lands
+                // beside the cursor instead of hanging where the pointer first
+                // stopped. The first one still waits out its show delay.
+                tip.IsOpen = false;
+                tip.IsOpen = true;
+            }
+        };
+        surface.MouseLeave += (_, _) =>
+        {
+            hovered = -1;
+            shown = false;
+            wash.Visibility = Visibility.Hidden;
+            tip.IsOpen = false;
+        };
+        Canvas.SetLeft(surface, plotLeft);
+        Canvas.SetTop(surface, plotTop);
+        canvas.Children.Add(surface);
+
+        _chartDrawnSignature = signature;
     }
 
     private double MetricValue(UsageBucket bucket) => _metricKey switch
@@ -3494,7 +6002,9 @@ public partial class MainWindow : Window
         _ => slice.Cost
     };
 
-    /// <summary>Bottom-to-top stack for one bucket: slot-assigned models in fixed order, then "Other".</summary>
+    /// <summary>Bottom-to-top stack for one bucket: every model in slot order, each
+    /// in its own color. "Other" only catches a slice whose model has no slot yet
+    /// (a refresh race) — it is never a pool.</summary>
     private List<(double Value, Brush Brush)> BuildSegments(UsageBucket bucket)
     {
         var result = new List<(double, Brush)>();
@@ -3509,7 +6019,14 @@ public partial class MainWindow : Window
             return result;
         }
 
-        var bySlot = new double[MaxModelSlots];
+        var slotCount = _modelSlots.Count;
+        var bySlot = new double[slotCount];
+        var modelBySlot = new string?[slotCount];
+        foreach (var pair in _modelSlots)
+        {
+            modelBySlot[pair.Value] = pair.Key;
+        }
+
         var other = 0d;
         foreach (var slice in bucket.Slices)
         {
@@ -3529,11 +6046,13 @@ public partial class MainWindow : Window
             }
         }
 
-        for (var slot = 0; slot < MaxModelSlots; slot++)
+        for (var slot = 0; slot < slotCount; slot++)
         {
             if (bySlot[slot] > 0)
             {
-                result.Add((bySlot[slot], _seriesBrushes[slot]));
+                result.Add((bySlot[slot], modelBySlot[slot] is { } model
+                    ? BrushForModel(model)
+                    : _otherBrush));
             }
         }
 
@@ -3986,9 +6505,30 @@ public partial class MainWindow : Window
         {
             _disposed = true;
             _collector.Dispose();
+            _openCodeService.Dispose();
             _limitsService.Dispose();
             _apiServer.Dispose();
+            _captureProxy.Dispose();
+            ReleaseEnvironment();
         }
+    }
+
+    /// <summary>New sessions launched while the app is closed must reach the API
+    /// directly rather than a relay that isn't there; re-set on relaunch. Called
+    /// from every way the app can end — window close, logoff/shutdown, a crash —
+    /// because a leftover ANTHROPIC_BASE_URL takes every Claude Code session on
+    /// the machine down with "Connection refused".</summary>
+    public void ReleaseEnvironment()
+    {
+        if (_settings.CaptureRequestsEnabled)
+        {
+            RequestCaptureProxy.ClearEnvironment();
+        }
+
+        // CODEX_ROLLOUT_TRACE_ROOT stays: with it cleared at every sign-out, whatever
+        // starts before the tracker at the next login (the Claude app, a terminal)
+        // runs Codex untraced all session. Bundles written meanwhile wait for the next
+        // start. Only unticking the setting removes it.
     }
 
     private sealed record TimelineTableRow(

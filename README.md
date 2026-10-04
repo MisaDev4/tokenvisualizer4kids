@@ -26,7 +26,7 @@ A page with one tile per **open** terminal — Claude Code and Codex, each weari
 
 ![Live](docs/live.png)
 
-Ultra real time: every response drops into the cup as a block within about a second of being logged, sized by cost or token count with the value printed on it. Hover a block and it names the chat it came from — the session's opening prompt, its terminal's folder, and the latest prompt when the conversation has moved on — above the cost and the full token split, so an expensive block is traceable to the conversation that produced it. Rounds are timed — the rim above the cup fills as the countdown runs (amber near the end, red just before), then the pile settles into a sediment layer, the floor rises, and the next round stacks on top. Scroll down through the layers to wander back in time; the small bars in the header score your recent rounds against your best. The feed header also shows your working pace — cost per minute and tokens per second averaged over the last 5 minutes, steadier than the 60-second tiles above the cup — and it rides along when the feed is docked into the dashboard. Round lengths run from 60 seconds to an hour, plus **∞ endless mode**, where nothing ever settles and the tower just keeps growing. Changing the round length re-partitions history instead of discarding it, and the live state keeps running in the background whatever tab is showing.
+Ultra real time: every response drops into the cup as a block within about a second of being logged, sized by cost or token count with the value printed on it. Hover a block and it names the chat it came from — the session's opening prompt, its terminal's folder, and the latest prompt when the conversation has moved on — above the cost and the full token split, so an expensive block is traceable to the conversation that produced it. Rounds are timed — the rim above the cup fills as the countdown runs (amber near the end, red just before), then the pile settles into a sediment layer, the floor rises, and the next round stacks on top. Scroll down through the layers to wander back in time; the small bars in the header score your recent rounds against your best. The feed header also shows your working pace — cost per minute and tokens per second averaged over the last 5 minutes, steadier than the 60-second tiles above the cup — and it rides along when the feed is docked into the dashboard. Round lengths run from 60 seconds to an hour, plus **∞ endless mode**, where nothing ever settles and the tower just keeps growing. Changing the round length re-partitions history instead of discarding it, and the live state keeps running in the background whatever tab is showing. Double-click a block to read the transcript it was parsed out of, scrolled to that response. Some harnesses delete a session log seconds after writing it (a bot forking its own session for a probe, then cleaning up), so the tracker keeps its own copy of every young transcript it indexes: copies whose source survives a day are dropped, copies of logs that vanished are gzipped and kept for 30 days or 1 GB, whichever comes first, and the viewer falls back to the copy when the original is gone.
 
 ## Limits
 
@@ -41,6 +41,7 @@ Below the account cards, a **Daily activity** grid maps a year of local usage Gi
 The app reads local logs only:
 
 - Codex sessions from `%USERPROFILE%\.codex`
+- Codex runs that save no session (`codex exec --ephemeral`) from Codex's own usage traces: it sets the user-level `CODEX_ROLLOUT_TRACE_ROOT` to its data folder (left set when the app exits, so runs while it's closed are counted at the next start), reads each call's token usage there, and prunes the traces (Settings → *Count Codex runs that save no session log*)
 - Claude Code projects and transcripts from `%USERPROFILE%\.claude`
 
 Some setups write Claude- or Codex-shaped JSONL somewhere else entirely — a container runner streaming `stream-json` to a results folder, an agent pinned to its own `CLAUDE_CONFIG_DIR`, a bridge running with session persistence off that keeps its own usage log. Add those folders to `ExtraSourceRoots` in `settings.json` and they are indexed alongside the standard locations:
@@ -62,9 +63,10 @@ While the app runs it serves everything it knows — dashboard aggregates, the l
 
 ## What gets stored, and where
 
-Token metadata only — never prompt or response text — in `%LOCALAPPDATA%\TokenTracker`:
+Everything lives in `%LOCALAPPDATA%\TokenTracker`. The usage index holds token metadata only — never prompt or response text; the transcript vault below is the one place conversation text is copied, and only so a deleted log can still be opened from the feed:
 
 - `usage.db` — the local usage index (SQLite)
+- `transcript-vault\` — copies of young transcripts, kept only while their source is under a day old or after it has been deleted (`TranscriptVaultEnabled`, `TranscriptVaultKeepDays`, `TranscriptVaultMaxMb` in settings.json)
 - `settings.json` — UI preferences and any extra scan folders
 - `pricing-litellm.json` — cached pricing catalog
 - `accounts.json` — per-account limit snapshots, including the OAuth tokens Claude Code already keeps in plaintext on this machine; they are only ever sent to the Anthropic API

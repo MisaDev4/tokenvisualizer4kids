@@ -151,11 +151,13 @@ Local-calendar-day totals (tokens + estimated cost), ascending. `days` defaults 
             { "day": "2026-07-16", "tokens": 96000000, "cost": 44.03 } ] }
 ```
 
-### `GET /api/limits` — Claude plan rate limits
+### `GET /api/limits` — subscription rate limits
 
-The latest snapshot of every Claude account the app tracks (refreshed every ~60 s; the
-active account is the one signed into Claude Code right now). Access tokens are never
-exposed.
+The latest snapshot of every account the app tracks (refreshed every ~60 s):
+Claude accounts seen signing into Claude Code (`provider: "anthropic"`; the active one
+is signed in right now) plus the ChatGPT account Codex uses (`provider: "openai"`,
+read locally from Codex's own files — its `active` means Codex answered within the
+last 30 minutes). Access tokens are never exposed.
 
 ```json
 {
@@ -170,6 +172,7 @@ exposed.
       "stale": false,
       "fetchedAt": "2026-07-16T16:46:30+00:00",
       "cooldownUntil": null,
+      "provider": "anthropic",
       "limits": [
         { "label": "5h",   "percent": 34, "severity": "normal",
           "resetsAt": "2026-07-16T19:00:00+00:00" },

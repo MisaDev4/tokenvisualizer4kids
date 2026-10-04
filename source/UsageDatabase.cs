@@ -60,6 +60,7 @@ public sealed class UsageDatabase
                 output_tokens INTEGER NOT NULL,
                 cache_read_tokens INTEGER NOT NULL,
                 cache_write_tokens INTEGER NOT NULL,
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
                 reasoning_tokens INTEGER NOT NULL,
                 message_count INTEGER NOT NULL,
                 updated_ms INTEGER NOT NULL
@@ -71,8 +72,76 @@ public sealed class UsageDatabase
                 ON usage_events(client, provider, model, timestamp_ms);
             CREATE INDEX IF NOT EXISTS ix_usage_events_source
                 ON usage_events(source_path);
+            -- The live feed (and the local API's /api/events) ask for "everything
+            -- updated since X" on every collector change — a few times a minute
+            -- under a bot writing transcripts around the clock. Without this the
+            -- query was a full table scan plus a sort: measured 2026-09-01 against
+            -- a 300 MB store, ~360 MB re-read every 3-4 s, 2-3 cores busy all day.
+            CREATE INDEX IF NOT EXISTS ix_usage_events_updated
+                ON usage_events(updated_ms);
+
+            -- Transcripts the vault holds a copy of (see TranscriptVault).
+            CREATE TABLE IF NOT EXISTS transcript_vault (
+                source_path TEXT PRIMARY KEY,
+                client TEXT NOT NULL,
+                vault_name TEXT NOT NULL,
+                vaulted_offset INTEGER NOT NULL,
+                last_append_ms INTEGER NOT NULL,
+                missing_since_ms INTEGER,
+                bytes INTEGER NOT NULL
+            );
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await AddCacheWriteTtlColumnAsync(connection, cancellationToken);
+
+        // Every dashboard pass (totals, buckets, per-row pricing, the models
+        // grid with the hint below) and the year heatmap select only these
+        // columns, so SQLite answers them from this index and never touches
+        // the table rows — the long strings (event_key, source_path,
+        // session_id) stay on disk. Created after the TTL-column migration
+        // because it names that column. ~15% of the store in size.
+        var covering = connection.CreateCommand();
+        covering.CommandText = """
+            CREATE INDEX IF NOT EXISTS ix_usage_events_dashboard
+                ON usage_events(timestamp_ms, client, provider, model,
+                                input_tokens, output_tokens, cache_read_tokens,
+                                cache_write_tokens, reasoning_tokens, message_count,
+                                cache_write_1h_tokens, updated_ms);
+            """;
+        await covering.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Databases written before cache TTL was tracked have no cache_write_1h_tokens column.
+    /// Adds it, then seeds existing Anthropic rows as 1-hour writes: Claude Code asks for a
+    /// 1-hour TTL on every cache write it makes, and it is the only client that produced
+    /// those rows, so leaving them at zero would keep under-charging history by ~12% forever.
+    /// Rows indexed from here on carry the real per-request split from the transcript.
+    /// </summary>
+    private static async Task AddCacheWriteTtlColumnAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var probe = connection.CreateCommand();
+        probe.CommandText = """
+            SELECT COUNT(*) FROM pragma_table_info('usage_events')
+            WHERE name = 'cache_write_1h_tokens';
+            """;
+        if (Convert.ToInt64(await probe.ExecuteScalarAsync(cancellationToken)) > 0)
+        {
+            return;
+        }
+
+        var migrate = connection.CreateCommand();
+        migrate.CommandText = """
+            ALTER TABLE usage_events
+                ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0;
+
+            UPDATE usage_events
+                SET cache_write_1h_tokens = cache_write_tokens
+                WHERE provider IN ('anthropic', 'bedrock', 'claude') AND cache_write_tokens > 0;
+            """;
+        await migrate.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<long> GetEventCountAsync(CancellationToken cancellationToken = default)
@@ -181,11 +250,12 @@ public sealed class UsageDatabase
                 INSERT INTO usage_events (
                     event_key, source_path, client, provider, model, session_id,
                     timestamp_ms, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, reasoning_tokens, message_count, updated_ms)
+                    cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
+                    message_count, updated_ms)
                 VALUES (
                     $event_key, $source_path, $client, $provider, $model, $session_id,
                     $timestamp_ms, $input, $output, $cache_read,
-                    $cache_write, $reasoning, $messages, $updated_ms)
+                    $cache_write, $cache_write_1h, $reasoning, $messages, $updated_ms)
                 ON CONFLICT(event_key) DO UPDATE SET
                     source_path = excluded.source_path,
                     client = excluded.client,
@@ -197,6 +267,7 @@ public sealed class UsageDatabase
                     output_tokens = MAX(usage_events.output_tokens, excluded.output_tokens),
                     cache_read_tokens = MAX(usage_events.cache_read_tokens, excluded.cache_read_tokens),
                     cache_write_tokens = MAX(usage_events.cache_write_tokens, excluded.cache_write_tokens),
+                    cache_write_1h_tokens = MAX(usage_events.cache_write_1h_tokens, excluded.cache_write_1h_tokens),
                     reasoning_tokens = MAX(usage_events.reasoning_tokens, excluded.reasoning_tokens),
                     message_count = MAX(usage_events.message_count, excluded.message_count),
                     updated_ms = excluded.updated_ms;
@@ -212,6 +283,7 @@ public sealed class UsageDatabase
             insert.Parameters.AddWithValue("$output", usageEvent.Tokens.Output);
             insert.Parameters.AddWithValue("$cache_read", usageEvent.Tokens.CacheRead);
             insert.Parameters.AddWithValue("$cache_write", usageEvent.Tokens.CacheWrite);
+            insert.Parameters.AddWithValue("$cache_write_1h", usageEvent.Tokens.CacheWrite1h);
             insert.Parameters.AddWithValue("$reasoning", usageEvent.Tokens.Reasoning);
             insert.Parameters.AddWithValue("$messages", usageEvent.MessageCount);
             insert.Parameters.AddWithValue("$updated_ms", now);
@@ -247,11 +319,102 @@ public sealed class UsageDatabase
         await transaction.CommitAsync(cancellationToken);
     }
 
+    public async Task<VaultEntry?> GetVaultEntryAsync(string sourcePath, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, client, vault_name, vaulted_offset, last_append_ms, missing_since_ms, bytes
+            FROM transcript_vault WHERE source_path = $path LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$path", sourcePath);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadVaultEntry(reader) : null;
+    }
+
+    public async Task<List<VaultEntry>> GetVaultEntriesAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, client, vault_name, vaulted_offset, last_append_ms, missing_since_ms, bytes
+            FROM transcript_vault;
+            """;
+        var entries = new List<VaultEntry>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            entries.Add(ReadVaultEntry(reader));
+        }
+
+        return entries;
+    }
+
+    public async Task UpsertVaultEntryAsync(VaultEntry entry, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO transcript_vault (
+                source_path, client, vault_name, vaulted_offset, last_append_ms, missing_since_ms, bytes)
+            VALUES ($path, $client, $name, $offset, $appended, $missing, $bytes)
+            ON CONFLICT(source_path) DO UPDATE SET
+                client = excluded.client,
+                vault_name = excluded.vault_name,
+                vaulted_offset = excluded.vaulted_offset,
+                last_append_ms = excluded.last_append_ms,
+                missing_since_ms = excluded.missing_since_ms,
+                bytes = excluded.bytes;
+            """;
+        command.Parameters.AddWithValue("$path", entry.SourcePath);
+        command.Parameters.AddWithValue("$client", entry.Client);
+        command.Parameters.AddWithValue("$name", entry.VaultName);
+        command.Parameters.AddWithValue("$offset", entry.VaultedOffset);
+        command.Parameters.AddWithValue("$appended", entry.LastAppendMs);
+        command.Parameters.AddWithValue("$missing", (object?)entry.MissingSinceMs ?? DBNull.Value);
+        command.Parameters.AddWithValue("$bytes", entry.Bytes);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task DeleteVaultEntryAsync(string sourcePath, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM transcript_vault WHERE source_path = $path;";
+        command.Parameters.AddWithValue("$path", sourcePath);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static VaultEntry ReadVaultEntry(SqliteDataReader reader) => new(
+        reader.GetString(0),
+        reader.GetString(1),
+        reader.GetString(2),
+        reader.GetInt64(3),
+        reader.GetInt64(4),
+        reader.IsDBNull(5) ? null : reader.GetInt64(5),
+        reader.GetInt64(6));
+
+    /// <summary>Removes everything a retired client ever indexed — its events
+    /// and its source-file rows — so a superseded ingestion path cannot keep
+    /// double-counting alongside its replacement.</summary>
+    public async Task DeleteClientEventsAsync(string client, CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            DELETE FROM usage_events WHERE client = $client;
+            DELETE FROM source_files WHERE client = $client;
+            """;
+        command.Parameters.AddWithValue("$client", client);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task<DashboardData> GetDashboardAsync(
         string rangeKey,
         PricingService? pricing = null,
         BucketUnit? unitOverride = null,
         long sessionGapMs = 4 * 3_600_000L,
+        long? manualSessionStartMs = null,
         CancellationToken cancellationToken = default)
     {
         var (startMs, endMs) = ResolveRange(rangeKey);
@@ -259,9 +422,11 @@ public sealed class UsageDatabase
 
         if (rangeKey == "session")
         {
-            // The current work session: everything since the last quiet
-            // stretch of at least sessionGapMs. No end — it runs to now.
-            startMs = await ResolveSessionStartAsync(connection, sessionGapMs, cancellationToken);
+            // The current work session: everything since the user's pinned
+            // start when one is set, otherwise since the last quiet stretch
+            // of at least sessionGapMs. No end — it runs to now.
+            startMs = manualSessionStartMs
+                ?? await ResolveSessionStartAsync(connection, sessionGapMs, cancellationToken);
             endMs = null;
         }
 
@@ -310,11 +475,17 @@ public sealed class UsageDatabase
 
         var models = new List<ModelUsageRow>();
         var modelCommand = connection.CreateCommand();
+        // Left to itself the planner takes ix_usage_events_model for the GROUP BY
+        // and walks all of it (measured 2026-09-01: ~43 MB per refresh, several
+        // times a minute, for a session range holding a few hundred rows). With
+        // a start bound the covering index's range scan is the cheap plan; an
+        // unbounded range keeps the planner's choice, which is right there.
+        var modelIndexHint = startMs is null ? "" : "INDEXED BY ix_usage_events_dashboard";
         modelCommand.CommandText = $"""
             SELECT client, provider, model,
                    SUM(message_count), SUM(input_tokens), SUM(output_tokens),
                    SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens)
-            FROM usage_events
+            FROM usage_events {modelIndexHint}
             {where}
             GROUP BY client, provider, model
             ORDER BY SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + reasoning_tokens) DESC;
@@ -379,7 +550,10 @@ public sealed class UsageDatabase
         }
 
         var buckets = FillBuckets(bucketRows, unit, startMs ?? firstEventMs, endMs);
-        return new DashboardData(totals, models, buckets, unit, lastUpdated);
+        return new DashboardData(totals, models, buckets, unit, lastUpdated)
+        {
+            RangeStartMs = startMs
+        };
     }
 
     private static async Task<(UsageTotals Totals, List<ModelUsageRow> Models, Dictionary<string, UsageBucket> Buckets)>
@@ -399,7 +573,8 @@ public sealed class UsageDatabase
         command.CommandText = $"""
             SELECT client, provider, model, timestamp_ms,
                    input_tokens, output_tokens, cache_read_tokens,
-                   cache_write_tokens, reasoning_tokens, message_count
+                   cache_write_tokens, reasoning_tokens, message_count,
+                   cache_write_1h_tokens
             FROM usage_events
             {where};
             """;
@@ -423,7 +598,8 @@ public sealed class UsageDatabase
                 reader.GetInt64(5),
                 reader.GetInt64(6),
                 reader.GetInt64(7),
-                reader.GetInt64(8));
+                reader.GetInt64(8),
+                reader.GetInt64(10));
             var messages = reader.GetInt64(9);
             var estimate = pricing.Calculate(provider, model, tokens);
             var unpriced = estimate.IsPriced ? 0L : 1L;
@@ -481,6 +657,28 @@ public sealed class UsageDatabase
     }
 
     /// <summary>
+    /// The log an indexed event was read out of, and the client that wrote it —
+    /// what the transcript viewer needs to reopen the conversation behind a
+    /// block. Null once the row has been pruned.
+    /// </summary>
+    public async Task<(string SourcePath, string Client)?> GetEventSourceAsync(
+        string eventKey,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT source_path, client FROM usage_events WHERE event_key = $key LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$key", eventKey);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken)
+            ? (reader.GetString(0), reader.GetString(1))
+            : null;
+    }
+
+    /// <summary>
     /// Newest events indexed after <paramref name="sinceUpdatedMs"/>, ascending.
     /// The limit keeps a full rescan (which re-stamps every row) from flooding
     /// the live view with ancient history.
@@ -495,7 +693,7 @@ public sealed class UsageDatabase
         command.CommandText = """
             SELECT event_key, client, provider, model, session_id, timestamp_ms, updated_ms,
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                   reasoning_tokens, message_count
+                   reasoning_tokens, message_count, cache_write_1h_tokens
             FROM usage_events
             WHERE updated_ms > $since
             ORDER BY updated_ms DESC
@@ -521,7 +719,8 @@ public sealed class UsageDatabase
                     reader.GetInt64(8),
                     reader.GetInt64(9),
                     reader.GetInt64(10),
-                    reader.GetInt64(11)),
+                    reader.GetInt64(11),
+                    reader.GetInt64(13)),
                 reader.GetInt64(12)));
         }
 
@@ -542,7 +741,7 @@ public sealed class UsageDatabase
         command.CommandText = """
             SELECT event_key, client, provider, model, session_id, timestamp_ms, updated_ms,
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                   reasoning_tokens, message_count
+                   reasoning_tokens, message_count, cache_write_1h_tokens
             FROM usage_events
             WHERE timestamp_ms >= $start AND timestamp_ms < $end
             ORDER BY timestamp_ms DESC
@@ -569,7 +768,8 @@ public sealed class UsageDatabase
                     reader.GetInt64(8),
                     reader.GetInt64(9),
                     reader.GetInt64(10),
-                    reader.GetInt64(11)),
+                    reader.GetInt64(11),
+                    reader.GetInt64(13)),
                 reader.GetInt64(12)));
         }
 
@@ -578,12 +778,14 @@ public sealed class UsageDatabase
     }
 
     /// <summary>
-    /// Estimated cost and token total of Claude subscription usage that landed
-    /// inside any of the given wall-clock spans — used to attribute local usage
-    /// to whichever account was signed in at the time. Bedrock and Codex events
-    /// don't draw on a Claude plan and are excluded.
+    /// Estimated cost and token total of one client's subscription usage that
+    /// landed inside any of the given wall-clock spans — used to attribute local
+    /// usage to accounts. Filtering on client + provider keeps each account's
+    /// number to usage that drew on its plan (Bedrock events, say, don't).
     /// </summary>
-    public async Task<(double Cost, long Tokens)> GetClaudeUsageInSpansAsync(
+    public async Task<(double Cost, long Tokens)> GetUsageInSpansAsync(
+        string client,
+        string provider,
         IReadOnlyList<(long StartMs, long EndMs)> spans,
         PricingService pricing,
         CancellationToken cancellationToken = default)
@@ -604,11 +806,14 @@ public sealed class UsageDatabase
             command.Parameters.AddWithValue($"$e{index}", span.EndMs);
         }
 
+        command.Parameters.AddWithValue("$client", client);
+        command.Parameters.AddWithValue("$provider", provider);
         command.CommandText = $"""
             SELECT provider, model, input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens, reasoning_tokens
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   cache_write_1h_tokens
             FROM usage_events
-            WHERE client = 'claude' AND provider = 'anthropic'
+            WHERE client = $client AND provider = $provider
               AND ({string.Join(" OR ", clauses)});
             """;
 
@@ -622,7 +827,8 @@ public sealed class UsageDatabase
                 reader.GetInt64(3),
                 reader.GetInt64(4),
                 reader.GetInt64(5),
-                reader.GetInt64(6));
+                reader.GetInt64(6),
+                reader.GetInt64(7));
             cost += pricing.Calculate(reader.GetString(0), reader.GetString(1), tokens).Cost;
             total += tokens.Total;
         }
@@ -640,7 +846,7 @@ public sealed class UsageDatabase
         command.CommandText = """
             SELECT client, provider, model, session_id, timestamp_ms,
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                   reasoning_tokens
+                   reasoning_tokens, cache_write_1h_tokens
             FROM usage_events
             WHERE timestamp_ms >= $since
             ORDER BY timestamp_ms;
@@ -662,7 +868,8 @@ public sealed class UsageDatabase
                     reader.GetInt64(6),
                     reader.GetInt64(7),
                     reader.GetInt64(8),
-                    reader.GetInt64(9))));
+                    reader.GetInt64(9),
+                    reader.GetInt64(10))));
         }
 
         return rows;
@@ -672,23 +879,36 @@ public sealed class UsageDatabase
     /// Per-day totals (local calendar days, all clients) since the given time,
     /// for the daily activity grid on the limits page.
     /// </summary>
+    /// <remarks>
+    /// Events are read one row at a time instead of pre-summed by SQL, because
+    /// <see cref="PricingService.Calculate"/> has per-request semantics: its long-context
+    /// tiers key off the size of a single request, so pricing a whole day's SUM charges
+    /// every token at the top tier. Price first, group after — the order
+    /// <see cref="ApplyCostsAsync"/> already uses, which is what keeps this grid and the
+    /// dashboard agreeing on the same day.
+    /// </remarks>
     public async Task<List<DailyUsageRow>> GetDailyUsageAsync(
         long sinceMs,
         PricingService? pricing = null,
+        long? untilMs = null,
         CancellationToken cancellationToken = default)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken);
         var command = connection.CreateCommand();
-        command.CommandText = """
+        var until = untilMs is null ? "" : "AND timestamp_ms < $until";
+        command.CommandText = $"""
             SELECT strftime('%Y-%m-%d', timestamp_ms / 1000, 'unixepoch', 'localtime') AS day,
                    provider, model,
-                   SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
-                   SUM(cache_write_tokens), SUM(reasoning_tokens)
+                   input_tokens, output_tokens, cache_read_tokens,
+                   cache_write_tokens, reasoning_tokens, cache_write_1h_tokens
             FROM usage_events
-            WHERE timestamp_ms >= $since
-            GROUP BY day, provider, model;
+            WHERE timestamp_ms >= $since {until};
             """;
         command.Parameters.AddWithValue("$since", sinceMs);
+        if (untilMs is { } untilValue)
+        {
+            command.Parameters.AddWithValue("$until", untilValue);
+        }
 
         var days = new Dictionary<string, (long Tokens, double Cost)>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -700,7 +920,8 @@ public sealed class UsageDatabase
                 reader.GetInt64(4),
                 reader.GetInt64(5),
                 reader.GetInt64(6),
-                reader.GetInt64(7));
+                reader.GetInt64(7),
+                reader.GetInt64(8));
             var cost = pricing?.Calculate(reader.GetString(1), reader.GetString(2), tokens).Cost ?? 0;
             var current = days.GetValueOrDefault(day);
             days[day] = (current.Tokens + tokens.Total, current.Cost + cost);

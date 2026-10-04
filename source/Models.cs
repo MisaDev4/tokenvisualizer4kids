@@ -5,10 +5,16 @@ public sealed record TokenBreakdown(
     long Output,
     long CacheRead,
     long CacheWrite,
-    long Reasoning)
+    long Reasoning,
+    long CacheWrite1h = 0)
 {
     // Reasoning is included in the provider-reported output token count.
     public long Total => checked(Input + Output + CacheRead + CacheWrite);
+
+    /// <summary>The slice of <see cref="CacheWrite"/> written with a 5-minute TTL.
+    /// Anthropic charges the two TTLs at different rates (1.25x base input for 5m,
+    /// 2x for 1h), so they can't be billed as one number.</summary>
+    public long CacheWrite5m => Math.Max(0, CacheWrite - CacheWrite1h);
 
     public bool IsEmpty => Input == 0 && Output == 0 && CacheRead == 0 && CacheWrite == 0 && Reasoning == 0;
 }
@@ -150,7 +156,14 @@ public sealed record DashboardData(
     IReadOnlyList<ModelUsageRow> Models,
     IReadOnlyList<UsageBucket> Buckets,
     BucketUnit Unit,
-    long LastUpdatedMs);
+    long LastUpdatedMs)
+{
+    /// <summary>Where the range actually began, unrounded — for the Session
+    /// range this is the session's first event, which no other field carries
+    /// (bucket starts are floored to the bar size). Null for open-ended ranges
+    /// like All, and when a session range found no data at all.</summary>
+    public long? RangeStartMs { get; init; }
+}
 
 public sealed record CollectorProgress(
     string Activity,

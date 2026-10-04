@@ -2,3 +2,25 @@ TokenTracker.exe
 source/bin/
 source/obj/
 source/publish/
+
+# Ideas board: ideas.json IS tracked (it is the shared source of truth), but the
+# rolling copy / quarantined files beside it are machine-local noise.
+.ideas-backups/
+ideas/shot.png
+
+# Verification scratch. Every offscreen `--shot=` run and every agent that
+# bisects a look-dev change leaves PNGs and probe JSON somewhere; none of it is
+# the app. Screenshots worth keeping go in docs/ deliberately.
+.shots/
+town/.shots/
+.seasonlab/
+town/bench-*.json
+town/bench-*.txt
+town/rev-*.json
+
+# more agent scratch that lands in the tree
+.shots-news/
+.seasonlab/
+
+town/b-*.png
+town/.shots-*

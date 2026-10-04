@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>Token Town</title>
+<style>
+  :root{
+    --page:#0D0D0D; --card:#1A1A19; --hairline:rgba(255,255,255,.10);
+    --ink:#FFFFFF; --ink2:#C3C2B7; --muted:#898781; --accent:#D9A441;
+    /* THE VIGNETTE HAS ONE OWNER AT A TIME, and it is whoever wrote the inline
+       style on <html> last. environs drives this value at <=4 Hz when the town
+       is drawn straight to the canvas; the moment postfx owns a render target
+       it pins it to 0 (re-asserted at 2 Hz) and does the vignette in-shader,
+       aspect-corrected, inside the tone curve. Nothing else may declare --vig:
+       a second rule is a second vignette, and they multiply. */
+    --vig:.18;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0; background:var(--page); color:var(--ink2); display:flex; flex-direction:column;
+    font:14px/1.5 "Segoe UI", system-ui, sans-serif; overflow:hidden}
+
+  /* ── header: the PLACE, not the product ───────────────────────── */
+  header{display:flex; align-items:center; gap:11px; padding:9px 16px; flex:none;
+    border-bottom:1px solid var(--hairline)}
+  header h1{color:var(--ink); font-size:15px; font-weight:600; margin:0; white-space:nowrap}
+  .seal{width:21px; height:21px; border-radius:50%; flex:none; display:grid; place-items:center;
+    font-size:11.5px; line-height:1; color:#14120C; background:var(--accent);
+    box-shadow:0 0 0 1px rgba(0,0,0,.35) inset}
+  .chip{display:inline-flex; align-items:center; gap:5px; font-size:11.5px; white-space:nowrap;
+    color:var(--muted); border:1px solid var(--hairline); border-radius:11px; padding:1px 9px}
+  .chip:empty{display:none}
+  #rangeBadge{color:var(--ink2)}
+  #rangeBadge.flash{animation:badgeFlash 1.5s ease-out}
+  @keyframes badgeFlash{
+    0%{background:rgba(217,164,65,.45); color:#fff; border-color:rgba(217,164,65,.8)} 100%{} }
+  /* Today's palette as ONE continuous bar, not three separate squares. Three flat
+     swatches sitting exactly where v2's Fable/Opus family legend used to sit read
+     as a model-colour key — the precise misreading v3 exists to eliminate. A
+     gradient bar cannot be mistaken for a legend: there are no discrete entries
+     in it to map onto anything. */
+  .dots{display:inline-flex; flex:none; width:42px; height:5px; border-radius:3px;
+    overflow:hidden; opacity:.85; box-shadow:inset 0 0 0 1px rgba(255,255,255,.10)}
+  .dots i{flex:1; display:block; height:100%}
+  .meta{margin-left:auto; font-size:12px; color:var(--muted); white-space:nowrap}
+  .meta b{color:var(--ink2); font-variant-numeric:tabular-nums; font-weight:600}
+
+  /* ── the Crier: its own row, so it can never cover the town ─────
+     THE GAZETTE IS A MASTHEAD, NOT A STATUS BAR. It used to be a 29 px strip of
+     12.5 px sans — the same weight as a tooltip — carrying the only writing in
+     the app with a voice. At that size nobody read it, which made every joke in
+     news.js dead weight. It is now a banner: a gilt edge, a serif masthead with
+     a rule after it, and the headline itself set in italic Georgia at 17 px, the
+     newspaper register the copy was always written in. The numbers inside it are
+     upright gold, so a headline and the footer's hero read as the same currency. */
+  #news{flex:none; position:relative; display:flex; align-items:center; gap:14px;
+    padding:9px 18px 10px; min-height:48px; overflow:hidden;
+    border-bottom:1px solid var(--hairline);
+    box-shadow:inset 0 -3px 0 -2px rgba(217,164,65,.28);
+    background:
+      linear-gradient(90deg,rgba(217,164,65,.10),rgba(217,164,65,0) 38%),
+      linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.012));
+    transition:background .6s, box-shadow .6s}
+  /* the gilt edge — what stops the row reading as another toolbar */
+  #news:before{content:''; position:absolute; left:0; top:0; bottom:0; width:3px;
+    background:linear-gradient(180deg,#F3D07A,#B99248 55%,#6E5526); opacity:.9}
+  #newsMast{flex:none; align-self:stretch; display:flex; align-items:center;
+    font:700 12.5px/1 Georgia,"Times New Roman",serif; letter-spacing:.17em;
+    text-transform:uppercase; color:#C99B4A; white-space:nowrap;
+    padding-right:14px; border-right:1px solid rgba(217,164,65,.30);
+    text-shadow:0 1px 0 rgba(0,0,0,.65); transition:color .5s, text-shadow .5s}
+  #news.hot{box-shadow:inset 0 -3px 0 -2px rgba(243,208,122,.72);
+    background:
+      linear-gradient(90deg,rgba(243,208,122,.20),rgba(243,208,122,.02) 48%),
+      linear-gradient(180deg,rgba(255,255,255,.075),rgba(255,255,255,.02))}
+  #news.hot #newsMast, #newsMast.hot{color:#F3D07A; text-shadow:0 0 16px rgba(243,208,122,.6)}
+  #news .line{flex:1; min-width:0;
+    font:italic 400 17px/1.32 Georgia,"Times New Roman",serif; color:#EFEADA;
+    text-shadow:0 1px 0 rgba(0,0,0,.55);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    /* BASE CSS IS THE FINAL STATE — a throttled compositor must never catch a
+       blank bar, so the animation only ever travels TOWARD this. */
+    opacity:1; transform:none}
+  /* a number in a headline is upright and gold: the one thing in the sentence
+     that is a fact rather than a joke, and the same colour the footer gives it */
+  #news .line b{font-style:normal; font-weight:700; color:#F3D07A;
+    font-variant-numeric:tabular-nums}
+  /* the aside. Everything around it is already italic, so the aside stops being
+     italic and goes quiet instead. */
+  #news .line i{font-style:normal; color:#B4AF9F}
+  #news .line.swap{animation:newsIn .42s cubic-bezier(.2,.8,.3,1)}
+  /* SLIDE, DON'T FADE FROM NOTHING. A 1200-building town paints at ~1 fps, so a
+     single sampled frame of a 420 ms fade-in is held for a whole visible frame —
+     and about a third of all captures landed inside one, showing the masthead
+     "THE ... CRIER" with an entirely empty line beside it. The 13 s mark was
+     deterministic: the boot line's 9 s dwell expires right about there. The base
+     state is already the final state, so starting at 0.4 costs nothing and the
+     line is legible from the animation's first composited frame. */
+  @keyframes newsIn{from{opacity:.4; transform:translateY(6px)} to{opacity:1; transform:none}}
+  /* hovering the bar recovers the last five headlines — a milestone missed
+     twenty minutes ago is still evidence. That popup (`.newsHist`) is news.js's
+     own: it injects its base sheet BEFORE this one, so anything styled here
+     wins and anything not styled here still looks right. */
+
+  /* ── stage ────────────────────────────────────────────────────── */
+  .stage{position:relative; flex:1; min-height:0}
+  #gl{position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab}
+  #gl:active{cursor:grabbing}
+  .stage::after{content:''; position:absolute; inset:0; pointer-events:none; z-index:1;
+    background:radial-gradient(ellipse at 50% 46%, rgba(0,0,0,0) 40%, rgba(0,0,0,var(--vig)) 100%)}
+  #overlay{position:absolute; inset:0; pointer-events:none; overflow:hidden; z-index:2}
+  .floater{position:absolute; font:600 11px "Segoe UI",system-ui; color:#EDEBE0;
+    transform:translate(-50%,-50%); text-shadow:0 1px 3px rgba(0,0,0,.8); white-space:nowrap}
+  /* a milestone has to be unmissable: 17px over a rooftop was not */
+  .floater.big{font-size:26px; font-weight:700; letter-spacing:.4px;
+    text-shadow:0 2px 4px rgba(0,0,0,1), 0 3px 18px rgba(0,0,0,.95)}
+  /* speech bubbles (`.bub`) are pooled DOM projected onto #overlay — DPR-crisp
+     where an 8-14 px sprite is mush. news.js ships their base sheet (and one
+     palette per kind); nothing is restyled here, so the two never fight. */
+  /* the founding plate — 0.15 s to 4.2 s, then removed from the DOM */
+  /* The masthead is the ONE overlay whose final state is "gone": its removal is a
+     JS timer that can only fire on a frame, and a 1200-building town paints at
+     ~1 fps, so a compositor-side fade is what actually takes it off the screen. */
+  /* top:42% put the plate exactly on the altar and its ledger — the one object
+     the frame is composed around — as white text with no backing over a pale
+     sky, so for its four seconds it was both low-contrast and in the way. Up in
+     the top third it sits over sky or far country, and the scrim makes it
+     readable there without a box. */
+  #plate{position:absolute; left:50%; top:20%; transform:translate(-50%,-50%); text-align:center;
+    pointer-events:none; opacity:0; z-index:3; padding:18px 44px;
+    background:radial-gradient(ellipse at 50% 50%, rgba(10,10,12,.52) 0%, rgba(10,10,12,0) 72%)}
+  #plate .nm{font:400 30px/1.15 Georgia,"Times New Roman",serif; letter-spacing:.16em;
+    color:#F4EFE2; text-shadow:0 2px 22px rgba(0,0,0,.9)}
+  #plate .sub{margin-top:9px; font-size:12px; letter-spacing:.10em; color:#CFC8B4;
+    text-transform:lowercase}
+  #plate .rule{height:1px; margin:12px auto; width:min(420px,60vw); background:var(--accent); opacity:.8}
+  #plate.go{animation:plateIn 4s ease-out both}
+  /* 82%->100% of a 4 s animation is a long dim goodbye; the tail is now short
+     enough that the plate is either legible or gone, never a ghost. */
+  @keyframes plateIn{
+    0%{opacity:0; letter-spacing:.30em}
+    11%{opacity:1; letter-spacing:normal}
+    88%{opacity:1} 100%{opacity:0}}
+  #tip{position:absolute; display:none; background:rgba(16,16,15,.94); border:1px solid rgba(255,255,255,.18);
+    border-radius:6px; padding:6px 9px; font-size:11px; pointer-events:none; z-index:5; white-space:nowrap}
+  #tip .t1{color:#EDEBE0; font-weight:600} #tip .t2{color:#C3C2B7} #tip .t3{color:#898781}
+  #hint{position:absolute; left:50%; top:44%; transform:translate(-50%,-50%); display:none;
+    text-align:center; color:var(--muted); font-size:13px; pointer-events:none; z-index:3;
+    background:rgba(13,13,13,.55); padding:14px 22px; border-radius:10px}
+  #hint b{color:var(--ink2)}
+  #banner{position:absolute; left:50%; top:14px; transform:translateX(-50%); display:none;
+    background:rgba(60,20,20,.92); border:1px solid rgba(229,72,77,.5); color:#f0d9d9;
+    border-radius:8px; padding:8px 14px; font-size:12.5px; max-width:80%; z-index:6}
+
+  /* ── footer: hero · town · the two reward bars ────────────────── */
+  footer{flex:none; display:flex; flex-wrap:wrap; gap:26px; align-items:center; font-size:12.5px;
+    color:var(--muted); padding:7px 16px; border-top:1px solid var(--hairline)}
+  footer b{color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums}
+  footer .zB{color:var(--muted)}
+  footer .zB b{color:var(--ink2); font-weight:600}
+  footer .zC{margin-left:auto; text-align:right}
+  footer .row+.row{margin-top:1px}
+  /* the total is the hero — it is the number the user is invited to grow */
+  footer .hero{font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.05;
+    color:var(--ink); text-shadow:0 0 22px rgba(255,255,255,.14)}
+  footer .hero.flash{animation:heroFlash .6s ease-out}
+  @keyframes heroFlash{0%{filter:brightness(2.2) saturate(1.4)} 100%{filter:none}}
+  footer .heroLbl{margin-left:7px}
+  /* Only the upward comparison is coloured. The quieter branch is a plain
+     statement of fact and is styled like one — no amber, no arrow, nothing that
+     reads as a target being missed. */
+  footer .cmp{color:#8A8578} footer .cmp.up{color:#5FBF8A}
+  /* percentages are a reward channel, not a readout — and at 74 px, 5 % was
+     three pixels, i.e. a meter that never visibly moved */
+  footer .bar{display:inline-block; width:126px; height:8px; border-radius:4px; vertical-align:middle;
+    background:rgba(255,255,255,.10); overflow:hidden; margin:0 4px}
+  footer .bar i{display:block; height:100%; border-radius:4px;
+    background:linear-gradient(90deg,#8A5F1E,#D9A441,#F3D07A)}
+  footer .tag{color:#5b594f}
+  /* The headline is set to be READ, so it gives ground before it gives up: it
+     steps down twice rather than ellipsing a joke in half. news.js drops the
+     town's name out of the masthead below 900 px for the same reason. */
+  @media (max-width:1100px){
+    #news{padding:8px 14px; min-height:44px; gap:11px}
+    #newsMast{font-size:11.5px; letter-spacing:.14em; padding-right:11px}
+    #news .line{font-size:15px}
+  }
+  @media (max-width:820px){
+    .dots,#archChip{display:none}
+    footer{gap:14px} footer .bar{width:120px}
+    #news{padding:7px 12px; min-height:40px; gap:9px}
+    #newsMast{font-size:10.5px; letter-spacing:.12em; padding-right:9px}
+    #news .line{font-size:13.5px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="seal" id="seal">✦</span>
+  <h1 id="townName">Token Town</h1>
+  <span class="chip" id="archChip">—</span>
+  <span class="dots" id="palDots"></span>
+  <!-- Typographic glyphs, not colour emoji: the raster emoji were the only
+       raster-styled elements in an otherwise flat vector chrome. -->
+  <span class="chip" id="rangeBadge">◷ —</span>
+  <!-- ═══ v4: weather ═══  The sky, named. Empty (and therefore invisible,
+       because .chip:empty collapses) until weather.js has something to say —
+       a clear day is not a weather report. -->
+  <span class="chip" id="wxChip"></span>
+  <div class="meta">☀ <b id="sunTxt">—</b> &nbsp;·&nbsp; <b id="clock">—</b></div>
+</header>
+<div id="news">
+  <span id="newsMast">❖ THE CRIER</span>
+  <span class="line" id="newsLine"></span>
+</div>
+<div class="stage" id="stage">
+  <canvas id="gl"></canvas>
+  <div id="overlay"></div>
+  <div id="tip"><div class="t1"></div><div class="t2"></div><div class="t3"></div></div>
+  <div id="hint"><b>No tokens yet.</b><br>The first houses go up when the ledger does.</div>
+  <div id="banner"></div>
+</div>
+<footer id="stats"><span>waiting for data…</span></footer>
+<script type="module" src="town.js"></script>
+</body>
+</html>

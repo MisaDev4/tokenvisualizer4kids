@@ -27,6 +27,11 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
 
+        // A crash must not leave the relay's ANTHROPIC_BASE_URL behind.
+        // Observation only — the crash itself still proceeds.
+        DispatcherUnhandledException += (_, _) => _window?.ReleaseEnvironment();
+        AppDomain.CurrentDomain.UnhandledException += (_, _) => _window?.ReleaseEnvironment();
+
         _instanceMutex = new Mutex(initiallyOwned: true, InstanceMutexName, out var isFirstInstance);
         if (!isFirstInstance)
         {
@@ -102,8 +107,20 @@ public partial class App : System.Windows.Application
         Shutdown();
     }
 
+    /// <summary>Logoff and shutdown: without this the window's Closing handler
+    /// sees IsExiting == false, hides instead of disposing, and the relay's
+    /// ANTHROPIC_BASE_URL survives into the next logon pointing at a relay the
+    /// app (which doesn't start with Windows) never brings back.</summary>
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        IsExiting = true;
+        _window?.ReleaseEnvironment();
+        base.OnSessionEnding(e);
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
+        _window?.ReleaseEnvironment();
         _trayIcon?.Dispose();
         _instanceMutex?.Dispose();
         base.OnExit(e);

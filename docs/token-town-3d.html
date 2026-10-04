@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Token Town 3D</title>
+<style>
+  :root{
+    --page:#0D0D0D; --card:#1A1A19; --raised:#242423;
+    --hairline:rgba(255,255,255,.10); --ink:#FFFFFF; --ink2:#C3C2B7;
+    --muted:#898781; --accent:#3987E5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--page); color:var(--ink2);
+    font:14px/1.55 "Segoe UI", system-ui, sans-serif; padding:30px 24px 46px}
+  .wrap{max-width:1240px; margin:0 auto}
+  h1{color:var(--ink); font-size:22px; font-weight:600; margin:0 0 6px}
+  .intro{max-width:80ch; margin:0 0 14px}
+  .intro em{color:var(--muted); font-style:normal}
+  .bar{display:flex; flex-wrap:wrap; align-items:center; gap:14px; margin-bottom:12px}
+  .tabs{display:flex; background:var(--raised); border:1px solid var(--hairline);
+    border-radius:9px; padding:3px; gap:2px}
+  .tabs button{border:0; background:transparent; color:var(--muted); border-radius:7px;
+    padding:6px 14px; font:600 12.5px "Segoe UI",system-ui,sans-serif; cursor:pointer}
+  .tabs button.on{background:#3A3A38; color:var(--ink)}
+  .legend{display:flex; gap:12px; flex-wrap:wrap}
+  .chip{display:flex; align-items:center; gap:6px; font-size:12px}
+  .chip i{width:9px; height:9px; border-radius:3px; display:inline-block}
+  .actions{display:flex; gap:8px; margin-left:auto}
+  .actions button{background:var(--raised); color:var(--ink); border:1px solid var(--hairline);
+    border-radius:8px; padding:6px 13px; font:600 12.5px "Segoe UI",system-ui,sans-serif; cursor:pointer}
+  .actions button:hover{border-color:rgba(255,255,255,.25)}
+  .meta{font-size:12px; color:var(--muted)}
+  .meta b{color:var(--ink2); font-variant-numeric:tabular-nums}
+  .stage{position:relative; background:var(--card); border:1px solid var(--hairline);
+    border-radius:14px; padding:14px 14px 8px}
+  #gl{display:block; width:100%; height:560px; border-radius:8px; cursor:grab}
+  #gl:active{cursor:grabbing}
+  .overlay{position:absolute; inset:14px 14px auto 14px; height:560px; pointer-events:none; overflow:hidden}
+  .floater{position:absolute; font:600 11px "Segoe UI",system-ui; color:#EDEBE0;
+    transform:translate(-50%,-50%); text-shadow:0 1px 3px rgba(0,0,0,.8); white-space:nowrap}
+  #tip{position:absolute; display:none; background:rgba(16,16,15,.94); border:1px solid rgba(255,255,255,.18);
+    border-radius:6px; padding:6px 9px; font-size:11px; pointer-events:none; z-index:5; white-space:nowrap}
+  #tip .t1{color:#898781} #tip .t2{color:#EDEBE0}
+  .stats{display:flex; flex-wrap:wrap; gap:16px; align-items:center; font-size:12.5px;
+    color:var(--muted); padding:10px 4px 4px}
+  .stats b{color:var(--ink); font-weight:600}
+  .desc{font-size:12.5px; color:var(--muted); margin:14px 2px 0; max-width:104ch}
+  .desc b{color:var(--ink2)}
+  #fail{padding:80px 20px; text-align:center; color:var(--muted); display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Token Town 3D — the session, as a real place</h1>
+  <p class="intro">
+    Same rules as the 2D MVP — every 5 minutes builds one house per model, it ranks up live at the
+    construction site, solidifies, and joins the town; breaks plant trees; the sun is your actual sun.
+    But now it's a <b>3D world with real lighting and shadows</b>: drag to orbit, scroll to zoom, hover any
+    building for its receipt. <em>Backfilled ~4.7&nbsp;h on load, exactly like the app would from its database.</em>
+  </p>
+  <div class="bar">
+    <div class="tabs" id="speedTabs">
+      <button data-s="50" class="on">Demo ×50</button>
+      <button data-s="1">Real time</button>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="actions">
+      <button id="burst">⚡ Burst</button>
+      <button id="geo" title="Refine sunrise/sunset with your location">📍 Sync location</button>
+    </div>
+    <div class="meta">☀ <b id="sunTxt">—</b> &nbsp;·&nbsp; clock <b id="clock">—</b></div>
+  </div>
+  <div class="stage">
+    <canvas id="gl"></canvas>
+    <div class="overlay" id="overlay"></div>
+    <div id="tip"><div class="t1"></div><div class="t2"></div></div>
+    <div id="fail">three.js failed to load — this demo needs an internet connection for the CDN script.<br>
+      (In the app, the library ships inside the executable, so this never happens.)</div>
+    <div class="stats" id="stats"></div>
+  </div>
+  <p class="desc">
+    <b>Why this demo answers the “can our app do 3D?” question:</b> this exact page can be embedded in
+    Token Tracker as a WebView2 tab (the same engine Edge uses, already on this PC) with C# streaming the
+    real usage rows into it — the demo <b>is</b> the production renderer. The dependency-free alternative is
+    WPF's built-in Viewport3D: same town, simpler lighting, no browser involved. Notes in the chat.
+  </p>
+</div>
+
+<script src="https://unpkg.com/three@0.147.0/build/three.min.js"></script>
+<script>
+'use strict';
+if(!window.THREE){
+  document.getElementById('gl').style.display='none';
+  document.getElementById('fail').style.display='block';
+} else (function(){
+/* ═══ shared vocabulary (same rules as the 2D MVP) ══════════════ */
+const MODELS = [
+  {id:'fable',  label:'Fable',  color:0x3987E5, css:'#3987E5', w:.50},
+  {id:'sonnet', label:'Sonnet', color:0x9085E9, css:'#9085E9', w:.22},
+  {id:'opus',   label:'Opus',   color:0xE5484D, css:'#E5484D', w:.16},
+  {id:'haiku',  label:'Haiku',  color:0x199E70, css:'#199E70', w:.12},
+];
+const MIDX={fable:0,sonnet:1,opus:2,haiku:3};
+const INT_MS=5*60*1000, MIN_HOUSE_TOK=900;
+const TIERS=[
+  {tok:0,name:'Tent'},{tok:6000,name:'Shack'},{tok:18000,name:'Cabin'},
+  {tok:45000,name:'Cottage'},{tok:90000,name:'House'},{tok:160000,name:'Villa'},
+  {tok:260000,name:'Manor'},{tok:400000,name:'Keep'}];
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,k)=>a+(b-a)*k;
+const easeOutBack=k=>{const c1=1.70158,c3=c1+1;return 1+c3*Math.pow(k-1,3)+c1*Math.pow(k-1,2);};
+const rand=(a,b)=>a+Math.random()*(b-a);
+const fmtTok=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1000?Math.round(n/1000)+'k':''+n;
+const tierOf=tok=>{let t=0;for(let i=0;i<TIERS.length;i++)if(tok>=TIERS[i].tok)t=i;return t;};
+function pickModel(){let r=Math.random();for(const m of MODELS){if((r-=m.w)<=0)return m;}return MODELS[0];}
+const seededR=s=>{const x=Math.sin(s*127.1+311.7)*43758.5453;return x-Math.floor(x);};
+const fmtClock=ms=>{const d=new Date(ms);
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;};
+
+document.getElementById('legend').innerHTML = MODELS.map(m=>
+  `<span class="chip"><i style="background:${m.css}"></i>${m.label}</span>`).join('')
+  +`<span class="chip"><i style="background:#55684A;border-radius:50%"></i>break</span>`;
+
+/* ═══ solar clock ═══════════════════════════════════════════════ */
+let lat=50, sunSr=6, sunSs=20;
+function computeSun(){
+  const d=new Date(), start=new Date(d.getFullYear(),0,0);
+  const doy=Math.floor((d-start)/864e5);
+  const decl=-23.44*Math.cos(2*Math.PI*(doy+10)/365)*Math.PI/180;
+  const cosH=clamp(-Math.tan(lat*Math.PI/180)*Math.tan(decl),-1,1);
+  const half=Math.acos(cosH)/(2*Math.PI)*24;
+  sunSr=12-half; sunSs=12+half;
+  const f=h=>`${String(Math.floor(h)).padStart(2,'0')}:${String(Math.floor(h%1*60)).padStart(2,'0')}`;
+  document.getElementById('sunTxt').textContent=`${f(sunSr)} → ${f(sunSs)}`;
+}
+computeSun();
+document.getElementById('geo').onclick=()=>{
+  if(!navigator.geolocation){ document.getElementById('geo').textContent='📍 unavailable'; return; }
+  navigator.geolocation.getCurrentPosition(
+    p=>{ lat=p.coords.latitude; computeSun(); document.getElementById('geo').textContent='📍 synced'; },
+    ()=>{ document.getElementById('geo').textContent='📍 blocked (50°N)'; });
+};
+const dayAmount=h=>{
+  if(h<sunSr-1.2||h>sunSs+1.2) return 0;
+  if(h>sunSr+.9&&h<sunSs-.9) return 1;
+  return h<12 ? (h-(sunSr-1.2))/2.1 : ((sunSs+1.2)-h)/2.1;
+};
+
+/* ═══ renderer / scene ══════════════════════════════════════════ */
+const canvas=document.getElementById('gl');
+const renderer=new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.outputEncoding=THREE.sRGBEncoding;
+const scene=new THREE.Scene();
+scene.fog=new THREE.FogExp2(0x0b0e14,.0028);
+const camera=new THREE.PerspectiveCamera(46,2,.1,400);
+
+const hemi=new THREE.HemisphereLight(0xbdd3ea,0x2a2d26,.5); scene.add(hemi);
+const sun=new THREE.DirectionalLight(0xffe0b0,1);
+sun.castShadow=true;
+sun.shadow.mapSize.set(2048,2048);
+Object.assign(sun.shadow.camera,{left:-55,right:55,top:55,bottom:-55,near:5,far:220});
+sun.shadow.bias=-0.0012;
+scene.add(sun); scene.add(sun.target);
+const moon=new THREE.DirectionalLight(0x8ea4c8,.16); scene.add(moon);
+// visible sun disc
+const sunBall=new THREE.Mesh(new THREE.SphereGeometry(3,16,12),
+  new THREE.MeshBasicMaterial({color:0xffe2a8, fog:false}));
+scene.add(sunBall);
+
+// ground
+const ground=new THREE.Mesh(new THREE.CircleGeometry(150,48),
+  new THREE.MeshStandardMaterial({color:0x2b2f24, roughness:1}));
+ground.rotation.x=-Math.PI/2; ground.receiveShadow=true; scene.add(ground);
+
+// stars
+const starGeo=new THREE.BufferGeometry();
+{
+  const p=new Float32Array(420*3);
+  for(let i=0;i<420;i++){
+    const a=rand(0,Math.PI*2), e=rand(.12,1.35), r=170;
+    p[i*3]=Math.cos(a)*Math.cos(e)*r; p[i*3+1]=Math.sin(e)*r; p[i*3+2]=Math.sin(a)*Math.cos(e)*r;
+  }
+  starGeo.setAttribute('position',new THREE.BufferAttribute(p,3));
+}
+const starMat=new THREE.PointsMaterial({color:0xdce1eb,size:.7,transparent:true,opacity:0,fog:false,depthWrite:false});
+scene.add(new THREE.Points(starGeo,starMat));
+
+/* ═══ town layout ═══════════════════════════════════════════════ */
+const PER_ROW=9, COLW=7.0, ROWD=8.6;
+function plotPos(idx){
+  const r=Math.floor(idx/PER_ROW), c=idx%PER_ROW;
+  const jx=(seededR(idx*7+3)-.5)*2.2, jz=(seededR(idx*5+11)-.5)*2.2;
+  return new THREE.Vector3(-((PER_ROW-1)/2)*COLW + c*COLW + jx, 0, -6 - r*ROWD + jz);
+}
+const SITE=new THREE.Vector3(((PER_ROW-1)/2)*COLW+9, 0, 2);
+const sitePos=j=>SITE.clone().add(new THREE.Vector3(0,0,-j*7));
+
+// plot slabs & site decor
+const slabGeo=new THREE.BoxGeometry(5.6,.08,5.6);
+const slabMat=new THREE.MeshStandardMaterial({color:0x33372b, roughness:1});
+function addSlab(v){ const m=new THREE.Mesh(slabGeo,slabMat); m.position.copy(v); m.position.y=.04; m.receiveShadow=true; scene.add(m); return m; }
+{ // construction site: corner posts + tape
+  const post=new THREE.BoxGeometry(.16,1,.16);
+  const postM=new THREE.MeshStandardMaterial({color:0xb8a24c});
+  const tapeM=new THREE.MeshBasicMaterial({color:0xd9c25e});
+  for(const [dx,dz] of [[-3.4,-3.4],[3.4,-3.4],[-3.4,3.4],[3.4,3.4]]){
+    const p=new THREE.Mesh(post,postM); p.position.set(SITE.x+dx,.5,SITE.z+dz); p.castShadow=true; scene.add(p);
+  }
+  for(const [x,z,w,d] of [[0,-3.4,6.8,.05],[0,3.4,6.8,.05],[-3.4,0,.05,6.8],[3.4,0,.05,6.8]]){
+    const t=new THREE.Mesh(new THREE.BoxGeometry(w,.06,d),tapeM);
+    t.position.set(SITE.x+x,.86,SITE.z+z); scene.add(t);
+  }
+  addSlab(SITE);
+}
+// streetlamps along the front
+const lampGlow=[];
+for(let i=-1;i<=1;i++){
+  const g=new THREE.Group();
+  const pole=new THREE.Mesh(new THREE.CylinderGeometry(.07,.09,2.6,6),
+    new THREE.MeshStandardMaterial({color:0x4a4a46}));
+  pole.position.y=1.3; pole.castShadow=true; g.add(pole);
+  const bulbM=new THREE.MeshBasicMaterial({color:0xffd68c});
+  const bulb=new THREE.Mesh(new THREE.SphereGeometry(.22,10,8),bulbM);
+  bulb.position.y=2.7; g.add(bulb);
+  const pt=new THREE.PointLight(0xffd68c,0,14,2); pt.position.y=2.8; g.add(pt);
+  g.position.set(i*16,0,3.2);
+  scene.add(g); lampGlow.push({bulbM,pt});
+}
+
+/* ═══ meshes: houses & trees ════════════════════════════════════ */
+function std(color,extra){ return new THREE.MeshStandardMaterial(Object.assign({color,roughness:.85},extra)); }
+function shade(hex,k){ // k<0 darken toward black, k>0 lighten toward white
+  const c=new THREE.Color(hex), t=new THREE.Color(k<0?0x000000:0xffffff);
+  return c.lerp(t,Math.abs(k)).getHex();
+}
+function pyramid(w,d,h,color){
+  const m=new THREE.Mesh(new THREE.ConeGeometry(.72,1,4),std(color,{roughness:.7}));
+  m.rotation.y=Math.PI/4;
+  m.scale.set(w*.78,h,d*.78);
+  return m;
+}
+function box(w,h,d,color,extra){ return new THREE.Mesh(new THREE.BoxGeometry(w,h,d),std(color,extra)); }
+function addWindows(g,count,wallW,wallH,wallD,seed){
+  const mats=[];
+  for(let i=0;i<count;i++){
+    const m=new THREE.MeshStandardMaterial({color:0x11141c, emissive:0xffd68c, emissiveIntensity:0});
+    const win=new THREE.Mesh(new THREE.BoxGeometry(.4,.5,.06),m);
+    const side=i%2?1:-1, k=Math.floor(i/2);
+    win.position.set(-wallW/2+.7+(k*.9)%Math.max(wallW-1.2,.9),
+                     wallH*.42+((seededR(seed+i)<.5&&wallH>2.4)?wallH*.34:0),
+                     side*(wallD/2+.03));
+    g.add(win); if(seededR(seed+40+i)<.8) mats.push(m); // ~80 % of windows light up
+  }
+  return mats;
+}
+function buildHouse(tier,colorHex,seed){
+  const g=new THREE.Group();
+  const wall=shade(colorHex,-.42), wall2=shade(colorHex,-.28), roof=colorHex, trim=shade(colorHex,.3);
+  let winMats=[], hTop=1.6;
+  if(tier===0){
+    const t=new THREE.Mesh(new THREE.ConeGeometry(1.15,1.5,4),std(wall2));
+    t.position.y=.75; t.rotation.y=Math.PI/4; g.add(t); hTop=1.5;
+  } else if(tier===1){
+    const b=box(2.4,1.3,2,wall); b.position.y=.65; g.add(b);
+    const r=box(2.7,.16,2.3,roof); r.position.y=1.4; g.add(r); hTop=1.5;
+  } else if(tier===2){
+    const b=box(2.6,1.7,2.2,wall); b.position.y=.85; g.add(b);
+    const r=pyramid(2.6,2.2,1.1,roof); r.position.y=2.25; g.add(r);
+    winMats=addWindows(g,2,2.6,1.4,2.2,seed); hTop=2.9;
+  } else if(tier===3){
+    const b=box(3,2,2.6,wall); b.position.y=1; g.add(b);
+    const r=pyramid(3,2.6,1.3,roof); r.position.y=2.65; g.add(r);
+    const ch=box(.34,.9,.34,trim); ch.position.set(.9,2.7,.4); g.add(ch);
+    winMats=addWindows(g,3,3,1.7,2.6,seed); hTop=3.4;
+  } else if(tier===4){
+    const b=box(3.2,2.6,2.8,wall); b.position.y=1.3; g.add(b);
+    const r=pyramid(3.2,2.8,1.5,roof); r.position.y=3.35; g.add(r);
+    const ch=box(.36,1,.36,trim); ch.position.set(-1,3.4,.5); g.add(ch);
+    winMats=addWindows(g,4,3.2,2.2,2.8,seed); hTop=4.2;
+  } else if(tier===5){
+    const b1=box(3.4,1.8,3,wall); b1.position.y=.9; g.add(b1);
+    const b2=box(3.4,1.7,3,wall2); b2.position.y=2.65; g.add(b2);
+    const r=pyramid(3.4,3,1.6,roof); r.position.y=4.3; g.add(r);
+    const ch=box(.38,1,.38,trim); ch.position.set(1.1,4.4,-.5); g.add(ch);
+    winMats=addWindows(g,6,3.4,3,3,seed); hTop=5.2;
+  } else if(tier===6){
+    const b1=box(3.6,1.9,3.2,wall); b1.position.y=.95; g.add(b1);
+    const b2=box(3.6,1.8,3.2,wall2); b2.position.y=2.75; g.add(b2);
+    const r=pyramid(3.6,3.2,1.7,roof); r.position.y=4.5; g.add(r);
+    const wing=box(2,1.7,2,wall); wing.position.set(2.6,.85,.4); g.add(wing);
+    const wr=pyramid(2,2,1,roof); wr.position.set(2.6,2.2,.4); g.add(wr);
+    const ch=box(.38,1.1,.38,trim); ch.position.set(-1.2,4.6,.5); g.add(ch);
+    winMats=addWindows(g,7,3.6,3.2,3.2,seed); hTop=5.5;
+  } else {
+    const t=new THREE.Mesh(new THREE.CylinderGeometry(1.7,1.9,4.6,10),std(wall));
+    t.position.y=2.3; g.add(t);
+    for(let i=0;i<8;i++){
+      const m=box(.5,.5,.5,wall2);
+      const a=i/8*Math.PI*2;
+      m.position.set(Math.cos(a)*1.55,4.85,Math.sin(a)*1.55); g.add(m);
+    }
+    const pole=new THREE.Mesh(new THREE.CylinderGeometry(.05,.05,1.6,5),std(0xc3c2b7));
+    pole.position.y=5.7; g.add(pole);
+    const flag=new THREE.Mesh(new THREE.PlaneGeometry(1.1,.6),
+      new THREE.MeshBasicMaterial({color:colorHex,side:THREE.DoubleSide}));
+    flag.position.set(.6,6.1,0); g.add(flag); g.userData.flag=flag;
+    const win=addWindows(g,4,2.6,3.6,3.1,seed); winMats=win; hTop=6.7;
+  }
+  g.traverse(o=>{ if(o.isMesh){o.castShadow=true; o.receiveShadow=true;} });
+  g.userData.winMats=winMats; g.userData.hTop=hTop;
+  return g;
+}
+function buildTree(seed){
+  const g=new THREE.Group();
+  const trunk=new THREE.Mesh(new THREE.CylinderGeometry(.13,.18,.8,6),std(0x4a3a28));
+  trunk.position.y=.4; g.add(trunk);
+  const c1=new THREE.Mesh(new THREE.ConeGeometry(.95,1.7,7),std(0x46573d));
+  c1.position.y=1.5; g.add(c1);
+  const c2=new THREE.Mesh(new THREE.ConeGeometry(.65,1.2,7),std(0x55684a));
+  c2.position.y=2.3; g.add(c2);
+  const s=.8+seededR(seed)*.5; g.scale.set(s,s,s);
+  g.traverse(o=>{ if(o.isMesh){o.castShadow=true; o.receiveShadow=true;} });
+  return g;
+}
+function disposeGroup(g){
+  g.traverse(o=>{ if(o.isMesh){ o.geometry.dispose(); (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>m.dispose()); } });
+}
+// scaffolding around the live build
+function buildScaffold(){
+  const g=new THREE.Group(), m=new THREE.MeshBasicMaterial({color:0xb8a24c});
+  for(const [dx,dz] of [[-2.2,-2.2],[2.2,-2.2],[-2.2,2.2],[2.2,2.2]]){
+    const p=new THREE.Mesh(new THREE.BoxGeometry(.09,1,.09),m);
+    p.position.set(dx,.5,dz); g.add(p);
+  }
+  for(const [x,z,w,d] of [[0,-2.2,4.4,.07],[0,2.2,4.4,.07],[-2.2,0,.07,4.4],[2.2,0,.07,4.4]]){
+    const b=new THREE.Mesh(new THREE.BoxGeometry(w,.07,d),m);
+    b.position.set(x,1,z); g.add(b);
+  }
+  return g;
+}
+
+/* ═══ particles + floaters ══════════════════════════════════════ */
+const MAXP=600;
+const pGeo=new THREE.BufferGeometry();
+const pPos=new Float32Array(MAXP*3), pCol=new Float32Array(MAXP*3);
+pGeo.setAttribute('position',new THREE.BufferAttribute(pPos,3));
+pGeo.setAttribute('color',new THREE.BufferAttribute(pCol,3));
+const parts=Array.from({length:MAXP},()=>({life:0}));
+scene.add(new THREE.Points(pGeo,new THREE.PointsMaterial({size:.32,vertexColors:true,transparent:true,opacity:.95,depthWrite:false})));
+function burst3d(v,colorHex,n,spd=6){
+  const c=new THREE.Color(colorHex);
+  for(let i=0;i<MAXP&&n>0;i++){
+    const p=parts[i]; if(p.life>0) continue;
+    n--;
+    p.life=p.max=rand(.5,1.1);
+    p.x=v.x; p.y=v.y; p.z=v.z;
+    const a=rand(0,Math.PI*2), e=rand(.3,1.4), s=rand(spd*.4,spd);
+    p.vx=Math.cos(a)*Math.cos(e)*s; p.vy=Math.sin(e)*s; p.vz=Math.sin(a)*Math.cos(e)*s;
+    pCol[i*3]=c.r; pCol[i*3+1]=c.g; pCol[i*3+2]=c.b;
+  }
+}
+function stepParts(dt){
+  for(let i=0;i<MAXP;i++){
+    const p=parts[i];
+    if(p.life>0){
+      p.life-=dt; p.vy-=14*dt;
+      p.x+=p.vx*dt; p.y+=p.vy*dt; p.z+=p.vz*dt;
+      if(p.y<0){p.y=0;p.vy*=-.3;}
+      pPos[i*3]=p.x; pPos[i*3+1]=p.y; pPos[i*3+2]=p.z;
+    } else pPos[i*3+1]=-999;
+  }
+  pGeo.attributes.position.needsUpdate=true;
+}
+const overlay=document.getElementById('overlay');
+let floaters=[];
+function floatText(v,txt,color){
+  if(floaters.length>14) return;
+  const el=document.createElement('div');
+  el.className='floater'; el.textContent=txt; if(color)el.style.color=color;
+  overlay.appendChild(el);
+  floaters.push({el, v:v.clone(), age:0});
+}
+
+/* ═══ session state (same sim as the 2D MVP) ════════════════════ */
+let plots=[], cur={}, curOrder=[], intervalStart=0, sessionStart=0;
+function makeEnt(kind,extra){ return Object.assign({kind, popT:1, group:null}, extra); }
+function mountEnt(e, pos){
+  addSlab(pos);
+  e.group = e.kind==='tree' ? buildTree(e.seed) : buildHouse(tierOf(e.tok), MODELS[MIDX[e.model]].color, e.seed);
+  e.group.position.copy(pos);
+  e.group.traverse(o=>{ o.userData.ent=e; });
+  scene.add(e.group);
+}
+function rebuildHouseMesh(e, pos){
+  if(e.group){ scene.remove(e.group); disposeGroup(e.group); }
+  e.group=buildHouse(tierOf(e.tok), MODELS[MIDX[e.model]].color, e.seed);
+  e.group.position.copy(pos);
+  e.group.traverse(o=>{ o.userData.ent=e; });
+  scene.add(e.group);
+}
+function addTokens(model,tokens){
+  let h=cur[model];
+  if(!h){
+    h=makeEnt('house',{model, tok:0, seed:Math.floor(rand(1,1e6)),
+      start:intervalStart, end:intervalStart+INT_MS, bumpT:1});
+    cur[model]=h; curOrder.push(model);
+  }
+  const before=h.group?tierOf(h.tok):-1;
+  h.tok+=tokens;
+  const j=curOrder.indexOf(model), sp=sitePos(j);
+  if(h.tok>=MIN_HOUSE_TOK){
+    const after=tierOf(h.tok);
+    if(after!==before){
+      rebuildHouseMesh(h,sp);
+      h.popT=0;
+      if(before>=0){
+        floatText(sp.clone().setY(h.group.userData.hTop+1.2),'⭐ '+TIERS[after].name+'!',MODELS[MIDX[model]].css);
+        burst3d(sp.clone().setY(h.group.userData.hTop*.6),MODELS[MIDX[model]].color,26);
+      }
+    } else h.bumpT=0;
+  }
+  floatText(sp.clone().setY((h.group?h.group.userData.hTop:1)+.6),'+'+fmtTok(tokens));
+}
+const scaffold=buildScaffold(); scene.add(scaffold); scaffold.visible=false;
+let flights=[];
+function finalizeInterval(){
+  let built=0;
+  for(const m of curOrder){
+    const h=cur[m];
+    if(h.tok>=MIN_HOUSE_TOK&&h.group){
+      const from=sitePos(curOrder.indexOf(m)), to=plotPos(plots.length);
+      plots.push(h); built++;
+      addSlab(to);
+      flights.push({e:h, from:from.clone(), to, t:0});
+    } else if(h.group){ scene.remove(h.group); disposeGroup(h.group); }
+  }
+  if(!built){
+    const tr=makeEnt('tree',{seed:Math.floor(rand(1,1e6)), start:intervalStart, end:intervalStart+INT_MS, popT:0});
+    const to=plotPos(plots.length);
+    plots.push(tr); mountEnt(tr,to);
+    tr.group.scale.setScalar(.01);
+  }
+  cur={}; curOrder=[];
+  intervalStart+=INT_MS;
+}
+const SESSION_LOOKBACK=4.7*3600*1000;
+function backfill(realNow){
+  sessionStart=Math.floor((realNow-SESSION_LOOKBACK)/INT_MS)*INT_MS;
+  let t=sessionStart, working=true;
+  while(t+INT_MS<=realNow){
+    working=Math.random()<(working?.8:.38);
+    if(!working){
+      const tr=makeEnt('tree',{seed:Math.floor(rand(1,1e6)),start:t,end:t+INT_MS});
+      plots.push(tr); mountEnt(tr,plotPos(plots.length-1));
+    } else {
+      const total=3000+Math.pow(Math.random(),1.7)*rand(80000,420000);
+      const list=[pickModel()];
+      if(Math.random()<.3){ const m2=pickModel(); if(m2.id!==list[0].id) list.push(m2); }
+      const share=list.length===1?[1]:[rand(.6,.85),0]; if(share.length>1)share[1]=1-share[0];
+      for(let i=0;i<list.length;i++){
+        const tok=Math.round(total*(share[i]||1));
+        if(tok<MIN_HOUSE_TOK) continue;
+        const h=makeEnt('house',{model:list[i].id, tok, seed:Math.floor(rand(1,1e6)), start:t, end:t+INT_MS});
+        plots.push(h); mountEnt(h,plotPos(plots.length-1));
+      }
+    }
+    t+=INT_MS;
+  }
+  intervalStart=t;
+}
+
+/* ═══ camera: custom orbit + idle auto-rotate ═══════════════════ */
+const target=new THREE.Vector3(7,1.2,-11);
+let az=.62, pol=.40, dist=56, idleT=0;
+function applyCam(){
+  const y=Math.sin(pol)*dist, r=Math.cos(pol)*dist;
+  camera.position.set(target.x+Math.sin(az)*r, target.y+y, target.z+Math.cos(az)*r);
+  camera.lookAt(target);
+}
+let drag=null;
+canvas.addEventListener('pointerdown',e=>{ drag={x:e.clientX,y:e.clientY}; idleT=0; });
+window.addEventListener('pointermove',e=>{
+  if(!drag) return;
+  az-=(e.clientX-drag.x)*.006; pol=clamp(pol+(e.clientY-drag.y)*.004,.12,1.2);
+  drag={x:e.clientX,y:e.clientY}; idleT=0;
+});
+window.addEventListener('pointerup',()=>{ drag=null; });
+canvas.addEventListener('wheel',e=>{ e.preventDefault(); dist=clamp(dist*(1+e.deltaY*.001),18,110); idleT=0; },{passive:false});
+
+/* ═══ hover receipts ════════════════════════════════════════════ */
+const ray=new THREE.Raycaster(), tip=document.getElementById('tip');
+let mouseNDC=null, mousePx=null;
+canvas.addEventListener('mousemove',e=>{
+  const r=canvas.getBoundingClientRect();
+  mousePx={x:e.clientX-r.left, y:e.clientY-r.top};
+  mouseNDC={x:(mousePx.x/r.width)*2-1, y:-(mousePx.y/r.height)*2+1};
+});
+canvas.addEventListener('mouseleave',()=>{ mouseNDC=null; tip.style.display='none'; });
+
+/* ═══ clock / sim ═══════════════════════════════════════════════ */
+let speed=50, realBase=performance.now(), wallBase=Date.now(), simAcc=0;
+document.querySelectorAll('#speedTabs button').forEach(b=>{
+  b.onclick=()=>{ document.querySelectorAll('#speedTabs button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); speed=+b.dataset.s; };
+});
+let evAcc=0, burstEnv=0, burstQ=[];
+const makeTokens=()=>1500+Math.floor(Math.pow(Math.random(),2.2)*35000);
+function genEvents(simDtMs, now){
+  while(burstQ.length&&burstQ[0]<=now){ burstQ.shift(); addTokens(pickModel().id, makeTokens()); }
+  if(Math.random()<simDtMs/60000*.5) burstEnv=Math.min(3,burstEnv+rand(1,2));
+  burstEnv*=Math.pow(.5,simDtMs/60000/1.5);
+  evAcc+=simDtMs/60000*(3.2+burstEnv*5);
+  while(evAcc>=1){ evAcc-=1; addTokens(pickModel().id, makeTokens()); }
+}
+document.getElementById('burst').onclick=()=>{
+  const now=performance.now(), n=Math.round(rand(9,14));
+  for(let i=0;i<n;i++) burstQ.push(now+i*140+rand(0,80));
+  burstQ.sort((a,b)=>a-b);
+};
+
+/* ═══ main loop ═════════════════════════════════════════════════ */
+const statsEl=document.getElementById('stats'), clockEl=document.getElementById('clock');
+const skyDay=new THREE.Color(0x8fb8e0), skyNight=new THREE.Color(0x070a14), skyCur=new THREE.Color();
+let last=performance.now(), statT=0;
+function resize(){
+  const r=canvas.getBoundingClientRect();
+  const w=Math.round(r.width), h=560;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+  renderer.setSize(w,h,false);
+  camera.aspect=w/h; camera.updateProjectionMatrix();
+}
+function tick(now){
+  const dt=clamp((now-last)/1000,0,.05); last=now;
+  simAcc+=dt*1000*(speed-1);
+  const simNow=wallBase+(now-realBase)+simAcc;
+  genEvents(dt*1000*speed, now);
+  while(simNow-intervalStart>=INT_MS) finalizeInterval();
+
+  // day/night
+  const d=new Date(simNow), hcur=d.getHours()+d.getMinutes()/60+d.getSeconds()/3600;
+  const day=dayAmount(hcur), night=1-day;
+  skyCur.copy(skyNight).lerp(skyDay,day);
+  scene.background=skyCur; scene.fog.color.copy(skyCur);
+  const st=clamp((hcur-sunSr)/Math.max(sunSs-sunSr,.1),0,1);
+  const sunA=Math.PI*(1-st), sunE=Math.sin(Math.PI*st)*1.05+.06;
+  sun.position.set(Math.cos(sunA)*70, Math.sin(sunE)*70, -20);
+  sun.intensity=day*1.45;
+  const glowK=Math.max(0,1-Math.abs(hcur-sunSr)/1.3,1-Math.abs(hcur-sunSs)/1.3);
+  sun.color.setHex(glowK>.3?0xffb877:0xffe0b0);
+  sunBall.position.copy(sun.position).multiplyScalar(1.9);
+  sunBall.visible=day>.02;
+  moon.position.set(-40,50,30); moon.intensity=.05+night*.14;
+  hemi.intensity=.16+day*.38;
+  starMat.opacity=night*.9;
+  for(const l of lampGlow){ l.pt.intensity=night*1.1;
+    l.bulbM.color.setHex(0xffd68c).multiplyScalar(.35+night*.75); }
+
+  // window lights
+  const winI=night*1.4+.04;
+  for(const e of plots) if(e.kind==='house'&&e.group)
+    for(const m of e.group.userData.winMats) m.emissiveIntensity=winI;
+  for(const m of curOrder){ const h=cur[m];
+    if(h.group) for(const w of h.group.userData.winMats) w.emissiveIntensity=winI; }
+
+  // anims: pops, bumps, flags, flights
+  const all=[...plots, ...curOrder.map(m=>cur[m])];
+  for(const e of all){
+    if(!e.group) continue;
+    if(e.popT<1){ e.popT=Math.min(1,e.popT+dt*2.4); const s=easeOutBack(e.popT); e.group.scale.setScalar(Math.max(s,.01)); }
+    if(e.bumpT!==undefined&&e.bumpT<1){ e.bumpT=Math.min(1,e.bumpT+dt*3);
+      const b=1+.08*Math.sin(e.bumpT*Math.PI); e.group.scale.y=b; }
+    const f=e.group.userData.flag;
+    if(f) f.rotation.y=Math.sin(now/300+e.seed)*.5;
+  }
+  for(let i=flights.length-1;i>=0;i--){
+    const F=flights[i]; F.t=Math.min(1,F.t+dt*1.4);
+    const k=F.t<.5?2*F.t*F.t:1-Math.pow(-2*F.t+2,2)/2;
+    F.e.group.position.lerpVectors(F.from,F.to,k);
+    F.e.group.position.y=Math.sin(Math.PI*k)*5;
+    if(F.t>=1){
+      F.e.group.position.copy(F.to);
+      burst3d(F.to.clone().setY(.3),0xb8ae96,14,3.5);
+      flights.splice(i,1);
+    }
+  }
+  // scaffolding follows the biggest live build
+  const lead=curOrder.length?cur[curOrder[0]]:null;
+  scaffold.visible=!!(lead&&lead.group);
+  if(scaffold.visible){
+    scaffold.position.copy(sitePos(0));
+    const h=lead.group.userData.hTop;
+    scaffold.children.forEach((c,ci)=>{ if(ci<4){ c.scale.y=h*.9; c.position.y=h*.45; } else c.position.y=h*.92; });
+  }
+  stepParts(dt);
+  // floaters (project to screen)
+  const r=canvas.getBoundingClientRect(), v=new THREE.Vector3();
+  for(let i=floaters.length-1;i>=0;i--){
+    const f=floaters[i]; f.age+=dt; f.v.y+=dt*1.4;
+    v.copy(f.v).project(camera);
+    f.el.style.left=((v.x+1)/2*r.width)+'px';
+    f.el.style.top=((-v.y+1)/2*560)+'px';
+    f.el.style.opacity=Math.max(0,1-f.age/1.4);
+    if(f.age>1.4){ f.el.remove(); floaters.splice(i,1); }
+  }
+  // camera
+  idleT+=dt; if(idleT>3) az+=dt*.05;
+  applyCam();
+  // hover receipt
+  if(mouseNDC){
+    ray.setFromCamera(mouseNDC,camera);
+    const hits=ray.intersectObjects(scene.children,true);
+    const ent=hits.find(h=>h.object.userData.ent)?.object.userData.ent;
+    if(ent){
+      tip.style.display='block';
+      tip.style.left=(mousePx.x+16)+'px'; tip.style.top=(mousePx.y+2)+'px';
+      tip.children[0].textContent=`${fmtClock(ent.start)}–${fmtClock(ent.end)}`;
+      tip.children[1].textContent=ent.kind==='tree'?'break 🌳'
+        :`${MODELS[MIDX[ent.model]].label} · ${fmtTok(ent.tok)} tokens · ${TIERS[tierOf(ent.tok)].name}`;
+    } else tip.style.display='none';
+  }
+  clockEl.textContent=fmtClock(simNow)+(speed>1?` (×${speed})`:'');
+  statT-=dt;
+  if(statT<=0){
+    statT=.5;
+    const counts={fable:0,sonnet:0,opus:0,haiku:0}; let trees=0,total=0,best=null;
+    for(const p of [...plots,...curOrder.map(m=>cur[m]).filter(h=>h.tok>=MIN_HOUSE_TOK)]){
+      if(p.kind==='tree'){trees++;continue;}
+      counts[p.model]++; total+=p.tok;
+      if(!best||p.tok>best.tok)best=p;
+    }
+    statsEl.innerHTML=
+      `<span>🏘 <b>${Object.values(counts).reduce((a,b)=>a+b,0)}</b> buildings</span>`+
+      MODELS.map(m=>`<span class="chip"><i style="background:${m.css}"></i><b>${counts[m.id]}</b></span>`).join('')+
+      `<span>🌳 <b>${trees}</b> breaks</span>`+
+      `<span><b>${fmtTok(total)}</b> tokens this session</span>`+
+      (best?`<span>grandest: <b>${TIERS[tierOf(best.tok)].name}</b> (${MODELS[MIDX[best.model]].label})</span>`:'')+
+      `<span>since <b>${fmtClock(sessionStart)}</b> — backfilled</span>`;
+  }
+  renderer.render(scene,camera);
+}
+function frame(now){ tick(now); requestAnimationFrame(frame); }
+window.__tick=tick;   // manual stepping for automated tests
+
+resize();
+window.addEventListener('resize',resize);
+backfill(Date.now());
+applyCam();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

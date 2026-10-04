@@ -12,6 +12,16 @@ public static class AppPaths
 
     public static string PricingCachePath => Path.Combine(DataDirectory, "pricing-litellm.json");
 
+    public static string AgentsScanLogPath => Path.Combine(DataDirectory, "agents-scan.log");
+
+    public static string RequestCapturesPath => Path.Combine(DataDirectory, "request-captures");
+
+    public static string TranscriptVaultPath => Path.Combine(DataDirectory, "transcript-vault");
+
+    /// <summary>Where Codex writes its rollout traces while CODEX_ROLLOUT_TRACE_ROOT
+    /// points here; see <see cref="CodexTraces"/>.</summary>
+    public static string CodexTracesPath => Path.Combine(DataDirectory, "codex-traces");
+
     public static string CodexSessionsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".codex",
@@ -26,6 +36,7 @@ public static class AppPaths
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".claude",
         "transcripts");
+
 
     public static void EnsureDataDirectory() => Directory.CreateDirectory(DataDirectory);
 

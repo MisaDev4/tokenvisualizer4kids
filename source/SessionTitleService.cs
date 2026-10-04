@@ -227,7 +227,7 @@ public sealed class SessionTitleService
 
                 if (content.ValueKind == JsonValueKind.String)
                 {
-                    var prompt = CleanPrompt(content.GetString());
+                    var prompt = CleanPrompt(TextOf(content));
                     if (prompt is not null)
                     {
                         return prompt;
@@ -378,8 +378,30 @@ public sealed class SessionTitleService
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
 
     private static string? StringOf(JsonElement element, string name) =>
-        element.ValueKind == JsonValueKind.Object &&
-        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value)
+            ? TextOf(value)
             : null;
+
+    /// <summary>A JSON string, or null when its text cannot be decoded. A prompt
+    /// that quotes a message truncated mid-emoji leaves an unpaired surrogate
+    /// escape (a \ud83d with no low half): JsonDocument.Parse accepts the line —
+    /// escapes are unescaped lazily — and GetString() then throws on the broken
+    /// pair. These titles are a convenience, so an unreadable one falls back to
+    /// the folder name instead of taking the app down from a background scan.</summary>
+    private static string? TextOf(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        try
+        {
+            return value.GetString();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
 }

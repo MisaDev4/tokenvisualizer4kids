@@ -125,20 +125,84 @@ public sealed class PricingService
                   pricing.CacheWrite,
                   (200_000, pricing.CacheWriteAbove200K));
 
+        cost += CacheWrite1HrSurcharge(pricing, tokens);
+
         return new PricingEstimate(double.IsFinite(cost) && cost >= 0 ? cost : 0, true);
     }
 
     private PricingResolution Resolve(string provider, string rawModel)
     {
+        var multiplier = SpeedMultiplier(rawModel);
         var model = NormalizeModel(rawModel);
-        if (TryFind(_catalog, model, provider, out var pricing) ||
-            TryFind(_fallback, model, provider, out pricing))
+        var lookup = PricingAliases.TryGetValue(model, out var standIn) ? standIn : model;
+        if (TryFind(_catalog, lookup, provider, out var pricing) ||
+            TryFind(_fallback, lookup, provider, out pricing))
         {
-            return new PricingResolution(pricing);
+            return new PricingResolution(Scale(pricing, multiplier));
         }
 
-        return new PricingResolution(MatchClaudeFamily(provider, model));
+        return new PricingResolution(Scale(MatchClaudeFamily(provider, model), multiplier));
     }
+
+    /// <summary>
+    /// Models billed at another model's rates. A stealth preview is free while it is
+    /// being trialled, which is honest but leaves it invisible on a cost chart — every
+    /// block reads $0. Pointing it at a comparable model prices the work as if it were
+    /// bought, so the usage shows up next to everything else.
+    /// <para>
+    /// These are stand-ins, not published prices: the numbers are what the named model
+    /// would have cost, not what was actually charged. The alias resolves through the
+    /// normal lookup, so it tracks that model's real rate — including Sonnet 5's
+    /// introductory pricing while it lasts — instead of freezing a copy that quietly
+    /// goes stale. A real published price for the model itself still wins: the catalog
+    /// is searched for the alias target, so once LiteLLM lists the model under its own
+    /// name, delete its entry here.
+    /// </para>
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> PricingAliases =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["stealth/ox-alpha"] = "claude-sonnet-5",
+            ["ox-alpha"] = "claude-sonnet-5"
+        };
+
+    /// <summary>
+    /// Fast mode is a flat 2x on every standard rate — $10/$50 per MTok against $5/$25 on Claude
+    /// Opus 5 and Opus 4.8 — and it applies across the whole context window, including requests
+    /// over 200k input tokens. The prompt-caching multipliers stack on top of the fast base rather
+    /// than the standard one, so cache reads and writes double along with it. The parser marks a
+    /// fast request by suffixing its model name, and NormalizeModel strips that suffix again
+    /// before the rate lookup, which leaves only the multiplier to apply here.
+    /// </summary>
+    private static double SpeedMultiplier(string rawModel) =>
+        rawModel.TrimEnd().EndsWith("(fast)", StringComparison.OrdinalIgnoreCase) ? 2d : 1d;
+
+    private static ModelPricing? Scale(ModelPricing? pricing, double multiplier) =>
+        pricing is null || multiplier == 1d
+            ? pricing
+            : pricing with
+            {
+                Input = Scale(pricing.Input, multiplier),
+                Output = Scale(pricing.Output, multiplier),
+                CacheRead = Scale(pricing.CacheRead, multiplier),
+                CacheWrite = Scale(pricing.CacheWrite, multiplier),
+                InputAbove128K = Scale(pricing.InputAbove128K, multiplier),
+                InputAbove200K = Scale(pricing.InputAbove200K, multiplier),
+                InputAbove256K = Scale(pricing.InputAbove256K, multiplier),
+                InputAbove272K = Scale(pricing.InputAbove272K, multiplier),
+                OutputAbove128K = Scale(pricing.OutputAbove128K, multiplier),
+                OutputAbove200K = Scale(pricing.OutputAbove200K, multiplier),
+                OutputAbove256K = Scale(pricing.OutputAbove256K, multiplier),
+                OutputAbove272K = Scale(pricing.OutputAbove272K, multiplier),
+                CacheReadAbove200K = Scale(pricing.CacheReadAbove200K, multiplier),
+                CacheReadAbove272K = Scale(pricing.CacheReadAbove272K, multiplier),
+                CacheWriteAbove200K = Scale(pricing.CacheWriteAbove200K, multiplier),
+                CacheWriteAbove272K = Scale(pricing.CacheWriteAbove272K, multiplier),
+                CacheWrite1Hr = Scale(pricing.CacheWrite1Hr, multiplier)
+            };
+
+    private static double? Scale(double? price, double multiplier) =>
+        IsValidPrice(price) ? price!.Value * multiplier : price;
 
     /// <summary>
     /// Last resort for Anthropic models nobody has published a price for yet — a brand new
@@ -186,7 +250,19 @@ public sealed class PricingService
             inputPerMillion / 1_000_000d,
             outputPerMillion / 1_000_000d,
             cacheReadPerMillion / 1_000_000d,
-            cacheWritePerMillion / 1_000_000d);
+            cacheWritePerMillion / 1_000_000d,
+            CacheWrite1Hr: LongTtlWriteRate("anthropic", cacheWritePerMillion));
+
+    /// <summary>
+    /// Anthropic's own ratio: a 5-minute cache write is 1.25x base input and a 1-hour one
+    /// is 2x, so the long-TTL rate is always 1.6x the short one. Used only for models the
+    /// catalog hasn't priced yet — LiteLLM's published 1-hour key wins when it exists.
+    /// </summary>
+    private static double? LongTtlWriteRate(string provider, double cacheWritePerMillion) =>
+        NormalizeProvider(provider).Equals("anthropic", StringComparison.OrdinalIgnoreCase) &&
+        cacheWritePerMillion > 0
+            ? cacheWritePerMillion * 1.6d / 1_000_000d
+            : null;
 
     private static bool TryFind(
         IReadOnlyDictionary<string, ModelPricing> catalog,
@@ -265,7 +341,8 @@ public sealed class PricingService
                     GetDouble(value, "cache_read_input_token_cost_above_200k_tokens"),
                     GetDouble(value, "cache_read_input_token_cost_above_272k_tokens"),
                     GetDouble(value, "cache_creation_input_token_cost_above_200k_tokens"),
-                    GetDouble(value, "cache_creation_input_token_cost_above_272k_tokens"));
+                    GetDouble(value, "cache_creation_input_token_cost_above_272k_tokens"),
+                    GetDouble(value, "cache_creation_input_token_cost_above_1hr"));
             }
         }
         catch (JsonException)
@@ -326,6 +403,24 @@ public sealed class PricingService
         return requestInput > OpenAiLongContextThreshold;
     }
 
+    /// <summary>
+    /// Anthropic prices a cache write by how long it lives: a 5-minute write costs 1.25x
+    /// base input, a 1-hour write 2x. Everything above has already charged every written
+    /// token at the 5-minute rate, so the 1-hour slice only owes the difference. Models
+    /// with no published 1-hour price (every OpenAI one) add nothing.
+    /// </summary>
+    private static double CacheWrite1HrSurcharge(ModelPricing pricing, TokenBreakdown tokens)
+    {
+        if (!IsValidPrice(pricing.CacheWrite1Hr))
+        {
+            return 0;
+        }
+
+        var baseRate = SafePrice(pricing.CacheWrite);
+        var extra = pricing.CacheWrite1Hr!.Value - baseRate;
+        return extra > 0 ? Math.Max(0, tokens.CacheWrite1h) * extra : 0;
+    }
+
     private static double FlatCost(long tokenCount, double? price) =>
         Math.Max(0, tokenCount) * SafePrice(price);
 
@@ -336,6 +431,12 @@ public sealed class PricingService
     {
         var pricing = new Dictionary<string, ModelPricing>(StringComparer.OrdinalIgnoreCase);
 
+        // Sol bills cache writes and reprices everything past 272k input, so these rows carry
+        // the long-context tier too — without it the fallback would underprice exactly the long
+        // Codex sessions Sol runs.
+        AddLongContext(pricing, "openai", (2, 10, 0.1, 2.5), (4, 15, 0.2, 5), "gpt-6.1-sol");
+        AddLongContext(pricing, "openai", (2, 10, 0.2, 2.5), (4, 15, 0.4, 5), "gpt-6-sol");
+        AddLongContext(pricing, "openai", (4, 20, 0.4, 5), (8, 30, 0.8, 10), "gpt-5.6-sol");
         Add(pricing, "openai", 5, 30, 0.5, 0, "gpt-5.5");
         Add(pricing, "openai", 2.5, 15, 0.25, 0, "gpt-5.4");
         Add(pricing, "openai", 1.75, 14, 0.175, 0, "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2");
@@ -372,7 +473,32 @@ public sealed class PricingService
             inputPerMillion / 1_000_000d,
             outputPerMillion / 1_000_000d,
             cacheReadPerMillion / 1_000_000d,
-            cacheWritePerMillion / 1_000_000d);
+            cacheWritePerMillion / 1_000_000d,
+            CacheWrite1Hr: LongTtlWriteRate(provider, cacheWritePerMillion));
+        foreach (var model in models)
+        {
+            target[model] = pricing;
+        }
+    }
+
+    private static void AddLongContext(
+        IDictionary<string, ModelPricing> target,
+        string provider,
+        (double Input, double Output, double CacheRead, double CacheWrite) perMillion,
+        (double Input, double Output, double CacheRead, double CacheWrite) above272KPerMillion,
+        params string[] models)
+    {
+        var pricing = new ModelPricing(
+            provider,
+            perMillion.Input / 1_000_000d,
+            perMillion.Output / 1_000_000d,
+            perMillion.CacheRead / 1_000_000d,
+            perMillion.CacheWrite / 1_000_000d,
+            InputAbove272K: above272KPerMillion.Input / 1_000_000d,
+            OutputAbove272K: above272KPerMillion.Output / 1_000_000d,
+            CacheReadAbove272K: above272KPerMillion.CacheRead / 1_000_000d,
+            CacheWriteAbove272K: above272KPerMillion.CacheWrite / 1_000_000d,
+            CacheWrite1Hr: LongTtlWriteRate(provider, perMillion.CacheWrite));
         foreach (var model in models)
         {
             target[model] = pricing;
@@ -455,5 +581,6 @@ public sealed class PricingService
         double? CacheReadAbove200K = null,
         double? CacheReadAbove272K = null,
         double? CacheWriteAbove200K = null,
-        double? CacheWriteAbove272K = null);
+        double? CacheWriteAbove272K = null,
+        double? CacheWrite1Hr = null);
 }

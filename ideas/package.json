@@ -1,0 +1,13 @@
+{
+  "name": "token-ideas",
+  "version": "1.0.0",
+  "description": "Ideas — a drag-and-drop board for what to build next in Token Tracker and Token Town. Shared memory between the user and the agent fleets: ideas.json is the source of truth, IDEAS.md is the readable rendering.",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "_comment": "src/main.js, never '.': electron resolves a folder arg like require() and would pick up ../ideas.json instead. Electron itself is borrowed from town/ — nothing to install here.",
+    "start": "node ../town/node_modules/electron/cli.js src/main.js",
+    "shot": "node ../town/node_modules/electron/cli.js src/main.js --shot-delay=2500 --shot=shot.png",
+    "test": "node test/store.test.js"
+  }
+}

@@ -87,7 +87,7 @@ public static class InsightsEngine
             var cIn = ComponentCost(pricing, ev, t.Input, 0, 0, 0);
             var cOut = ComponentCost(pricing, ev, 0, t.Output, 0, 0);
             var cRead = ComponentCost(pricing, ev, 0, 0, t.CacheRead, 0);
-            var cWrite = ComponentCost(pricing, ev, 0, 0, 0, t.CacheWrite);
+            var cWrite = ComponentCost(pricing, ev, 0, 0, 0, t.CacheWrite, t.CacheWrite1h);
             var sum = cIn + cOut + cRead + cWrite;
             if (sum > 0)
             {
@@ -399,8 +399,12 @@ public static class InsightsEngine
         long input,
         long output,
         long cacheRead,
-        long cacheWrite) =>
-        pricing.Calculate(ev.Provider, ev.Model, new TokenBreakdown(input, output, cacheRead, cacheWrite, 0)).Cost;
+        long cacheWrite,
+        long cacheWrite1h = 0) =>
+        pricing.Calculate(
+            ev.Provider,
+            ev.Model,
+            new TokenBreakdown(input, output, cacheRead, cacheWrite, 0, cacheWrite1h)).Cost;
 
     /// <summary>
     /// The event's cost with every token at base rates: each component priced in
@@ -411,7 +415,8 @@ public static class InsightsEngine
         return Chunked(t.Input, n => new TokenBreakdown(n, 0, 0, 0, 0))
              + Chunked(t.Output, n => new TokenBreakdown(0, n, 0, 0, 0))
              + Chunked(t.CacheRead, n => new TokenBreakdown(0, 0, n, 0, 0))
-             + Chunked(t.CacheWrite, n => new TokenBreakdown(0, 0, 0, n, 0));
+             + Chunked(t.CacheWrite5m, n => new TokenBreakdown(0, 0, 0, n, 0))
+             + Chunked(t.CacheWrite1h, n => new TokenBreakdown(0, 0, 0, n, 0, n));
 
         double Chunked(long tokens, Func<long, TokenBreakdown> make)
         {

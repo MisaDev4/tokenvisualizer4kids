@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Token Tracker — the Ambient tab</title>
+<style>
+  :root{
+    --page:#0D0D0D; --card:#1A1A19; --raised:#242423;
+    --hairline:rgba(255,255,255,.10); --ink:#FFFFFF; --ink2:#C3C2B7;
+    --muted:#898781; --accent:#3987E5;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--page); color:var(--ink2);
+    font:14px/1.55 "Segoe UI", system-ui, sans-serif; padding:30px 24px 46px}
+  .wrap{max-width:1240px; margin:0 auto}
+  h1{color:var(--ink); font-size:22px; font-weight:600; margin:0 0 6px}
+  .intro{max-width:76ch; margin:0 0 16px}
+  .intro em{color:var(--muted); font-style:normal}
+  .bar{display:flex; flex-wrap:wrap; align-items:center; gap:14px; margin-bottom:14px}
+  .tabs{display:flex; background:var(--raised); border:1px solid var(--hairline);
+    border-radius:9px; padding:3px; gap:2px}
+  .tabs button{border:0; background:transparent; color:var(--muted); border-radius:7px;
+    padding:6px 15px; font:600 13px "Segoe UI",system-ui,sans-serif; cursor:pointer}
+  .tabs button.on{background:#3A3A38; color:var(--ink)}
+  .legend{display:flex; gap:13px; flex-wrap:wrap}
+  .chip{display:flex; align-items:center; gap:6px; font-size:12px}
+  .chip i{width:9px; height:9px; border-radius:3px; display:inline-block}
+  .actions{display:flex; gap:8px; margin-left:auto}
+  .actions button{background:var(--raised); color:var(--ink); border:1px solid var(--hairline);
+    border-radius:8px; padding:6px 14px; font:600 12.5px "Segoe UI",system-ui,sans-serif; cursor:pointer}
+  .actions button:hover{border-color:rgba(255,255,255,.25)}
+  .clock{font-size:12px; color:var(--muted); min-width:120px; text-align:right}
+  .clock b{color:var(--ink2); font-weight:600; font-variant-numeric:tabular-nums}
+  .stage{background:var(--card); border:1px solid var(--hairline); border-radius:14px;
+    padding:14px 14px 10px}
+  canvas{display:block; width:100%; height:460px}
+  .desc{font-size:12.5px; color:var(--muted); margin:10px 4px 2px; max-width:100ch}
+  .desc b{color:var(--ink2)}
+  .outro{margin-top:22px; font-size:13px; color:var(--muted); max-width:82ch}
+  .outro b{color:var(--ink2)}
+  .outro li{margin:5px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>The Ambient tab — your whole day, building something</h1>
+  <p class="intro">
+    A new tab next to Live: pick a display, leave it on a second monitor, and the day
+    constructs itself in front of you. Every response feeds the scene; every hour leaves a mark;
+    at <b>midnight</b> each scene gets a finale and a fresh canvas.
+    <em>Time is compressed — the demo day runs 8:00 → midnight in about a minute. The sky follows the clock.</em>
+  </p>
+  <div class="bar">
+    <div class="tabs" id="tabs"></div>
+    <div class="legend" id="legend"></div>
+    <div class="actions">
+      <button id="burst">⚡ Burst</button>
+      <button id="endday">🌙 Skip to midnight</button>
+    </div>
+    <div class="clock">day clock <b id="clock">08:00</b></div>
+  </div>
+  <div class="stage">
+    <canvas id="cv"></canvas>
+    <p class="desc" id="desc"></p>
+  </div>
+  <p class="outro"><b>And if we want to go even crazier:</b></p>
+  <ul class="outro">
+      <li><b>Launchpad</b> — the weekly limit is a rocket. Every session bolts on a part, fueling fills as the cap approaches, and actually hitting 100% is not a sad red bar… it's liftoff.</li>
+      <li><b>Aquarium</b> — every open session is a fish; its size is its context window. Responses are food dropping in. A session that hits compaction visibly slims down. Close the terminal, the fish swims off-screen.</li>
+      <li><b>Vinyl</b> — the day engraves grooves into a spinning record, groove density = token rate. Drag the needle onto any hour to watch that hour's pulse replay.</li>
+      <li><b>Accretion disk</b> — tokens are stardust spiraling into a black hole that slowly grows all week. Bursts are meteor showers. The event horizon is your weekly cap.</li>
+      <li><b>Zen garden</b> — each response rakes a line of colored sand; idle time slowly blurs it. A calm day literally looks calm.</li>
+    </ul>
+</div>
+
+<script>
+'use strict';
+/* ═══ shared vocabulary ═════════════════════════════════════════ */
+const MODELS = [
+  {id:'fable',  label:'Fable',  color:'#3987E5', w:.50},
+  {id:'sonnet', label:'Sonnet', color:'#9085E9', w:.22},
+  {id:'opus',   label:'Opus',   color:'#E5484D', w:.16},
+  {id:'haiku',  label:'Haiku',  color:'#199E70', w:.12},
+];
+const MIDX = {fable:0, sonnet:1, opus:2, haiku:3};
+const RUN_MS = 64000;         // 8:00 → 24:00
+const FINALE_MS = 5000;
+const START_H = 8;
+const TOK2PX = 1/2600;
+
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,k)=>a+(b-a)*k;
+const easeOut=k=>1-Math.pow(1-k,3);
+const easeInOut=k=>k<.5?4*k*k*k:1-Math.pow(-2*k+2,3)/2;
+const rand=(a,b)=>a+Math.random()*(b-a);
+function hexRGB(h){return [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];}
+function mixc(a,b,k){const A=hexRGB(a),B=hexRGB(b);return `rgb(${A.map((v,i)=>Math.round(lerp(v,B[i],k))).join(',')})`;}
+const fmtTok=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1000?Math.round(n/1000)+'k':''+n;
+function pickModel(){let r=Math.random();for(const m of MODELS){if((r-=m.w)<=0)return m;}return MODELS[0];}
+
+document.getElementById('legend').innerHTML = MODELS.map(m=>
+  `<span class="chip"><i style="background:${m.color}"></i>${m.label}</span>`).join('');
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W=0, H=460;
+
+/* ═══ the day ledger: tokens per model per hour ═════════════════ */
+let ledger = [];
+function newLedger(){
+  ledger = Array.from({length:24}, ()=>({fable:0,sonnet:0,opus:0,haiku:0}));
+  for(let h=0; h<START_H; h++){
+    const total = h<6 ? rand(6000,55000) : rand(130000,320000);
+    MODELS.forEach(m=>{ ledger[h][m.id]+=Math.round(total*m.w*rand(.4,1.7)); });
+  }
+}
+function ledgerTotals(uptoH=24){
+  const t={fable:0,sonnet:0,opus:0,haiku:0};
+  for(let h=0; h<Math.min(uptoH,24); h++) for(const m in t) t[m]+=ledger[h][m];
+  return t;
+}
+const sumTot = t => t.fable+t.sonnet+t.opus+t.haiku;
+
+/* ═══ the sky: shared day/night backdrop ════════════════════════ */
+let stars=[];
+function makeStars(){ stars=Array.from({length:130},()=>({x:Math.random(),y:Math.random()*.55,p:rand(0,9)})); }
+function skyAmount(h){ // 0 = night, 1 = full day
+  if(h<=5||h>=21.5) return 0;
+  if(h>=8&&h<=18) return 1;
+  return h<8 ? (h-5)/3 : (21.5-h)/3.5;
+}
+function drawSky(horizon, hcur, now){
+  const day = skyAmount(hcur), night = 1-day;
+  const g = ctx.createLinearGradient(0,0,0,horizon);
+  g.addColorStop(0, mixc('#050509','#14273F', day));
+  g.addColorStop(1, mixc('#0B0B0A','#20344A', day));
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,horizon);
+  // dawn / dusk glow
+  const glow = Math.max(0, 1-Math.abs(hcur-6.4)/1.9, 1-Math.abs(hcur-20)/1.9);
+  if(glow>0){
+    const dg = ctx.createLinearGradient(0,horizon-90,0,horizon);
+    dg.addColorStop(0,'rgba(226,132,62,0)');
+    dg.addColorStop(1,`rgba(226,132,62,${(.30*glow).toFixed(3)})`);
+    ctx.fillStyle=dg; ctx.fillRect(0,horizon-90,W,90);
+  }
+  if(night>.08){
+    for(const s of stars){
+      ctx.fillStyle=`rgba(220,225,235,${(night*(.25+.45*(.5+.5*Math.sin(now/420+s.p)))).toFixed(3)})`;
+      ctx.fillRect(s.x*W, s.y*horizon, 1.4, 1.4);
+    }
+  }
+  // sun
+  if(day>.03){
+    const t=clamp((hcur-5.5)/15, 0, 1);
+    const sx=W*(.07+.86*t), sy=horizon-14-Math.sin(Math.PI*t)*(horizon-70);
+    for(let i=3;i>=1;i--){
+      ctx.fillStyle=`rgba(255,214,150,${(.05*i*day).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(sx,sy,9+i*8,0,7); ctx.fill();
+    }
+    ctx.fillStyle=`rgba(255,224,170,${(.9*day).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(sx,sy,9,0,7); ctx.fill();
+  }
+  // moon
+  if(night>.4){
+    const t = hcur>=20 ? (hcur-20)/10 : (hcur+4)/10;
+    const mx=W*(.1+.8*clamp(t,0,1)), my=90+40*Math.cos(Math.PI*clamp(t,0,1));
+    ctx.fillStyle=`rgba(205,212,226,${(.85*night).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(mx,my,8,0,7); ctx.fill();
+    ctx.fillStyle = mixc('#050509','#14273F', day);
+    ctx.beginPath(); ctx.arc(mx+3.5,my-2,7,0,7); ctx.fill();
+  }
+}
+
+/* tiny confetti/spark pool shared by scenes */
+function makeSparks(){
+  const arr=[];
+  return {
+    burst(x,y,color,n,spd=170){
+      for(let i=0;i<n;i++){
+        const a=rand(0,Math.PI*2), v=rand(spd*.3,spd);
+        arr.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v-60,life:rand(.6,1.2),age:0,color});
+      }
+    },
+    update(dt){
+      for(let i=arr.length-1;i>=0;i--){
+        const s=arr[i]; s.age+=dt; s.vy+=420*dt; s.x+=s.vx*dt; s.y+=s.vy*dt;
+        if(s.age>s.life) arr.splice(i,1);
+      }
+    },
+    draw(){
+      for(const s of arr){
+        ctx.globalAlpha=Math.max(0,1-s.age/s.life);
+        ctx.fillStyle=s.color; ctx.fillRect(s.x-1.5,s.y-1.5,3,3);
+      }
+      ctx.globalAlpha=1;
+    }
+  };
+}
+
+/* ═══ SCENE 1 · Sandcastle Cove ═════════════════════════════════ */
+function castleScene(){
+  const GS=4;
+  let towers=[], grains=[], spawnQ=[], sparks=makeSparks(), gulls=[], finaleK=-1;
+  const S={id:'castle', label:'Sandcastle'};
+
+  function geom(){
+    S.seaY = H-140; S.baseY = H-34;
+    const tw=76, gap=16, total=MODELS.length*tw+(MODELS.length-1)*gap;
+    const x0=(W-total)/2;
+    towers = MODELS.map((m,i)=>({
+      model:m.id, color:m.color, x:x0+i*(tw+gap), w:tw,
+      hf:new Array(Math.ceil(tw/GS)).fill(0),
+      cv:Object.assign(document.createElement('canvas'),{width:tw,height:H}),
+      tok:0,
+    }));
+    towers.forEach(t=>t.ctx=t.cv.getContext('2d'));
+  }
+  const towH = t => Math.max(...t.hf)*GS;
+
+  S.rebuild = () => {
+    geom(); grains=[]; spawnQ=[]; gulls=[]; finaleK=-1;
+    const tot=ledgerTotals();
+    for(const t of towers){
+      t.tok=tot[t.model];
+      const hPx=clamp(t.tok*TOK2PX, 0, S.baseY-90);
+      const rows=Math.floor(hPx/GS);
+      for(let c=0;c<t.hf.length;c++){
+        t.hf[c]=Math.max(0, rows+Math.round(rand(-1.6,1.6)));
+        for(let r=0;r<t.hf[c];r++){
+          t.ctx.globalAlpha=rand(.7,1);
+          t.ctx.fillStyle=t.color;
+          t.ctx.fillRect(c*GS, H-(r+1)*GS, GS, GS);
+        }
+      }
+      t.ctx.globalAlpha=1;
+    }
+  };
+  S.event = e => {
+    if(finaleK>=0) return;
+    const t=towers[MIDX[e.model]]; t.tok+=e.tokens;
+    const n=clamp(Math.round(e.tokens/2600),3,34), t0=performance.now();
+    for(let i=0;i<n;i++) spawnQ.push({at:t0+i*(600/n)+rand(0,40), ti:MIDX[e.model]});
+    if(e.tokens>32000) sparks.burst(t.x+t.w/2, S.baseY-towH(t)-26, '#FFE9B8', 14, 120);
+  };
+  S.hour = () => {
+    let best=towers[0]; for(const t of towers) if(towH(t)>towH(best)) best=t;
+    sparks.burst(best.x+best.w/2, S.baseY-towH(best)-30, '#FFFFFF', 10, 90);
+    gulls.push({x:-30, y:rand(60,150), v:rand(45,70), p:rand(0,9)});
+  };
+  S.dayEnd = () => { finaleK=0; grains=[]; spawnQ=[]; };
+  function settle(t,g){
+    let col=clamp(Math.floor(g.x/GS),0,t.hf.length-1);
+    for(const c of [col-1,col+1]) if(c>=0&&c<t.hf.length&&t.hf[c]<t.hf[col]-1) col=c;
+    const maxRows=Math.floor((S.baseY-84)/GS);
+    t.hf[col]=Math.min(t.hf[col]+1, maxRows);
+    t.ctx.globalAlpha=rand(.7,1);
+    t.ctx.fillStyle=Math.random()<.06?'#EFE3C2':t.color;
+    t.ctx.fillRect(col*GS, H-t.hf[col]*GS, GS, GS);
+    t.ctx.globalAlpha=1;
+  }
+  S.update = (dt, now) => {
+    sparks.update(dt);
+    if(finaleK>=0){ finaleK=clamp(finaleK+dt/(FINALE_MS/1000),0,1); return; }
+    while(spawnQ.length && spawnQ[0].at<=now){
+      const q=spawnQ.shift(), t=towers[q.ti];
+      grains.push({ti:q.ti, x:t.w/2+rand(-7,7), y:0, vx:rand(-26,26), vy:rand(80,150)});
+    }
+    for(let i=grains.length-1;i>=0;i--){
+      const g=grains[i], t=towers[g.ti];
+      g.vy+=2400*dt; g.x+=g.vx*dt; g.y+=g.vy*dt;
+      if(g.x<1){g.x=1;g.vx*=-.4;} if(g.x>t.w-1){g.x=t.w-1;g.vx*=-.4;}
+      const col=clamp(Math.floor(g.x/GS),0,t.hf.length-1);
+      if(64+g.y >= S.baseY - t.hf[col]*GS - GS/2){ settle(t,g); grains.splice(i,1); }
+    }
+    for(let i=gulls.length-1;i>=0;i--){ const b=gulls[i]; b.x+=b.v*dt; b.p+=dt*9; if(b.x>W+30) gulls.splice(i,1); }
+  };
+  S.draw = (now, hcur) => {
+    drawSky(S.seaY, hcur, now);
+    // sea
+    ctx.fillStyle='rgba(72,118,158,.30)'; ctx.fillRect(0,S.seaY,W,26);
+    ctx.strokeStyle='rgba(190,215,235,.25)'; ctx.lineWidth=1.2;
+    ctx.beginPath();
+    for(let x=0;x<=W;x+=6) ctx.lineTo(x, S.seaY+2+Math.sin(now/500+x*.05)*1.6);
+    ctx.stroke();
+    // beach
+    const bg=ctx.createLinearGradient(0,S.seaY+26,0,H);
+    bg.addColorStop(0,'#33301F'); bg.addColorStop(1,'#221F15');
+    ctx.fillStyle=bg; ctx.fillRect(0,S.seaY+26,W,H-S.seaY-26);
+    // towers
+    const melt = finaleK>=0 ? easeInOut(clamp(finaleK*1.5,0,1)) : 0;
+    for(const t of towers){
+      const hPx=towH(t);
+      const drawH=Math.round(H*(1-melt*.96));
+      ctx.drawImage(t.cv, 0, H-drawH, t.w, drawH, t.x, S.baseY-drawH*(1-0)+ (drawH-drawH), t.w, drawH);
+      // features ride the top
+      const top=S.baseY-hPx*(1-melt);
+      if(melt<0.6){
+        if(hPx>52){ ctx.fillStyle='rgba(0,0,0,.42)';
+          ctx.beginPath(); ctx.ellipse(t.x+t.w/2, S.baseY-1, 8, 15, 0, Math.PI, 0); ctx.fill(); }
+        if(hPx>112){ ctx.fillStyle='rgba(0,0,0,.38)';
+          for(const dx of [-18,18]){ ctx.beginPath(); ctx.ellipse(t.x+t.w/2+dx, S.baseY-64, 4.5, 7, 0, Math.PI, 0); ctx.fill(); } }
+        if(hPx>150){ ctx.fillStyle=mixc(t.color,'#FFFFFF',.28);
+          for(const dx of [-26,0,26]) ctx.fillRect(t.x+t.w/2+dx-6, top-8, 12, 8); }
+        if(hPx>195){
+          ctx.strokeStyle='#C3C2B7'; ctx.lineWidth=1.6;
+          ctx.beginPath(); ctx.moveTo(t.x+t.w/2, top-8); ctx.lineTo(t.x+t.w/2, top-34); ctx.stroke();
+          const wav=Math.sin(now/160)*3;
+          ctx.fillStyle=t.color;
+          ctx.beginPath(); ctx.moveTo(t.x+t.w/2, top-34);
+          ctx.lineTo(t.x+t.w/2+20, top-30+wav); ctx.lineTo(t.x+t.w/2, top-25); ctx.closePath(); ctx.fill();
+        }
+      }
+      // airborne sand
+      ctx.fillStyle=t.color;
+      for(const g of grains) if(g.ti===MIDX[t.model])
+        ctx.fillRect(t.x+g.x-1.4, 64+g.y-1.4, 2.8, 2.8);
+      // caption
+      ctx.font='11px "Segoe UI",system-ui'; ctx.textAlign='center'; ctx.fillStyle='#898781';
+      ctx.fillText(MODELS[MIDX[t.model]].label, t.x+t.w/2, H-16);
+      ctx.fillStyle='#C3C2B7';
+      ctx.fillText(fmtTok(t.tok), t.x+t.w/2, H-4);
+    }
+    // gulls
+    ctx.strokeStyle='rgba(210,215,222,.7)'; ctx.lineWidth=1.4;
+    for(const b of gulls){
+      const f=Math.sin(b.p)*4;
+      ctx.beginPath(); ctx.moveTo(b.x-6,b.y-f*.4); ctx.quadraticCurveTo(b.x-2,b.y-4-f,b.x,b.y);
+      ctx.quadraticCurveTo(b.x+2,b.y-4-f,b.x+6,b.y-f*.4); ctx.stroke();
+    }
+    // tide finale
+    if(finaleK>=0){
+      const rise=easeInOut(finaleK);
+      const wy=lerp(H+10, S.seaY+20, rise);
+      ctx.fillStyle='rgba(72,118,158,.55)';
+      ctx.beginPath(); ctx.moveTo(0,H);
+      for(let x=0;x<=W;x+=8) ctx.lineTo(x, wy+Math.sin(now/300+x*.04)*4);
+      ctx.lineTo(W,H); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle='rgba(230,240,248,.5)'; ctx.lineWidth=2;
+      ctx.beginPath();
+      for(let x=0;x<=W;x+=8) ctx.lineTo(x, wy+Math.sin(now/300+x*.04)*4);
+      ctx.stroke();
+    }
+    sparks.draw();
+  };
+  S.desc = `<b>Sandcastle Cove.</b> The whole day builds one castle — every model raises its <b>own tower</b>,
+    so the mix is unmissable. Big responses shower in visibly heavier sand. Towers earn a door,
+    windows, battlements and finally a waving flag as they pass milestones; every hour a gull flies through.
+    At midnight <b>the tide comes in and takes the whole thing back</b> — tomorrow you build again.`;
+  return S;
+}
+
+/* ═══ SCENE 2 · The Great Sorter (pachinko) ═════════════════════ */
+function pachinkoScene(){
+  let pins=[], marbles=[], bins=[], sparks=makeSparks(), floaters=[], recent=[], finaleK=-1;
+  const S={id:'pachinko', label:'Pachinko'};
+  const BINCAP=760000;
+
+  function geom(){
+    S.boardL=Math.max(30,W*.5-330); S.boardR=Math.min(W-30,W*.5+330);
+    S.binTop=H-158; S.binBot=H-40;
+    const bw=128, gap=18, total=4*bw+3*gap, x0=W/2-total/2;
+    bins=MODELS.map((m,i)=>({model:m.id,color:m.color,x:x0+i*(bw+gap),w:bw,
+      tok:0,disp:0,vel:0,rings:[],ripples:[]}));
+    pins=[];
+    for(let r=0;r<6;r++){
+      const y=86+r*30, off=(r%2)*17;
+      for(let x=S.boardL+22+off; x<S.boardR-14; x+=34)
+        pins.push({x,y,hit:-1e9});
+    }
+  }
+  S.rebuild = () => {
+    geom(); marbles=[]; floaters=[]; recent=[]; finaleK=-1;
+    const tot=ledgerTotals();
+    bins.forEach(b=>{ b.tok=tot[b.model]; b.disp=b.tok; b.vel=0; b.rings=[]; b.ripples=[]; });
+  };
+  const binCX = m => { const b=bins[MIDX[m]]; return b.x+b.w/2; };
+  S.event = e => {
+    if(finaleK>=0) return;
+    marbles.push({model:e.model,color:e.color,tokens:e.tokens,
+      x:W/2+rand(-70,70), y:40, vx:rand(-40,40), vy:rand(0,60),
+      r:clamp(3+e.tokens/9000,3,9), age:0});
+  };
+  S.hour = h => {
+    for(const b of bins){
+      const fh=clamp(b.tok/BINCAP,0,1)*(S.binBot-S.binTop-8);
+      b.rings.push({y:S.binBot-fh, h});
+    }
+  };
+  S.dayEnd = () => {
+    finaleK=0;
+    for(const b of bins){
+      sparks.burst(b.x+b.w/2, S.binTop+20, b.color, clamp(Math.round(b.tok/14000),12,70), 260);
+      b.tok=0;   // flasks drain during the finale
+    }
+    marbles=[];
+  };
+  function land(mb){
+    const b=bins[MIDX[mb.model]];
+    b.tok+=mb.tokens; b.vel+=90;
+    const fh=clamp(b.disp/BINCAP,0,1)*(S.binBot-S.binTop-8);
+    b.ripples.push({y:S.binBot-fh, r:2, age:0});
+    const t=performance.now();
+    recent.push({m:mb.model,t});
+    while(recent.length&&t-recent[0].t>800) recent.shift();
+    const n=recent.filter(r=>r.m===mb.model).length;
+    if(n>=3) floaters.push({txt:'COMBO ×'+n, x:b.x+b.w/2, y:S.binTop-14, age:0, color:b.color});
+  }
+  S.update = (dt, now) => {
+    sparks.update(dt);
+    for(const f of floaters) f.age+=dt, f.y-=20*dt;
+    floaters=floaters.filter(f=>f.age<1.1);
+    if(finaleK>=0){ finaleK=clamp(finaleK+dt/(FINALE_MS/1000),0,1); }
+    for(const b of bins){
+      // springy fill level
+      b.vel += (b.tok-b.disp)*14*dt*(finaleK>=0?4:1);
+      if(finaleK>=0) b.vel += (0-b.disp)*3*dt*finaleK;
+      b.vel*=Math.pow(.012,dt); b.disp+=b.vel*dt*60;
+      if(b.disp<0)b.disp=0;
+      for(let i=b.ripples.length-1;i>=0;i--){ const r=b.ripples[i]; r.age+=dt; r.r+=90*dt; if(r.age>.5)b.ripples.splice(i,1); }
+    }
+    for(let i=marbles.length-1;i>=0;i--){
+      const m=marbles[i]; m.age+=dt;
+      m.vy+=1500*dt;
+      m.vx+=(binCX(m.model)-m.x)*2.4*dt;
+      m.vx*=Math.pow(.5,dt);
+      m.x+=m.vx*dt; m.y+=m.vy*dt;
+      if(m.x<S.boardL+m.r){m.x=S.boardL+m.r; m.vx=Math.abs(m.vx)*.5;}
+      if(m.x>S.boardR-m.r){m.x=S.boardR-m.r; m.vx=-Math.abs(m.vx)*.5;}
+      for(const p of pins){
+        const dx=m.x-p.x, dy=m.y-p.y, rr=m.r+3.5;
+        if(dx*dx+dy*dy<rr*rr){
+          const d=Math.sqrt(dx*dx+dy*dy)||1, nx=dx/d, ny=dy/d;
+          m.x=p.x+nx*rr; m.y=p.y+ny*rr;
+          const dot=m.vx*nx+m.vy*ny;
+          m.vx=(m.vx-2*dot*nx)*.5+rand(-28,28);
+          m.vy=(m.vy-2*dot*ny)*.5;
+          p.hit=now;
+        }
+      }
+      const home=bins[MIDX[m.model]];
+      if(m.y>S.binTop-6 && m.x>home.x+4 && m.x<home.x+home.w-4){ land(m); marbles.splice(i,1); continue; }
+      if(m.y>S.binBot || m.age>6){ land(m); marbles.splice(i,1); }
+    }
+  };
+  S.draw = (now, hcur) => {
+    drawSky(H, hcur, now);
+    // pins
+    for(const p of pins){
+      const hot=now-p.hit<200;
+      ctx.fillStyle=hot?'#EDEBE0':'#3E3E3B';
+      ctx.beginPath(); ctx.arc(p.x,p.y,hot?4:3,0,7); ctx.fill();
+    }
+    // side walls
+    ctx.strokeStyle='rgba(255,255,255,.14)'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(S.boardL,60); ctx.lineTo(S.boardL,S.binTop);
+    ctx.moveTo(S.boardR,60); ctx.lineTo(S.boardR,S.binTop); ctx.stroke();
+    // bins
+    ctx.font='11px "Segoe UI",system-ui'; ctx.textAlign='center';
+    for(const b of bins){
+      const innerH=S.binBot-S.binTop-8;
+      const fh=clamp(b.disp/BINCAP,0,1)*innerH;
+      // liquid fill with wobbly surface
+      ctx.fillStyle=b.color; ctx.globalAlpha=.92;
+      ctx.beginPath();
+      ctx.moveTo(b.x+3, S.binBot);
+      ctx.lineTo(b.x+3, S.binBot-fh+Math.sin(now/220)*1.5);
+      for(let x=0;x<=b.w-6;x+=6)
+        ctx.lineTo(b.x+3+x, S.binBot-fh+Math.sin(now/220+x*.2)*1.5);
+      ctx.lineTo(b.x+b.w-3, S.binBot);
+      ctx.closePath(); ctx.fill(); ctx.globalAlpha=1;
+      // ripples
+      ctx.strokeStyle='rgba(255,255,255,.5)';
+      for(const r of b.ripples){
+        ctx.globalAlpha=Math.max(0,1-r.age/.5);
+        ctx.beginPath(); ctx.ellipse(b.x+b.w/2, r.y, Math.min(r.r,b.w/2-4), 3, 0, 0, 7); ctx.stroke();
+      }
+      ctx.globalAlpha=1;
+      // hour rings
+      for(const ring of b.rings){
+        ctx.strokeStyle='rgba(255,255,255,.22)';
+        ctx.beginPath(); ctx.moveTo(b.x+3,ring.y); ctx.lineTo(b.x+b.w-3,ring.y); ctx.stroke();
+        if(ring.h%3===0){ ctx.fillStyle='#898781'; ctx.textAlign='left';
+          ctx.fillText(ring.h+'h', b.x+b.w-1, ring.y+3); ctx.textAlign='center'; }
+      }
+      // glass
+      ctx.strokeStyle='rgba(255,255,255,.30)'; ctx.lineWidth=1.6;
+      ctx.beginPath();
+      ctx.moveTo(b.x, S.binTop);
+      ctx.lineTo(b.x, S.binBot-6); ctx.arcTo(b.x,S.binBot,b.x+6,S.binBot,6);
+      ctx.lineTo(b.x+b.w-6,S.binBot); ctx.arcTo(b.x+b.w,S.binBot,b.x+b.w,S.binBot-6,6);
+      ctx.lineTo(b.x+b.w,S.binTop);
+      ctx.stroke();
+      // labels + odometer
+      ctx.fillStyle='#898781'; ctx.fillText(MODELS[MIDX[b.model]].label, b.x+b.w/2, H-24);
+      ctx.fillStyle='#FFFFFF'; ctx.font='600 13px "Segoe UI",system-ui';
+      ctx.fillText(fmtTok(Math.round(b.disp)), b.x+b.w/2, H-8);
+      ctx.font='11px "Segoe UI",system-ui';
+    }
+    // marbles
+    for(const m of marbles){
+      ctx.fillStyle=m.color;
+      ctx.beginPath(); ctx.arc(m.x,m.y,m.r,0,7); ctx.fill();
+      ctx.fillStyle='rgba(255,255,255,.45)';
+      ctx.beginPath(); ctx.arc(m.x-m.r*.3,m.y-m.r*.3,m.r*.3,0,7); ctx.fill();
+    }
+    // combo floaters
+    ctx.textAlign='center'; ctx.font='700 13px "Segoe UI",system-ui';
+    for(const f of floaters){
+      ctx.fillStyle=f.color; ctx.globalAlpha=Math.max(0,1-f.age/1.1);
+      ctx.fillText(f.txt, f.x, f.y);
+    }
+    ctx.globalAlpha=1; ctx.font='11px "Segoe UI",system-ui';
+    sparks.draw();
+  };
+  S.desc = `<b>The Great Sorter.</b> Every response drops as a marble — <b>size is its token count</b> — and
+    pinballs down through the pegs before sorting itself into its model's flask. Fill lines are the day's totals,
+    the etched lines are <b>hour marks</b> (your timeline, as tide rings), and landing three of a kind inside a
+    second scores a combo. At midnight every flask erupts its contents as fireworks.`;
+  return S;
+}
+
+/* ═══ SCENE 3 · Goo Tank (lava-lamp strata) ═════════════════════ */
+function gooScene(){
+  const NPTS=44;
+  let bounds=[], tok={}, blobs=[], bubbles=[], sc=1, finaleK=-1, idleT=3;
+  const S={id:'goo', label:'Goo tank'};
+
+  function geom(){
+    S.tx=Math.max(60,W*.5-320); S.tw=Math.min(W-120,640);
+    S.ty=44; S.tb=H-52; S.th=S.tb-S.ty;
+  }
+  S.rebuild = () => {
+    geom(); blobs=[]; bubbles=[]; finaleK=-1; idleT=3;
+    const t=ledgerTotals(); tok={...t};
+    sc=fitScale();
+    bounds=MODELS.map(()=>Array.from({length:NPTS},()=>({y:S.tb,vy:0})));
+    setTargets(); bounds.forEach((b,i)=>b.forEach((p,j)=>{p.y=targetY(i);}));
+  };
+  function fitScale(){ const need=sumTot(tok)*TOK2PX; return Math.min(1,(S.th-26)/Math.max(need,1)); }
+  function cumPx(i){ let c=0; for(let k=0;k<=i;k++) c+=tok[MODELS[k].id]*TOK2PX*sc; return c; }
+  function targetY(i){ return S.tb-cumPx(i); }
+  function setTargets(){ S._tg=MODELS.map((_,i)=>targetY(i)); }
+  S.event = e => {
+    if(finaleK>=0) return;
+    blobs.push({model:e.model,color:e.color,tokens:e.tokens,
+      x:S.tx+rand(20,S.tw-20), y:S.ty-16, vy:rand(20,80),
+      r:clamp(4+e.tokens/8000,4,12), phase:'fall'});
+  };
+  S.hour = ()=>{};
+  S.dayEnd = () => { finaleK=0; blobs=[]; };
+  S.update = (dt, now) => {
+    const targetSc=fitScale();
+    sc += (targetSc-sc)*Math.min(1,dt*3);
+    if(finaleK>=0){
+      finaleK=clamp(finaleK+dt/(FINALE_MS/1000),0,1);
+      const drain=Math.pow(.02,dt*finaleK);
+      for(const m in tok) tok[m]*=drain;
+    }
+    setTargets();
+    // boundary water-surface sim
+    for(let i=0;i<bounds.length;i++){
+      const pts=bounds[i], T=S._tg[i];
+      for(let j=0;j<NPTS;j++){
+        const p=pts[j];
+        const nb=((pts[j-1]||p).y+(pts[j+1]||p).y)/2;
+        p.vy += ((T-p.y)*30 + (nb-p.y)*80)*dt;
+        p.vy *= Math.pow(.004,dt);
+        p.y += p.vy*dt*8;
+      }
+    }
+    // blobs sink to their stratum
+    for(let i=blobs.length-1;i>=0;i--){
+      const b=blobs[i], li=MIDX[b.model];
+      const surfI=topIndex();
+      const xj=Math.floor((b.x-S.tx)/S.tw*(NPTS-1));
+      if(b.phase==='fall'){
+        b.vy+=1600*dt; b.y+=b.vy*dt;
+        const surfY=bounds[surfI][clamp(xj,0,NPTS-1)].y;
+        if(b.y+b.r>=surfY){
+          b.phase='sink'; b.vy=0;
+          kick(surfI,xj, 90);
+          bubbles.push({x:b.x,y:surfY,r:rand(1.5,3),vy:rand(24,40)});
+        }
+      } else {
+        b.y+=54*dt; b.x+=Math.sin(now/230+b.r)*14*dt;
+        for(let k=bounds.length-1;k>li;k--){
+          const by=bounds[k][clamp(xj,0,NPTS-1)].y;
+          if(Math.abs(b.y-by)<6) kick(k,xj,50);
+        }
+        const homeY=bounds[li][clamp(xj,0,NPTS-1)].y;
+        if(b.y>=homeY-2){
+          tok[b.model]+=b.tokens;
+          kick(li,xj,-160);
+          for(let q=0;q<3;q++) bubbles.push({x:b.x+rand(-8,8),y:b.y,r:rand(1,2.5),vy:rand(26,46)});
+          blobs.splice(i,1);
+        }
+      }
+    }
+    for(let i=bubbles.length-1;i>=0;i--){
+      const u=bubbles[i]; u.y-=u.vy*dt; u.x+=Math.sin(now/180+u.r*7)*8*dt;
+      const surfY=bounds[topIndex()][clamp(Math.floor((u.x-S.tx)/S.tw*(NPTS-1)),0,NPTS-1)].y;
+      if(u.y<surfY+2) bubbles.splice(i,1);
+    }
+    // idle lava "bloops"
+    idleT-=dt;
+    if(idleT<=0 && finaleK<0){
+      idleT=rand(2.5,6);
+      const alive=MODELS.map((m,i)=>i).filter(i=>tok[MODELS[i].id]>30000);
+      if(alive.length){ kick(alive[Math.floor(rand(0,alive.length))], Math.floor(rand(4,NPTS-4)), -120); }
+    }
+  };
+  function topIndex(){
+    for(let i=MODELS.length-1;i>=0;i--) if(tok[MODELS[i].id]>1000) return i;
+    return 0;
+  }
+  function kick(i,xj,v){
+    const pts=bounds[i];
+    for(let j=Math.max(0,xj-3);j<=Math.min(NPTS-1,xj+3);j++)
+      pts[j].vy += v*(1-Math.abs(j-xj)/4);
+  }
+  S.draw = (now, hcur) => {
+    drawSky(H, hcur, now);
+    const px=j=>S.tx+j/(NPTS-1)*S.tw;
+    // layers bottom-up
+    for(let i=0;i<MODELS.length;i++){
+      const below = i===0 ? null : bounds[i-1];
+      ctx.fillStyle=MODELS[i].color; ctx.globalAlpha=.9;
+      ctx.beginPath();
+      ctx.moveTo(S.tx, below?below[0].y:S.tb);
+      if(below) for(let j=0;j<NPTS;j++) ctx.lineTo(px(j), below[j].y);
+      else ctx.lineTo(S.tx+S.tw, S.tb);
+      for(let j=NPTS-1;j>=0;j--) ctx.lineTo(px(j), bounds[i][j].y);
+      ctx.closePath(); ctx.fill();
+      ctx.globalAlpha=1;
+      // glowing boundary
+      ctx.strokeStyle=mixc(MODELS[i].color,'#FFFFFF',.4); ctx.lineWidth=1.4; ctx.globalAlpha=.55;
+      ctx.beginPath();
+      for(let j=0;j<NPTS;j++) j?ctx.lineTo(px(j),bounds[i][j].y):ctx.moveTo(px(0),bounds[i][0].y);
+      ctx.stroke(); ctx.globalAlpha=1;
+    }
+    // bubbles
+    ctx.fillStyle='rgba(255,255,255,.35)';
+    for(const u of bubbles){ ctx.beginPath(); ctx.arc(u.x,u.y,u.r,0,7); ctx.fill(); }
+    // blobs
+    for(const b of blobs){
+      ctx.fillStyle=b.color;
+      ctx.strokeStyle='rgba(0,0,0,.4)'; ctx.lineWidth=1.5;
+      const sq=b.phase==='fall'?clamp(b.vy/900,0,.4):0;
+      ctx.beginPath(); ctx.ellipse(b.x,b.y,b.r*(1-sq*.5),b.r*(1+sq),0,0,7);
+      ctx.fill(); ctx.stroke();
+    }
+    // hour etch marks on the glass
+    ctx.font='10px "Segoe UI",system-ui'; ctx.textAlign='left';
+    let cum=0;
+    for(let h=0;h<Math.floor(hcur);h++){
+      cum+=sumTot(ledger[h]);
+      const y=S.tb-cum*TOK2PX*sc;
+      if(y<S.ty+8) continue;
+      ctx.strokeStyle='rgba(255,255,255,.18)';
+      ctx.beginPath(); ctx.moveTo(S.tx+S.tw,y); ctx.lineTo(S.tx+S.tw+7,y); ctx.stroke();
+      if(h%3===2){ ctx.fillStyle='#898781'; ctx.fillText((h+1)+'h', S.tx+S.tw+10, y+3); }
+    }
+    // tank glass
+    ctx.strokeStyle='rgba(255,255,255,.30)'; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(S.tx-4, S.ty-10);
+    ctx.lineTo(S.tx-4, S.tb+4-10); ctx.arcTo(S.tx-4,S.tb+4,S.tx+6,S.tb+4,10);
+    ctx.lineTo(S.tx+S.tw-6+4,S.tb+4); ctx.arcTo(S.tx+S.tw+4,S.tb+4,S.tx+S.tw+4,S.tb-6,10);
+    ctx.lineTo(S.tx+S.tw+4, S.ty-10);
+    ctx.stroke();
+    // per-model totals at left
+    ctx.textAlign='right'; ctx.font='11px "Segoe UI",system-ui';
+    for(let i=0;i<MODELS.length;i++){
+      const t=tok[MODELS[i].id]; if(t<15000) continue;
+      const yMid=(( i===0?S.tb:bounds[i-1][0].y)+bounds[i][0].y)/2;
+      ctx.fillStyle='#C3C2B7'; ctx.fillText(fmtTok(Math.round(t)), S.tx-14, yMid+3);
+      ctx.fillStyle=MODELS[i].color; ctx.fillRect(S.tx-11,yMid-3,6,6);
+    }
+    // drain finale
+    if(finaleK>=0 && finaleK<1){
+      const dx=S.tx+S.tw/2;
+      ctx.strokeStyle='rgba(255,255,255,.4)'; ctx.lineWidth=2;
+      for(let a=0;a<3;a++){
+        ctx.beginPath();
+        ctx.arc(dx, S.tb-8, 10+a*7, now/200+a, now/200+a+2.1); ctx.stroke();
+      }
+      ctx.fillStyle=MODELS[topIndex()].color; ctx.globalAlpha=.8;
+      ctx.fillRect(dx-6+Math.sin(now/90)*2, S.tb+4, 12, H-S.tb-4);
+      ctx.globalAlpha=1;
+    }
+  };
+  S.desc = `<b>Goo Tank.</b> The liquid effect, promoted to the whole day: each model is a stratum of goo, and every
+    response falls in as a blob that <b>sinks through the layers above it</b> — wobbling each boundary as it passes —
+    before merging into its own color with a bloop of bubbles. Layers breathe and slosh on their own like a lava lamp,
+    the etches on the glass are hour marks, and when the day outgrows the tank the whole brew compresses to fit.
+    At midnight someone pulls the plug and it all spirals down the drain.`;
+  return S;
+}
+
+/* ═══ SCENE 4 · Token City (skyline) ════════════════════════════ */
+function cityScene(){
+  let lots=[], craneQ=[], carrying=null, sparks=makeSparks(), fireworks=[], recentT=[], fwCool=0, finaleK=-1, finaleShot=0;
+  const S={id:'city', label:'Token City'};
+  const FLOORH=7;
+
+  function geom(){
+    S.street=H-42;
+    S.lotW=(W-50)/24; S.bw=Math.min(38,S.lotW*.74);
+  }
+  const lotX = h => 25 + h*S.lotW + (S.lotW-S.bw)/2;
+  function buildingFromLedger(h){
+    const floors=[];
+    for(const m of MODELS){
+      const n=Math.round(ledger[h][m.id]/7000);
+      for(let i=0;i<n;i++) floors.push({color:m.color});
+    }
+    return {floors, antenna: floors.length*FLOORH>150};
+  }
+  S.rebuild = () => {
+    geom(); craneQ=[]; carrying=null; fireworks=[]; finaleK=-1; finaleShot=0;
+    lots=Array.from({length:24},(_,h)=> h<START_H ? buildingFromLedger(h) : {floors:[],antenna:false});
+  };
+  S.event = e => {
+    if(finaleK>=0) return;
+    const n=Math.max(1,Math.round(e.tokens/7000));
+    for(let i=0;i<n;i++) craneQ.push({color:e.color});
+    const t=performance.now();
+    recentT.push(t); while(recentT.length&&t-recentT[0]>1000) recentT.shift();
+    if(recentT.length>=4 && fwCool<=0){ launchFirework(e.color); fwCool=6; }
+  };
+  function launchFirework(color){
+    fireworks.push({x:rand(W*.15,W*.85), y:S.street, vy:-rand(240,320),
+      ex:rand(120,210), color, sparks:null});
+  }
+  S.hour = h => {
+    const prev=lots[h-1];
+    if(prev && prev.floors.length){
+      prev.antenna = prev.floors.length*FLOORH>150;
+      sparks.burst(lotX(h-1)+S.bw/2, S.street-prev.floors.length*FLOORH-8, '#FFE9B8', 12, 110);
+    }
+    craneQ=[]; carrying=null; // crane packs up and moves
+  };
+  S.dayEnd = () => { finaleK=0; craneQ=[]; carrying=null; };
+  S.update = (dt, now, hourIdx) => {
+    sparks.update(dt);
+    fwCool-=dt;
+    if(finaleK>=0){
+      finaleK=clamp(finaleK+dt/(FINALE_MS/1000),0,1);
+      if(finaleK>finaleShot/4 && finaleShot<4){ launchFirework(MODELS[finaleShot%4].color); finaleShot++; }
+    }
+    // crane delivers one floor at a time
+    const lot=lots[clamp(hourIdx,0,23)];
+    if(!carrying && craneQ.length && finaleK<0){
+      const f=craneQ.shift();
+      carrying={color:f.color, t:0, lot, hourIdx};
+    }
+    if(carrying){
+      carrying.t+=dt/.42;
+      if(carrying.t>=1){ carrying.lot.floors.push({color:carrying.color}); carrying=null; }
+    }
+    for(let i=fireworks.length-1;i>=0;i--){
+      const f=fireworks[i];
+      if(!f.sparks){
+        f.y+=f.vy*dt; f.vy+=160*dt;
+        if(f.y<=f.ex){
+          f.sparks=[];
+          for(let k=0;k<44;k++){
+            const a=rand(0,Math.PI*2), v=rand(40,190);
+            f.sparks.push({x:f.x,y:f.y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,age:0,life:rand(.7,1.3)});
+          }
+        }
+      } else {
+        let alive=false;
+        for(const s of f.sparks){
+          s.age+=dt; if(s.age<s.life) alive=true;
+          s.vy+=190*dt; s.x+=s.vx*dt; s.y+=s.vy*dt;
+        }
+        if(!alive) fireworks.splice(i,1);
+      }
+    }
+  };
+  S.draw = (now, hcur) => {
+    const hourIdx=clamp(Math.floor(hcur),0,23);
+    drawSky(S.street, hcur, now);
+    const night=1-skyAmount(hcur);
+    // fireworks behind buildings
+    for(const f of fireworks){
+      if(!f.sparks){ ctx.fillStyle='rgba(255,235,200,.9)'; ctx.fillRect(f.x-1.5,f.y-4,3,8); }
+      else for(const s of f.sparks){
+        if(s.age>=s.life) continue;
+        ctx.globalAlpha=Math.max(0,1-s.age/s.life);
+        ctx.fillStyle=f.color; ctx.fillRect(s.x-1.5,s.y-1.5,3,3);
+      }
+    }
+    ctx.globalAlpha=1;
+    // buildings
+    for(let h=0;h<24;h++){
+      const b=lots[h]; if(!b.floors.length) continue;
+      const x=lotX(h);
+      for(let i=0;i<b.floors.length;i++){
+        const y=S.street-(i+1)*FLOORH;
+        ctx.fillStyle=mixc(b.floors[i].color,'#000000',.25);
+        ctx.fillRect(x,y,S.bw,FLOORH-1);
+        // windows: deterministic lighting, more lit at night
+        const seed=(h*97+i*31)%100;
+        const lit = finaleK>=0 ? true : (seed/100 < .15+.55*night && h!==hourIdx);
+        for(let wnd=0;wnd<3;wnd++){
+          const wx=x+5+wnd*(S.bw-10)/2.4;
+          ctx.fillStyle = lit && ((seed+wnd*37)%3!==0)
+            ? 'rgba(255,226,150,.85)' : 'rgba(0,0,0,.35)';
+          ctx.fillRect(wx, y+2, 3, 3);
+        }
+      }
+      if(b.antenna){
+        const top=S.street-b.floors.length*FLOORH;
+        ctx.strokeStyle='#8A8F98'; ctx.lineWidth=1.4;
+        ctx.beginPath(); ctx.moveTo(x+S.bw/2,top); ctx.lineTo(x+S.bw/2,top-14); ctx.stroke();
+        ctx.fillStyle = (Math.floor(now/700)%2)?'#E5484D':'#5A1F21';
+        ctx.beginPath(); ctx.arc(x+S.bw/2,top-15,1.8,0,7); ctx.fill();
+      }
+    }
+    // crane over the working lot
+    if(finaleK<0){
+      const x=lotX(hourIdx), lot=lots[hourIdx];
+      const topY=S.street-lot.floors.length*FLOORH;
+      const mastX=x+S.bw+8, jibY=Math.min(topY,S.street-40)-52;
+      ctx.strokeStyle='#B8A24C'; ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(mastX,S.street); ctx.lineTo(mastX,jibY);
+      ctx.moveTo(mastX+12,jibY); ctx.lineTo(x-14,jibY);
+      ctx.stroke();
+      ctx.strokeStyle='rgba(184,162,76,.5)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(mastX,jibY+10); ctx.lineTo(mastX-16,jibY); ctx.stroke();
+      if(carrying){
+        const k=easeOut(clamp(carrying.t,0,1));
+        const slabY=lerp(jibY+6, S.street-(carrying.lot.floors.length+1)*FLOORH, k);
+        const slabX=x+S.bw/2;
+        ctx.strokeStyle='rgba(200,200,200,.6)'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(slabX,jibY); ctx.lineTo(slabX,slabY); ctx.stroke();
+        ctx.fillStyle=mixc(carrying.color,'#FFFFFF',.35);
+        ctx.fillRect(x,slabY,S.bw,FLOORH-1);
+      }
+    }
+    // street
+    ctx.fillStyle='#151513'; ctx.fillRect(0,S.street,W,H-S.street);
+    ctx.strokeStyle='rgba(255,255,255,.16)';
+    ctx.beginPath(); ctx.moveTo(0,S.street+.5); ctx.lineTo(W,S.street+.5); ctx.stroke();
+    // hour labels every 3h
+    ctx.font='10px "Segoe UI",system-ui'; ctx.textAlign='center'; ctx.fillStyle='#898781';
+    for(let h=0;h<24;h+=3) ctx.fillText(h+'h', lotX(h)+S.bw/2, S.street+16);
+    ctx.fillStyle='#C3C2B7';
+    ctx.fillText('▲', lotX(hourIdx)+S.bw/2, S.street+28);
+    sparks.draw();
+  };
+  S.desc = `<b>Token City.</b> Each hour gets a lot on the street, and your usage erects the building floor by floor —
+    <b>every floor is ~7k tokens</b>, colored by model, delivered by a working crane that visibly can't keep up during
+    a burst. Finished towers get lit windows (more at night), tall ones get a blinking antenna, and hot streaks launch
+    fireworks behind the skyline. The street <b>is</b> the timeline — you can read your whole day left to right.
+    At midnight the full skyline lights up for a fireworks finale.`;
+  return S;
+}
+
+/* ═══ orchestration ═════════════════════════════════════════════ */
+const scenes=[castleScene(), pachinkoScene(), gooScene(), cityScene()];
+let active=0;
+
+const tabsEl=document.getElementById('tabs');
+scenes.forEach((s,i)=>{
+  const b=document.createElement('button');
+  b.textContent=s.label;
+  b.onclick=()=>{ active=i; refreshTabs(); };
+  tabsEl.appendChild(b);
+});
+function refreshTabs(){
+  [...tabsEl.children].forEach((b,i)=>b.classList.toggle('on', i===active));
+  document.getElementById('desc').innerHTML=scenes[active].desc;
+}
+
+function resize(){
+  const r=cv.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  cv.width=Math.max(1,Math.round(r.width*dpr));
+  cv.height=Math.round(460*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  W=r.width; H=460;
+  makeStars();
+  scenes.forEach(s=>s.rebuild());
+}
+
+let mode='run', dayStart=performance.now(), finaleT=0, lastHour=START_H-1;
+function hourNow(now){ return clamp(START_H+(now-dayStart)/RUN_MS*(24-START_H), 0, 24); }
+function hourIdx(now){ return clamp(Math.floor(hourNow(now)),0,23); }
+
+function makeEvent(){
+  const m=pickModel();
+  return {model:m.id, color:m.color, tokens:3000+Math.floor(Math.pow(Math.random(),1.8)*52000)};
+}
+function emit(e, now){
+  ledger[hourIdx(now)][e.model]+=e.tokens;
+  scenes.forEach(s=>s.event(e));
+}
+let burstEnv=0, evAcc=.9, burstQ=[];
+function genEvents(dtMs, now){
+  if(mode!=='run') return;
+  while(burstQ.length&&burstQ[0]<=now){ burstQ.shift(); emit(makeEvent(), now); }
+  if(Math.random()<dtMs/1000*.07) burstEnv=Math.min(2.4,burstEnv+rand(1,2.2));
+  burstEnv*=Math.pow(.5,dtMs/1000/1.8);
+  evAcc+=dtMs/1000*(.85+burstEnv);
+  while(evAcc>=1){ evAcc-=1; emit(makeEvent(), now); }
+}
+document.getElementById('burst').onclick=()=>{
+  const now=performance.now(), n=Math.round(rand(10,16));
+  for(let i=0;i<n;i++) burstQ.push(now+i*120+rand(0,80));
+  burstQ.sort((a,b)=>a-b);
+};
+document.getElementById('endday').onclick=()=>{
+  if(mode==='run') dayStart=performance.now()-RUN_MS;
+};
+
+function resetDay(now){
+  newLedger();
+  scenes.forEach(s=>s.rebuild());
+  dayStart=now; lastHour=START_H-1; mode='run';
+}
+
+const clockEl=document.getElementById('clock');
+let last=performance.now();
+function tick(now){
+  const dtMs=clamp(now-last, 0, 50); last=now;
+  const dt=dtMs/1000;
+  genEvents(dtMs, now);
+  const hcur = mode==='run' ? hourNow(now) : 24;
+  const hi=Math.floor(hcur);
+  if(mode==='run'){
+    if(hi>lastHour && hi<24){ for(let h=lastHour+1;h<=hi;h++) scenes.forEach(s=>s.hour(h)); lastHour=hi; }
+    if(hcur>=24){ mode='finale'; finaleT=0; scenes.forEach(s=>s.dayEnd()); }
+  } else {
+    finaleT+=dtMs;
+    if(finaleT>=FINALE_MS+800) resetDay(now);
+  }
+  const hh=Math.floor(Math.min(hcur,23.999)), mm=Math.floor((hcur-hh)*60);
+  clockEl.textContent = mode==='finale' ? '24:00' : `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
+  for(const s of scenes) s.update(dt, now, hourIdx(now));
+  scenes[active].draw(now, hcur);
+}
+function frame(now){ tick(now); requestAnimationFrame(frame); }
+window.__tick=tick;              // manual stepping for automated tests
+window.__setScene=i=>{active=i; refreshTabs();};
+
+active = clamp(parseInt(location.hash.slice(1))||0, 0, scenes.length-1);
+newLedger();
+resize();
+window.addEventListener('resize', resize);
+refreshTabs();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
